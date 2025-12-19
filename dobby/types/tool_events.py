@@ -1,29 +1,31 @@
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
+
+from pydantic import BaseModel
 
 
-class ToolStreamEvent(TypedDict):
+class ToolStreamEvent(BaseModel):
     """Event emitted by streaming tools during execution.
 
-    Used for mid-execution streaming (e.g., document content deltas).
+    Used for mid-execution streaming (e.g., progress updates, partial results).
     """
 
-    type: str  # e.g., "data-textDelta", "data-kind", etc.
+    type: str
     data: Any
 
 
-class ToolResultPart(TypedDict):
+class ToolResultPart(BaseModel):
     """Result from tool execution."""
 
-    type: Literal["tool_result_event"]
+    type: Literal["tool_result_event"] = "tool_result_event"
     tool_use_id: str
     name: str
     result: Any
-    is_error: bool
+    is_error: bool = False
 
 
-class ToolUseEndEvent(TypedDict):
+class ToolUseEndEvent(BaseModel):
     """Event when tool execution completes."""
 
-    type: Literal["tool_use_end"]
+    type: Literal["tool_use_end"] = "tool_use_end"
     tool_use_id: str
     tool_name: str

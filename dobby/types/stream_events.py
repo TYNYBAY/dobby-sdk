@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from .message import ResponsePart, StopReason
+from .tool_events import ToolResultPart, ToolStreamEvent, ToolUseEndEvent
 from .usage import Usage
 
 
@@ -91,8 +92,17 @@ class StreamEndEvent(BaseModel):
     usage: Usage | None
 
 
-# Discriminated union - Pydantic uses 'type' field to determine which model to instantiate
 type StreamEvent = Annotated[
-    StreamStartEvent | TextDeltaEvent | ReasoningDeltaEvent | ReasoningStartEvent | ReasoningEndEvent | StreamErrorEvent | ToolUseEvent | StreamEndEvent,
-    Field(discriminator="type")
+    StreamStartEvent
+    | TextDeltaEvent
+    | ReasoningDeltaEvent
+    | ReasoningStartEvent
+    | ReasoningEndEvent
+    | StreamErrorEvent
+    | ToolUseEvent
+    | ToolStreamEvent
+    | ToolResultPart
+    | ToolUseEndEvent
+    | StreamEndEvent,
+    Field(discriminator="type"),
 ]

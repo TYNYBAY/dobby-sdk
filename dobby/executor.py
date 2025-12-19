@@ -90,7 +90,7 @@ class AgentExecutor(Generic[ContextT]):
         max_iterations: int = 10,
         reasoning_effort: str | None = None,
         approved_tool_calls: set[str] | None = None,
-    ) -> AsyncIterator[StreamEvent | ToolStreamEvent | ToolResultPart | ToolUseEndEvent]:
+    ) -> AsyncIterator[StreamEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
 
         Implements the agentic loop:
@@ -125,7 +125,6 @@ class AgentExecutor(Generic[ContextT]):
         approved = approved_tool_calls or set()
 
         for _ in range(max_iterations):
-            # Stream from LLM
             tool_calls: list[ToolUsePart] = []
 
             async for event in await self.llm.chat(
@@ -161,12 +160,8 @@ class AgentExecutor(Generic[ContextT]):
                     async for event_or_result in self._execute_tool_stream(
                         tool_name, tool_id, tool_inputs, context, approved
                     ):
-                        if (
-                            isinstance(event_or_result, dict)
-                            and event_or_result.get("type", "").startswith("data-")
-                        ):
-                            # This is a ToolStreamEvent (TypedDict with type starting with 'data-')
-                            yield ToolStreamEvent(type=event_or_result["type"], data=event_or_result.get("data"))
+                        if isinstance(event_or_result, ToolStreamEvent):
+                            yield event_or_result
                         else:
                             result = event_or_result
                 except Exception as e:
