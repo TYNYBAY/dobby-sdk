@@ -1,20 +1,20 @@
 """AgentExecutor for managing tool registration and agentic LLM interactions.
 
 This module provides the AgentExecutor class which handles:
-- Tool registration via @agent.tool() decorator
+- Tool registration via Tool class instances
 - Agentic loop with streaming support
 - Tool execution with injected context
 """
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 import inspect
-from typing import Any, Literal
+from typing import Any, Generic, Literal, TypeVar
 
 from ._logging import logger
 
+from .exceptions import ApprovalRequired
 from .providers.openai import OpenAIProvider
-from .tools.base import ToolSchema
-from .tools.schema_utils import process_tool_definition
+from .tools.tool import Tool
 from .types import (
     MessagePart,
     StreamEndEvent,
@@ -25,9 +25,14 @@ from .types import (
     ToolUsePart,
 )
 
+ContextT = TypeVar('ContextT')
 
-class AgentExecutor:
+
+class AgentExecutor(Generic[ContextT]):
     """Manages tool registration, execution, and LLM interactions with streaming support.
+
+    Type Parameters:
+        ContextT: Type of context object passed to tools via Injected[ContextT]
 
     Attributes:
         provider: The LLM provider type ('openai', 'azure-openai', 'anthropic')
@@ -38,64 +43,24 @@ class AgentExecutor:
         self,
         provider: Literal["openai", "azure-openai", "anthropic"],
         llm: OpenAIProvider,
+        tools: list[Tool] | None = None,
     ):
         """Initialize the AgentExecutor.
 
         Args:
             provider: LLM provider type for schema formatting
             llm: LLM provider instance for chat completions
+            tools: List of Tool instances to register
         """
         self.provider = provider
         self.llm = llm
-        self._tools: dict[str, Callable] = {}
-        self._tool_schemas: dict[str, ToolSchema] = {}
-        self._tool_metadata: dict[str, dict[str, Any]] = {}
+        self._tools: dict[str, Tool] = {}
         self._formatted_tools: list | None = None
-
-    def tool(
-        self,
-        description: str,
-        name: str | None = None,
-        stream_output: bool = False,
-        version: str = "1.0.0",
-    ) -> Callable[[Callable], Callable]:
-        """Decorator to register tools with the agent.
-
-        Args:
-            description: Tool description for LLM
-            name: Optional tool name (defaults to function name)
-            stream_output: If True, tool is async generator yielding ToolStreamEvent
-            version: Tool version
-
-        Returns:
-            Decorator function that registers the tool
-
-        Example:
-            @agent.tool(description="Create document", stream_output=True)
-            async def create_document(ctx: Injected[ToolContext], title: str):
-                yield ToolStreamEvent(type="data-title", data=title)
-                yield {"id": "123"}  # Final result
-        """
-
-        def decorator(func: Callable) -> Callable:
-            schema, injected_params = process_tool_definition(
-                func, name, description, version
-            )
-
-            tool_name = schema.name
-            self._tools[tool_name] = func
-            self._tool_schemas[tool_name] = schema
-            self._tool_metadata[tool_name] = {
-                "injected_params": injected_params,
-                "stream_output": stream_output,
-            }
-            self._formatted_tools = None  # Clear cache
-
-            logger.debug(f"Registering tool: {schema.name}")
-
-            return func
-
-        return decorator
+        
+        if tools:
+            for tool in tools:
+                self._tools[tool._tool_schema.name] = tool
+                logger.debug(f"Registered tool: {tool._tool_schema.name}")
 
     def get_tools_schema(self) -> list:
         """Get tool schemas formatted for the LLM provider.
@@ -107,13 +72,13 @@ class AgentExecutor:
             match self.provider:
                 case "openai" | "azure-openai":
                     self._formatted_tools = [
-                        schema.to_openai_format()
-                        for schema in self._tool_schemas.values()
+                        tool.to_openai_format()
+                        for tool in self._tools.values()
                     ]
                 case "anthropic":
                     self._formatted_tools = [
-                        schema.to_anthropic_format()
-                        for schema in self._tool_schemas.values()
+                        tool.to_anthropic_format()
+                        for tool in self._tools.values()
                     ]
         return self._formatted_tools
 
@@ -121,9 +86,10 @@ class AgentExecutor:
         self,
         messages: list[MessagePart],
         system_prompt: str | None = None,
-        context: Any | None = None,
+        context: ContextT | None = None,
         max_iterations: int = 10,
         reasoning_effort: str | None = None,
+        approved_tool_calls: set[str] | None = None,
     ) -> AsyncIterator[StreamEvent | ToolStreamEvent | ToolResultPart | ToolUseEndEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
 
@@ -133,23 +99,30 @@ class AgentExecutor:
         3. Add tool results to messages
         4. Repeat until LLM returns without tool calls or max iterations
 
-        Currently, the AgentExecutor does not support parallel execution.
-
         Args:
             messages: Conversation messages
             system_prompt: Optional system prompt
-            context: Context to inject into tools (e.g., ToolContext)
+            context: Context to inject into tools (e.g., RunToolContext)
             max_iterations: Maximum tool calling iterations
             reasoning_effort: Optional reasoning effort override
+            approved_tool_calls: Set of tool_call_ids that have been approved
+                for tools with requires_approval=True. If a tool requires
+                approval and its call_id is not in this set, ApprovalRequired
+                is raised.
 
         Yields:
             StreamEvent: LLM streaming events
             ToolStreamEvent: Mid-execution tool events (for streaming tools)
             ToolUsePart: Tool call info
             ToolResultPart: Tool execution results
+
+        Raises:
+            ApprovalRequired: When a tool with requires_approval=True is called
+                and its tool_call_id is not in approved_tool_calls
         """
         tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)
+        approved = approved_tool_calls or set()
 
         for _ in range(max_iterations):
             # Stream from LLM
@@ -186,7 +159,7 @@ class AgentExecutor:
                 is_error = False
                 try:
                     async for event_or_result in self._execute_tool_stream(
-                        tool_name, tool_inputs, context
+                        tool_name, tool_id, tool_inputs, context, approved
                     ):
                         if (
                             isinstance(event_or_result, dict)
@@ -235,54 +208,53 @@ class AgentExecutor:
     async def _execute_tool_stream(
         self,
         tool_name: str,
+        tool_call_id: str,
         inputs: dict[str, Any],
-        context: Any | None,
+        context: ContextT | None,
+        approved_tool_calls: set[str],
     ) -> AsyncIterator[ToolStreamEvent | Any]:
-        """Execute a tool, yielding stream events if stream_output=True.
-
-        Supports three tool types:
-        1. Sync tools: def func() -> result
-        2. Async tools: async def func() -> result
-        3. Streaming tools: async def func() with stream_output=True -> yields events
+        """Execute a tool.
 
         Args:
             tool_name: Name of the tool to execute
+            tool_call_id: Unique ID for this tool call
             inputs: Tool input arguments from LLM
-            context: Context to inject into Injected parameters
+            context: Context to inject if tool takes_ctx
+            approved_tool_calls: Set of approved tool call IDs
 
         Yields:
-            ToolStreamEvent objects during execution (streaming only), then final result
+            ToolStreamEvent for streaming tools, then final result
+
+        Raises:
+            ApprovalRequired: If tool requires approval and not approved
         """
-        func = self._tools[tool_name]
-        metadata = self._tool_metadata[tool_name]
-        injected_params = metadata["injected_params"]
-        stream_output = metadata["stream_output"]
+        tool = self._tools[tool_name]
+
+        if tool.requires_approval and tool_call_id not in approved_tool_calls:
+            raise ApprovalRequired(tool_call_id, tool_name, inputs)
 
         logger.debug(f"[x] Executing tool: {tool_name}")
 
-        # Build kwargs with injected context
         kwargs = dict(inputs)
-        if injected_params and context is not None:
-            for param_name in injected_params:
-                kwargs[param_name] = context
 
-        if stream_output:
-            # Streaming tool - async generator yielding events then final result
-            result = None
-            async for event in func(**kwargs):
-                if (
-                    isinstance(event, dict)
-                    and event.get("type", "").startswith("data-")
-                ):
+        if tool.stream_output:
+            # Streaming tool - yields events then final result
+            if tool.takes_ctx and context is not None:
+                async for event in tool(context, **kwargs):  # type: ignore[misc]
                     yield event
-                else:
-                    result = event
-            yield result
-        elif inspect.iscoroutinefunction(func):
-            # Async tool - await and return
-            result = await func(**kwargs)
-            yield result
+            else:
+                async for event in tool(**kwargs):  # type: ignore[misc]
+                    yield event
         else:
-            # Sync tool - call directly
-            result = func(**kwargs)
+            # Non-streaming tool
+            if tool.takes_ctx and context is not None:
+                if inspect.iscoroutinefunction(tool.__call__):
+                    result = await tool(context, **kwargs)
+                else:
+                    result = tool(context, **kwargs)
+            else:
+                if inspect.iscoroutinefunction(tool.__call__):
+                    result = await tool(**kwargs)
+                else:
+                    result = tool(**kwargs)
             yield result
