@@ -32,6 +32,8 @@ class HybridRetriever[T: Document](BaseRetriever[T]):
         ...     print(f"{doc.content[:100]}... (score: {doc.score})")
     """
 
+    client: AsyncOpenAI | AsyncAzureOpenAI
+    
     def __init__(
         self,
         vector_store: BaseVectorStore[T],
