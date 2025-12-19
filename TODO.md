@@ -1,0 +1,3 @@
+- openai does not return the usage currently
+- Standard the Tool Return format for the functions
+- 
