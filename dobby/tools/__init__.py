@@ -2,5 +2,5 @@ from .base import (
     ToolParameter as ToolParameter,
     ToolSchema as ToolSchema,
 )
-from .decorator import tool as tool
+from .tool import Tool as Tool
 from .injected import Injected as Injected
