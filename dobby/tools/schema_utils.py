@@ -66,7 +66,7 @@ def extract_pydantic_properties(model_class: type[BaseModel]) -> dict[str, ToolP
 
 
 def json_schema_to_tool_parameter(
-    field_name: str, field_schema: dict, defs: dict = None
+    field_name: str, field_schema: dict, defs: dict | None = None
 ) -> ToolParameter:
     """Convert a JSON schema field to ToolParameter."""
     actual_schema = field_schema
@@ -381,6 +381,9 @@ def process_tool_definition(
     injected_params = {}
 
     for param_name, param in sig.parameters.items():
+        # Skip self for class methods
+        if param_name == 'self':
+            continue
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             continue
 
