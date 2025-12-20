@@ -10,10 +10,13 @@ from collections.abc import AsyncIterator
 import inspect
 from typing import Any, Generic, Literal, TypeVar
 
+from pydantic import BaseModel
+
 from ._logging import logger
 
 from .exceptions import ApprovalRequired
 from .providers.openai import OpenAIProvider
+from .tools.base import ToolSchema, ToolParameter
 from .tools.tool import Tool
 from .types import (
     MessagePart,
@@ -26,17 +29,24 @@ from .types import (
 )
 
 ContextT = TypeVar('ContextT')
+OutputT = TypeVar('OutputT', bound=BaseModel)
+
+OUTPUT_TOOL_NAME = "final_result"
 
 
-class AgentExecutor(Generic[ContextT]):
+class AgentExecutor(Generic[ContextT, OutputT]):
     """Manages tool registration, execution, and LLM interactions with streaming support.
 
     Type Parameters:
         ContextT: Type of context object passed to tools via Injected[ContextT]
+        OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
         provider: The LLM provider type ('openai', 'azure-openai', 'anthropic')
         llm: The LLM provider instance
+        output_type: Pydantic model for structured output (optional)
+        output_mode: How to get structured output ('tool' or 'native')
+        last_output: The last validated structured output (if output_type was set)
     """
 
     def __init__(
@@ -44,6 +54,8 @@ class AgentExecutor(Generic[ContextT]):
         provider: Literal["openai", "azure-openai", "anthropic"],
         llm: OpenAIProvider,
         tools: list[Tool] | None = None,
+        output_type: type[OutputT] | None = None,
+        output_mode: Literal["tool", "native"] = "tool",
     ):
         """Initialize the AgentExecutor.
 
@@ -51,16 +63,54 @@ class AgentExecutor(Generic[ContextT]):
             provider: LLM provider type for schema formatting
             llm: LLM provider instance for chat completions
             tools: List of Tool instances to register
+            output_type: Pydantic BaseModel for structured output
+            output_mode: 'tool' (default) or 'native' (NotImplementedError)
         """
         self.provider = provider
         self.llm = llm
+        self.output_type = output_type
+        self.output_mode = output_mode
+        self.last_output: OutputT | None = None
+        
         self._tools: dict[str, Tool] = {}
         self._formatted_tools: list | None = None
+        self._output_tool_schema: ToolSchema | None = None
+        
+        # Validate output_mode
+        if output_type and output_mode == "native":
+            raise NotImplementedError("Native output mode not yet supported. Use 'tool' mode.")
+        
+        # Create output tool schema if output_type is set
+        if output_type and output_mode == "tool":
+            self._output_tool_schema = self._create_output_tool_schema(output_type)
         
         if tools:
             for tool in tools:
                 self._tools[tool._tool_schema.name] = tool
                 logger.debug(f"Registered tool: {tool._tool_schema.name}")
+    
+    def _create_output_tool_schema(self, model: type[BaseModel]) -> ToolSchema:
+        """Create output tool schema from Pydantic model."""
+        json_schema = model.model_json_schema()
+        
+        # Convert Pydantic schema properties to ToolParameters
+        parameters: list[ToolParameter] = []
+        required_fields = set(json_schema.get("required", []))
+        
+        for name, prop in json_schema.get("properties", {}).items():
+            param = ToolParameter(
+                name=name,
+                type=prop.get("type", "string"),
+                description=prop.get("description", prop.get("title", "")),
+                required=name in required_fields,
+            )
+            parameters.append(param)
+        
+        return ToolSchema(
+            name=OUTPUT_TOOL_NAME,
+            description=f"Return the final structured result as {model.__name__}",
+            parameters=parameters,
+        )
 
     def get_tools_schema(self) -> list:
         """Get tool schemas formatted for the LLM provider.
@@ -75,11 +125,17 @@ class AgentExecutor(Generic[ContextT]):
                         tool.to_openai_format()
                         for tool in self._tools.values()
                     ]
+                    # Add output tool if output_type is set
+                    if self._output_tool_schema:
+                        self._formatted_tools.append(self._output_tool_schema.to_openai_format())
                 case "anthropic":
                     self._formatted_tools = [
                         tool.to_anthropic_format()
                         for tool in self._tools.values()
                     ]
+                    # Add output tool for Anthropic format
+                    if self._output_tool_schema:
+                        self._formatted_tools.append(self._output_tool_schema.to_anthropic_format())
         return self._formatted_tools
 
     async def run_stream(
@@ -134,7 +190,7 @@ class AgentExecutor(Generic[ContextT]):
                 stream=True,
                 reasoning_effort=reasoning_effort,
             ):
-                yield event  # Forward LLM events (including ToolUseEvent from provider)
+                yield event
 
                 # Collect tool calls from stream_end event
                 if isinstance(event, StreamEndEvent):
@@ -153,6 +209,31 @@ class AgentExecutor(Generic[ContextT]):
                 tool_name = tool_call["name"]
                 tool_id = tool_call["id"]
                 tool_inputs = tool_call["inputs"]
+
+                # Check if this is the output tool (final_result)
+                if tool_name == OUTPUT_TOOL_NAME and self.output_type:
+                    # Validate output with Pydantic
+                    try:
+                        self.last_output = self.output_type.model_validate(tool_inputs)
+                        logger.debug(f"Validated output: {self.last_output}")
+                        # Yield result event for the output tool
+                        yield ToolResultPart(
+                            type="tool_result_event",
+                            tool_use_id=tool_id,
+                            name=tool_name,
+                            result=tool_inputs,
+                            is_error=False,
+                        )
+                        yield ToolUseEndEvent(
+                            type="tool_use_end",
+                            tool_use_id=tool_id,
+                            tool_name=tool_name,
+                        )
+                        return  # End run - structured output received
+                    except Exception as e:
+                        logger.error(f"Output validation error: {e}")
+                        # TODO: Implement retry logic
+                        raise
 
                 result = None
                 is_error = False
@@ -177,6 +258,8 @@ class AgentExecutor(Generic[ContextT]):
                     is_error=is_error,
                 )
                 
+                # TODO: see what is the requirement of this event ?, as if 
+                # tool_result is generated that indicated too_use_end
                 yield ToolUseEndEvent(
                     type="tool_use_end",
                     tool_use_id=tool_id,
