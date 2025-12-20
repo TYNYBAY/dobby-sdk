@@ -1,9 +1,19 @@
 [project]
 name = "dobby-sdk"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight multi-provider LLM SDK with streaming and tools"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Anant Gupta", email = "anant.gupta@tynybay.com" }]
+keywords = ["llm", "ai", "openai", "anthropic", "streaming", "tools", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "anthropic>=0.75.0",
     "logfire>=4.16.0",
@@ -12,3 +22,14 @@ dependencies = [
     "pydantic>=2.12.5",
     "tavily-python>=0.7.17",
 ]
+
+[project.urls]
+Homepage = "https://github.com/tynybay/dobby-sdk"
+Repository = "https://github.com/tynybay/dobby-sdk"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dobby"]
