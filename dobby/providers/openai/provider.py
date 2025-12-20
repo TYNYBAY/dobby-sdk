@@ -34,6 +34,7 @@ from ...types import (
     Usage,
     UserMessagePart,
 )
+from .converters import content_part_to_openai
 
 __all__ = ["OpenAIProvider", "to_openai_messages"]
 
@@ -400,8 +401,6 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> ResponseInputParam:
     Returns:
         List of OpenAI-formatted message parameters
     """
-    from .converters import content_part_to_openai
-
     openai_messages: ResponseInputParam = []
 
     for message in messages:
