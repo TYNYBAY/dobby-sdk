@@ -3,6 +3,4 @@
 This module provides ready-to-use tools that can be added to any agent.
 """
 
-from .tavily import TavilySearchResult, TavilySearchTool
-
-__all__ = ["TavilySearchResult", "TavilySearchTool"]
+from .tavily import TavilySearchResult as TavilySearchResult, TavilySearchTool as TavilySearchTool

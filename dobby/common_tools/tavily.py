@@ -91,7 +91,7 @@ class TavilySearchTool(Tool):
             query=query,
             search_depth=search_depth,
             topic=topic,
-            time_range=time_range,
+            time_range=time_range, # type: ignore[reportUnknownMemberType]
         )
         return [
             TavilySearchResult(
