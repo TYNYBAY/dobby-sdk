@@ -1,5 +1,5 @@
-from collections.abc import Iterable
-from typing import Literal, TypedDict
+from dataclasses import dataclass, field
+from typing import Literal
 
 from .document_part import DocumentPart
 from .image_part import ImagePart
@@ -7,10 +7,10 @@ from .reasoning_part import ReasoningPart
 from .text_part import TextPart
 from .tool_part import ToolUsePart
 
-# Input content parts (for user messages) - union discriminated by 'type' field
+# Input content parts (for user messages)
 type ContentPart = TextPart | ImagePart | DocumentPart
 
-# Output content parts (for assistant responses) - union discriminated by 'type' field
+# Output content parts (for assistant responses)
 type ResponsePart = TextPart | ReasoningPart | ToolUsePart
 
 
@@ -27,31 +27,37 @@ only non-null in the last response.
 """
 
 
-class UserMessagePart(TypedDict):
+@dataclass
+class UserMessagePart:
+    """A user message with content parts."""
 
-    role: Literal["user"]
+    parts: list[ContentPart] = field(default_factory=list)
 
-    parts: Iterable[ContentPart]
-
-
-class AssistantMessagePart(TypedDict):
-
-    role: Literal["assistant"]
-
-    parts: Iterable[ResponsePart]
+    role: Literal["user"] = "user"
 
 
-class ToolResultMessagePart(TypedDict):
+@dataclass
+class AssistantMessagePart:
+    """An assistant message with content and tool calls."""
 
-    role: Literal["tool_result"]
+    parts: list[ResponsePart] = field(default_factory=list)
+
+    role: Literal["assistant"] = "assistant"
+
+
+@dataclass
+class ToolResultMessagePart:
+    """A tool result message."""
 
     tool_use_id: str
 
     name: str
 
-    parts: Iterable[TextPart | ImagePart | DocumentPart]
+    parts: list[TextPart | ImagePart | DocumentPart] = field(default_factory=list)
 
-    is_error: bool
+    is_error: bool = False
+
+    role: Literal["tool_result"] = "tool_result"
 
 
 type MessagePart = AssistantMessagePart | UserMessagePart | ToolResultMessagePart

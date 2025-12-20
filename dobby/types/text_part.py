@@ -1,8 +1,11 @@
-from typing import Literal, TypedDict
+from dataclasses import dataclass
+from typing import Literal
 
 
-class TextPart(TypedDict):
-
-    type: Literal["text"]
+@dataclass
+class TextPart:
+    """A text content part."""
 
     text: str
+
+    kind: Literal["text"] = "text"

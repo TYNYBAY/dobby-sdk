@@ -1,8 +1,11 @@
-from typing import Literal, TypedDict
+from dataclasses import dataclass
+from typing import Literal
 
 
-class ReasoningPart(TypedDict):
-
-    type: Literal["reasoning"]
+@dataclass
+class ReasoningPart:
+    """Reasoning/thinking content from the model."""
 
     text: str
+
+    kind: Literal["reasoning"] = "reasoning"

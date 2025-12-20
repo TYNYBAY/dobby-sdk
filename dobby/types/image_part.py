@@ -1,29 +1,34 @@
-from typing import Literal, TypedDict
+from dataclasses import dataclass
+from typing import Literal
 
-__all__ = ["ImagePart", "ImageSource", "Base64ImageSource", "URLImageSource"]
 
-
-class Base64ImageSource(TypedDict):
-
-    type: Literal["base64"]
+@dataclass
+class Base64ImageSource:
+    """Image source from base64 data."""
 
     data: str
 
     media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
 
+    kind: Literal["base64"] = "base64"
 
-class URLImageSource(TypedDict):
 
-    type: Literal["url"]
+@dataclass
+class URLImageSource:
+    """Image source from URL."""
 
     url: str
+
+    kind: Literal["url"] = "url"
 
 
 type ImageSource = Base64ImageSource | URLImageSource
 
 
-class ImagePart(TypedDict):
-
-    type: Literal["image"]
+@dataclass
+class ImagePart:
+    """An image content part."""
 
     source: ImageSource
+
+    kind: Literal["image"] = "image"
