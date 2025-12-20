@@ -19,9 +19,12 @@ from .providers.openai import OpenAIProvider
 from .tools.base import ToolSchema, ToolParameter
 from .tools.tool import Tool
 from .types import (
+    AssistantMessagePart,
     MessagePart,
     StreamEndEvent,
     StreamEvent,
+    TextPart,
+    ToolResultMessagePart,
     ToolResultPart,
     ToolStreamEvent,
     ToolUseEndEvent,
@@ -195,9 +198,8 @@ class AgentExecutor(Generic[ContextT, OutputT]):
                 # Collect tool calls from stream_end event
                 if isinstance(event, StreamEndEvent):
                     for part in event.parts:
-                        if isinstance(part, dict) and part.get("type") == "tool_use":
-                            # Cast to ToolUsePart since we verified the type
-                            tool_calls.append(part)  # type: ignore[arg-type]
+                        if isinstance(part, ToolUsePart):
+                            tool_calls.append(part)
 
             # No tool calls = done
             if not tool_calls:
@@ -206,9 +208,9 @@ class AgentExecutor(Generic[ContextT, OutputT]):
             for tool_call in tool_calls:
                 # Provider already yielded the ToolUseEvent
                 # Execute tool and yield stream events
-                tool_name = tool_call["name"]
-                tool_id = tool_call["id"]
-                tool_inputs = tool_call["inputs"]
+                tool_name = tool_call.name
+                tool_id = tool_call.id
+                tool_inputs = tool_call.inputs
 
                 # Check if this is the output tool (final_result)
                 if tool_name == OUTPUT_TOOL_NAME and self.output_type:
@@ -268,19 +270,15 @@ class AgentExecutor(Generic[ContextT, OutputT]):
 
                 # Add to messages for next iteration
                 working_messages.append(
-                    {
-                        "role": "assistant",
-                        "parts": [tool_call],
-                    }
+                    AssistantMessagePart(parts=[tool_call])
                 )
                 working_messages.append(
-                    {
-                        "role": "tool_result",
-                        "tool_use_id": tool_id,
-                        "name": tool_name,
-                        "parts": [{"type": "text", "text": str(result)}],
-                        "is_error": is_error,
-                    }
+                    ToolResultMessagePart(
+                        tool_use_id=tool_id,
+                        name=tool_name,
+                        parts=[TextPart(text=str(result))],
+                        is_error=is_error,
+                    )
                 )
 
     async def _execute_tool_stream(
