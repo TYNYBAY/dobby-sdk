@@ -22,9 +22,9 @@ Example:
             return await ctx.db.get_policy(policy_id)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import inspect
-from typing import Any, get_origin, get_type_hints
+from typing import Any, ClassVar, get_origin, get_type_hints
 
 from .base import ToolSchema
 from .injected import Injected
@@ -39,33 +39,38 @@ class Tool:
     Use Annotated[type, "description"] for parameter descriptions.
     Use Injected[T] for the first parameter to inject runtime context.
     
-    Attributes:
-        name: Tool name (defaults to class name)
+    Class Attributes (define in subclass as class variables, NOT fields):
+        name: Tool name (defaults to class name if not set)
         description: Tool description for the LLM
-        max_retries: Maximum retry attempts on failure
-        requires_approval: Whether tool needs human approval before execution
-        stream_output: Whether tool yields streaming events (requires async generator)
+        max_retries: Maximum retry attempts on failure (default: 1)
+        requires_approval: Whether tool needs human approval before execution (default: False)
+        stream_output: Whether tool yields streaming events (default: False)
     """
     
-    # Auto-generated from __call__ signature
-    _tool_schema: ToolSchema = field(init=False, repr=False)
-    takes_ctx: bool = field(init=False, default=False)
+    # Class variables (ClassVar means NOT a dataclass field)
+    name: ClassVar[str | None] = None  # Falls back to class name if None
+    description: ClassVar[str]  # Required! No default
+    max_retries: ClassVar[int] = 1
+    requires_approval: ClassVar[bool] = False
+    stream_output: ClassVar[bool] = False
     
-    # Overridable class attributes
-    name: str | None = None
-    description: str | None = None
-    max_retries: int = 1
-    requires_approval: bool = False
-    stream_output: bool = False
+    # Auto-generated class variables (set by __init_subclass__)
+    _tool_schema: ClassVar[ToolSchema]
+    takes_ctx: ClassVar[bool] = False
     
     def __init_subclass__(cls, **kwargs):
         """Auto-generate schema when a Tool subclass is defined."""
         super().__init_subclass__(**kwargs)
         
-        # Only process if __call__ is defined and not the base class
-        if hasattr(cls, '__call__') and cls.__call__ is not Tool.__call__:
+        # Only process if __call__ is overridden (not the base class implementation)
+        if "__call__" in cls.__dict__:
+            if not getattr(cls, "description", None):
+                raise TypeError(
+                    f"Tool '{cls.__name__}' must define a 'description' class attribute."
+                )
+            
             # Validate streaming tools are async generators
-            if cls.stream_output:
+            if getattr(cls, "stream_output", False):
                 if not inspect.isasyncgenfunction(cls.__call__):
                     raise TypeError(
                         f"Tool '{cls.__name__}' has stream_output=True but __call__ "
@@ -89,7 +94,7 @@ class Tool:
         try:
             hints = get_type_hints(cls.__call__)
             # Remove 'return' and 'self' from hints
-            param_names = [k for k in hints.keys() if k not in ('return',)]
+            param_names = [k for k in hints.keys() if k not in ("return",)]
             
             if param_names:
                 first_param_type = hints[param_names[0]]
@@ -100,10 +105,14 @@ class Tool:
             # If type hints fail, assume no context
             pass
         
+        # Use class attribute for name, fall back to class name
+        tool_name = getattr(cls, "name", None) or cls.__name__
+        tool_description = getattr(cls, "description", None)
+        
         schema, _ = process_tool_definition(
             cls.__call__,
-            name=getattr(cls, 'name', None) or cls.__name__,
-            description=getattr(cls, 'description', None),
+            name=tool_name,
+            description=tool_description,
             version="1.0.0"
         )
         
