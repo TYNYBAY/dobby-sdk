@@ -112,6 +112,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             parameters=parameters,
         )
 
+    @property
+    def tools(self) -> dict[str, Tool]:
+        """Get all registered tools by name.
+        
+        Returns:
+            Dictionary mapping tool names to Tool instances.
+        """
+        return self._tools
+
     def get_tools_schema(self) -> list:
         """Get tool schemas formatted for the LLM provider.
 
