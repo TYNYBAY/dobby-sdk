@@ -28,7 +28,7 @@ from dobby.types import (
     StreamStartEvent,
     TextDeltaEvent,
     TextPart,
-    ToolResultPart,
+    ToolResultEvent,
     ToolUseEndEvent,
     ToolUseEvent,
     UserMessagePart,
@@ -127,7 +127,7 @@ Always cite your sources by mentioning the URLs."""
                     )
                     print(f"{Colors.DIM}   Inputs: {inputs}{Colors.RESET}\n")
 
-                case ToolResultPart(name=name, result=result):
+                case ToolResultEvent(name=name, result=result):
                     output = str(result)
                     if len(output) > 200:
                         output = output[:200] + "..."

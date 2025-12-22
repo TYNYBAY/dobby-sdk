@@ -122,16 +122,14 @@ class AnalyzeTool(Tool):
         self,
         file_path: Annotated[str, "Path to file"],
     ):
-        yield ToolStreamEvent(type="tool-stream", data="Starting analysis...")
+        yield ToolStreamEvent(type="progress", data="Starting analysis...")
         
         for i in range(10):
             await asyncio.sleep(1)
-            yield ToolStreamEvent(type="tool-stream", data=f"Progress: {i*10}%")
+            yield ToolStreamEvent(type="progress", data=f"Progress: {i*10}%")
         
-        yield ToolUseEndEvent(
-            type="tool-use-end",
-            result=ToolResultPart(output="Analysis complete"),
-        )
+        # Return final result
+        return {"status": "complete", "output": "Analysis finished"}
 ```
 
 ---

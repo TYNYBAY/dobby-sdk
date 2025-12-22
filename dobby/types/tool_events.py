@@ -13,7 +13,7 @@ class ToolStreamEvent(BaseModel):
     data: Any
 
 
-class ToolResultPart(BaseModel):
+class ToolResultEvent(BaseModel):
     """Result from tool execution."""
 
     type: Literal["tool_result_event"] = "tool_result_event"

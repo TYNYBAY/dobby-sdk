@@ -8,12 +8,12 @@ Dobby uses dataclasses for all message and content types. Each type has a `kind`
 graph TB
     M[MessagePart] --> U[UserMessagePart]
     M --> A[AssistantMessagePart]
-    M --> TR[ToolResultMessagePart]
     
     U --> CP[ContentPart]
     CP --> TEXT[TextPart]
     CP --> IMG[ImagePart]
     CP --> DOC[DocumentPart]
+    CP --> TRP[ToolResultPart]
 ```
 
 ---
@@ -22,15 +22,28 @@ graph TB
 
 ### UserMessagePart
 
-User messages contain a list of content parts.
+User messages contain a list of content parts, including tool results.
 
 ```python
-from dobby.types import UserMessagePart, TextPart, ImagePart
+from dobby.types import UserMessagePart, TextPart, ImagePart, ToolResultPart
 
+# Simple text message
 message = UserMessagePart(
     parts=[
         TextPart(text="What's in this image?"),
         ImagePart(source=URLImageSource(url="https://...")),
+    ]
+)
+
+# Tool result (returned after tool execution)
+tool_result = UserMessagePart(
+    parts=[
+        ToolResultPart(
+            tool_use_id="call_123",
+            name="search",
+            parts=[TextPart(text="Search results: ...")],
+            is_error=False,
+        )
     ]
 )
 ```
@@ -47,21 +60,6 @@ message = AssistantMessagePart(
         TextPart(text="Let me search for that."),
         ToolUsePart(id="call_123", name="search", inputs={"query": "..."}),
     ]
-)
-```
-
-### ToolResultMessagePart
-
-Results from tool execution.
-
-```python
-from dobby.types import ToolResultMessagePart, TextPart
-
-result = ToolResultMessagePart(
-    tool_use_id="call_123",
-    name="search",
-    parts=[TextPart(text="Search results: ...")],
-    is_error=False,
 )
 ```
 
@@ -121,6 +119,22 @@ pdf = DocumentPart(
 )
 ```
 
+### ToolResultPart
+
+Results from tool execution. Included in `UserMessagePart.parts`.
+
+```python
+from dobby.types import ToolResultPart, TextPart
+
+result = ToolResultPart(
+    tool_use_id="call_123",
+    name="search",
+    parts=[TextPart(text="Search results: ...")],
+    is_error=False,
+)
+# result.kind == "tool_result"
+```
+
 ---
 
 ## Response Parts
@@ -156,14 +170,14 @@ tool_call = ToolUsePart(
 ## Type Aliases
 
 ```python
-# Content parts for user messages
-type ContentPart = TextPart | ImagePart | DocumentPart
+# Content parts for user messages (includes tool results)
+type ContentPart = TextPart | ImagePart | DocumentPart | ToolResultPart
 
 # Response parts for assistant messages
 type ResponsePart = TextPart | ReasoningPart | ToolUsePart
 
 # All message types
-type MessagePart = UserMessagePart | AssistantMessagePart | ToolResultMessagePart
+type MessagePart = UserMessagePart | AssistantMessagePart
 ```
 
 ---
@@ -182,6 +196,8 @@ for message in messages:
                         print(f"User: {text}")
                     case ImagePart():
                         print("User sent an image")
+                    case ToolResultPart(name=name, parts=result_parts):
+                        print(f"Tool result: {name}")
         
         case AssistantMessagePart(parts=parts):
             for part in parts:

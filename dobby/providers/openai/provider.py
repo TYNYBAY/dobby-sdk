@@ -28,13 +28,13 @@ from ...types import (
     StreamStartEvent,
     TextDeltaEvent,
     TextPart,
-    ToolResultMessagePart,
+    ToolResultPart,
     ToolUseEvent,
     ToolUsePart,
     Usage,
     UserMessagePart,
 )
-from .converters import content_part_to_openai
+from .converters import OpenAIContentPart, content_part_to_openai
 
 __all__ = ["OpenAIProvider", "to_openai_messages"]
 
@@ -440,33 +440,35 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> ResponseInputParam:
                     openai_messages.extend(tool_calls)
 
             case UserMessagePart(parts=parts):
-                content_parts = [content_part_to_openai(p) for p in parts]
+                content_parts: list[OpenAIContentPart] = []
+                tool_outputs: list[Any] = []
+                
+                for p in parts:
+                    if isinstance(p, ToolResultPart):
+                        # Convert ToolResultPart to function_call_output
+                        output_parts: ResponseFunctionCallOutputItemListParam = [
+                            content_part_to_openai(tp) for tp in p.parts
+                        ]
+                        # Add error prefix if tool execution failed
+                        if p.is_error and output_parts:
+                            output_parts.insert(
+                                0, {"type": "input_text", "text": "Failed to execute tool:"}
+                            )
+                        tool_outputs.append({
+                            "type": "function_call_output",
+                            "output": output_parts,
+                            "call_id": p.tool_use_id,
+                            "status": "incomplete" if p.is_error else "completed",
+                        })
+                    else:
+                        content_parts.append(content_part_to_openai(p))
+                
                 if content_parts:
                     openai_messages.append(
                         {"type": "message", "role": "user", "content": content_parts}
                     )
-
-            case ToolResultMessagePart(
-                parts=parts, tool_use_id=tid, is_error=is_error
-            ):
-                output_parts: ResponseFunctionCallOutputItemListParam = [
-                    content_part_to_openai(p) for p in parts
-                ]
-
-                # Add error prefix if tool execution failed
-                if is_error and output_parts:
-                    output_parts.insert(
-                        0, {"type": "input_text", "text": "Failed to execute tool:"}
-                    )
-
-                openai_messages.append(
-                    {
-                        "type": "function_call_output",
-                        "output": output_parts,
-                        "call_id": tid,
-                        "status": "incomplete" if is_error else "completed",
-                    }
-                )
+                if tool_outputs:
+                    openai_messages.extend(tool_outputs)
 
     return openai_messages
 

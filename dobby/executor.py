@@ -8,15 +8,14 @@ This module provides the AgentExecutor class which handles:
 
 from collections.abc import AsyncIterator
 import inspect
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from ._logging import logger
-
 from .exceptions import ApprovalRequired
 from .providers.openai import OpenAIProvider
-from .tools.base import ToolSchema, ToolParameter
+from .tools.base import ToolParameter, ToolSchema
 from .tools.tool import Tool
 from .types import (
     AssistantMessagePart,
@@ -24,20 +23,18 @@ from .types import (
     StreamEndEvent,
     StreamEvent,
     TextPart,
-    ToolResultMessagePart,
+    ToolResultEvent,
     ToolResultPart,
     ToolStreamEvent,
     ToolUseEndEvent,
     ToolUsePart,
+    UserMessagePart,
 )
-
-ContextT = TypeVar('ContextT')
-OutputT = TypeVar('OutputT', bound=BaseModel)
 
 OUTPUT_TOOL_NAME = "final_result"
 
 
-class AgentExecutor(Generic[ContextT, OutputT]):
+class AgentExecutor[ContextT, OutputT: BaseModel]:
     """Manages tool registration, execution, and LLM interactions with streaming support.
 
     Type Parameters:
@@ -219,8 +216,7 @@ class AgentExecutor(Generic[ContextT, OutputT]):
                         self.last_output = self.output_type.model_validate(tool_inputs)
                         logger.debug(f"Validated output: {self.last_output}")
                         # Yield result event for the output tool
-                        yield ToolResultPart(
-                            type="tool_result_event",
+                        yield ToolResultEvent(
                             tool_use_id=tool_id,
                             name=tool_name,
                             result=tool_inputs,
@@ -252,8 +248,7 @@ class AgentExecutor(Generic[ContextT, OutputT]):
                     result = {"error": str(e)}
                     is_error = True
 
-                yield ToolResultPart(
-                    type="tool_result_event",
+                yield ToolResultEvent(
                     tool_use_id=tool_id,
                     name=tool_name,
                     result=result,
@@ -273,12 +268,14 @@ class AgentExecutor(Generic[ContextT, OutputT]):
                     AssistantMessagePart(parts=[tool_call])
                 )
                 working_messages.append(
-                    ToolResultMessagePart(
-                        tool_use_id=tool_id,
-                        name=tool_name,
-                        parts=[TextPart(text=str(result))],
-                        is_error=is_error,
-                    )
+                    UserMessagePart(parts=[
+                        ToolResultPart(
+                            tool_use_id=tool_id,
+                            name=tool_name,
+                            parts=[TextPart(text=str(result))],
+                            is_error=is_error,
+                        )
+                    ])
                 )
 
     async def _execute_tool_stream(
