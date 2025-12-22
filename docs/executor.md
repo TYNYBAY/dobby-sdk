@@ -43,6 +43,19 @@ executor = AgentExecutor(
 | `output_type` | `type[BaseModel]` | Pydantic model for structured output |
 | `output_mode` | `str` | How to get structured output |
 
+### Accessing Registered Tools
+
+```python
+# Get all tools as dict[name, Tool]
+executor.tools
+
+# Get tool names
+list(executor.tools.keys())  # ['search', 'fetch_data', ...]
+
+# Get a specific tool
+executor.tools['search']
+```
+
 ---
 
 ## run_stream()

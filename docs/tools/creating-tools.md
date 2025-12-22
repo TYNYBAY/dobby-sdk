@@ -91,16 +91,28 @@ class GetUserTool(Tool):
         return await ctx.db.get_user(ctx.user_id)
 ```
 
-Pass context to executor:
+Pass tool and context to executor:
 
 ```python
-executor = AgentExecutor(...)
+from dobby import AgentExecutor, OpenAIProvider
 
+# 1. Create context
 context = MyContext(user_id="123", db=db)
 
+# 2. Instantiate tool
+get_user_tool = GetUserTool()
+
+# 3. Create executor with tool
+executor = AgentExecutor(
+    provider="openai",
+    llm=OpenAIProvider(model="gpt-4o"),
+    tools=[get_user_tool],  # Pass tool instances
+)
+
+# 4. Run with context
 async for event in executor.run_stream(
     messages,
-    context=context,  # Passed to tools with Injected[T]
+    context=context,  # Context injected into tools with Injected[T]
 ):
     ...
 ```
