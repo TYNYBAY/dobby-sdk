@@ -1,6 +1,6 @@
 [project]
 name = "dobby-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight multi-provider LLM SDK with streaming and tools"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,9 +36,7 @@ build-backend = "hatchling.build"
 packages = ["dobby"]
 
 [dependency-groups]
-dev = [
-    "pypdf>=6.4.2",
-]
+dev = ["pypdf>=6.4.2"]
 
 [tool.pyrefly]
 # Tells Pyrefly to look in the current folder for imports
@@ -105,7 +103,7 @@ docstring-code-line-length = "dynamic"
 [tool.ruff.lint]
 # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`) codes by default.
 select = ["E4", "E7", "E9", "F", "B", "Q", "I", "D", "UP", "B"]
-ignore = ["B008", "D100", "D101", "D102", "D103", "D104", "D106","D107"]
+ignore = ["B008", "D100", "D101", "D102", "D103", "D104", "D106", "D107"]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]
