@@ -16,6 +16,7 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.75.0",
+    "azure-search-documents>=11.6.0",
     "logfire>=4.16.0",
     "loguru>=0.7.3",
     "openai>=2.14.0",
