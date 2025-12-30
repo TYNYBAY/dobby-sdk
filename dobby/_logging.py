@@ -1,52 +1,35 @@
-"""Loguru logging configuration for dobby SDK.
+"""Logger configuration.
 
-Configuration via environment variables:
-    DOBBY_LOG_LEVEL: DEBUG, INFO, WARNING, ERROR (default: INFO)
-    DOBBY_LOG_FORMAT: "pretty" or "json" (default: pretty)
+Usage at application layer:
+    # Option 1: Environment variable (recommended)
+    export DOBBY_LOG=DEBUG  # or INFO, WARNING, ERROR
 
-Example:
-    # Enable debug logging
-    import os
-    os.environ["DOBBY_LOG_LEVEL"] = "DEBUG"
+    # Option 2: Configure logger in your app
+    import logging
+    logging.getLogger("dobby").setLevel(logging.DEBUG)
+    logging.getLogger("dobby").addHandler(logging.StreamHandler())
 
-    from dobby._logging import logger
-    logger.info("Hello from dobby!")
+Why silent by default?
+    - Avoids log spam in production applications
+    - Lets the application control all logging configuration
+    - Prevents conflicts with application's logging setup
 """
 
+import logging
 import os
-import sys
 
-from loguru import logger
+logger = logging.getLogger("dobby")
 
-# Remove default handler to configure our own
-logger.remove()
-
-LOG_LEVEL = os.getenv("DOBBY_LOG_LEVEL", "INFO").upper()
-LOG_FORMAT = os.getenv("DOBBY_LOG_FORMAT", "pretty").lower()
-
-if LOG_FORMAT == "json":
-    # JSON format for log aggregation systems (production)
-    logger.add(
-        sys.stderr,
-        format="{message}",
-        level=LOG_LEVEL,
-        serialize=True,  # Loguru's built-in JSON serialization
+_level = os.getenv("DOBBY_LOG", "").upper()
+if _level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
     )
-else:
-    # Pretty colored format for development
-    # Loguru auto-detects TTY and enables/disables colors accordingly (True if TTY, False otherwise)
-    logger.add(
-        sys.stderr,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-            "<level>{message}</level>"
-        ),
-        level=LOG_LEVEL,
-        colorize=None,
-        backtrace=True,
-        diagnose=True,
-    )
+    logger.addHandler(_handler)
+    logger.setLevel(getattr(logging, _level))
 
 __all__ = ["logger"]

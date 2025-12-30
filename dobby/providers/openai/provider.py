@@ -348,7 +348,7 @@ class OpenAIProvider:
                         parts.append(ReasoningPart(text=accumulated_reasoning))
                     if accumulated_text:
                         parts.append(TextPart(text=accumulated_text))
-                    # Convert ToolUseEvent (Pydantic) to ToolUsePart (dataclass) for message history
+
                     for tool_event in function_calls:
                         parts.append(ToolUsePart(
                             id=tool_event.id,
