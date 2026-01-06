@@ -382,7 +382,7 @@ def process_tool_definition(
 
     for param_name, param in sig.parameters.items():
         # Skip self for class methods
-        if param_name == 'self':
+        if param_name == "self":
             continue
         if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
             continue

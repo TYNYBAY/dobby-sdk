@@ -3,7 +3,6 @@ from typing import Any
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from .._logging import logger
-
 from ..vector_store.base import BaseVectorStore, Document
 from .base import BaseRetriever
 

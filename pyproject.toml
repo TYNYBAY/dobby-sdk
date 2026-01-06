@@ -40,6 +40,9 @@ dev = [
     "pypdf>=6.4.2",
     "python-dotenv>=1.2.1",
 ]
+lint = [
+    "ruff>=0.14.10",
+]
 
 [tool.pyrefly]
 # Tells Pyrefly to look in the current folder for imports
