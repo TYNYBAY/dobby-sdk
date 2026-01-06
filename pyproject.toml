@@ -33,6 +33,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["dobby"]
+artifacts = ["dobby/py.typed"]
 
 [dependency-groups]
 dev = [
