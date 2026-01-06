@@ -15,7 +15,6 @@ from pydantic import BaseModel
 from ._logging import logger
 from .exceptions import ApprovalRequired
 from .providers.openai import OpenAIProvider
-from .tools.base import ToolParameter, ToolSchema
 from .tools.tool import Tool
 from .types import (
     AssistantMessagePart,
@@ -74,7 +73,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         
         self._tools: dict[str, Tool] = {}
         self._formatted_tools: list | None = None
-        self._output_tool_schema: ToolSchema | None = None
+        self._output_tool_schema: dict | None = None
         
         # Validate output_mode
         if output_type and output_mode == "native":
@@ -89,28 +88,26 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 self._tools[tool._tool_schema.name] = tool
                 logger.debug(f"Registered tool: {tool._tool_schema.name}")
     
-    def _create_output_tool_schema(self, model: type[BaseModel]) -> ToolSchema:
-        """Create output tool schema from Pydantic model."""
+    def _create_output_tool_schema(self, model: type[BaseModel]) -> dict:
+        """Create output tool schema from Pydantic model.
+        
+        Uses Pydantic's native JSON schema output directly to preserve all
+        type information including enums, nested objects, arrays, dates, etc.
+        
+        Args:
+            model: Pydantic BaseModel class for structured output
+            
+        Returns:
+            OpenAI-compatible tool schema dict with full JSON schema
+        """
         json_schema = model.model_json_schema()
         
-        # Convert Pydantic schema properties to ToolParameters
-        parameters: list[ToolParameter] = []
-        required_fields = set(json_schema.get("required", []))
-        
-        for name, prop in json_schema.get("properties", {}).items():
-            param = ToolParameter(
-                name=name,
-                type=prop.get("type", "string"),
-                description=prop.get("description", prop.get("title", "")),
-                required=name in required_fields,
-            )
-            parameters.append(param)
-        
-        return ToolSchema(
-            name=OUTPUT_TOOL_NAME,
-            description=f"Return the final structured result as {model.__name__}",
-            parameters=parameters,
-        )
+        return {
+            "type": "function",
+            "name": OUTPUT_TOOL_NAME,
+            "description": json_schema.get("description") or f"Return the final structured result as {model.__name__}",
+            "parameters": json_schema,
+        }
 
     @property
     def tools(self) -> dict[str, Tool]:
@@ -134,9 +131,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         tool.to_openai_format()
                         for tool in self._tools.values()
                     ]
-                    # Add output tool if output_type is set
+                    # Add output tool if output_type is set (already in OpenAI format)
                     if self._output_tool_schema:
-                        self._formatted_tools.append(self._output_tool_schema.to_openai_format())
+                        self._formatted_tools.append(self._output_tool_schema)
                 case "anthropic":
                     self._formatted_tools = [
                         tool.to_anthropic_format()
@@ -144,7 +141,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     ]
                     # Add output tool for Anthropic format
                     if self._output_tool_schema:
-                        self._formatted_tools.append(self._output_tool_schema.to_anthropic_format())
+                        # Convert OpenAI format to Anthropic format
+                        self._formatted_tools.append({
+                            "name": self._output_tool_schema["name"],
+                            "description": self._output_tool_schema["description"],
+                            "input_schema": self._output_tool_schema["parameters"],
+                        })
         return self._formatted_tools
 
     async def run_stream(
