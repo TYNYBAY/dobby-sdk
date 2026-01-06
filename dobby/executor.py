@@ -187,7 +187,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ApprovalRequired: When a tool with requires_approval=True is called
                 and its tool_call_id is not in approved_tool_calls
         """
-        tools = self.get_tools_schema() if self._tools else None
+        tools = self.get_tools_schema() if (self._tools or self._output_tool_schema) else None
         working_messages = list(messages)
         approved = approved_tool_calls or set()
 
