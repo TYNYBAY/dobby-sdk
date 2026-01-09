@@ -1,6 +1,6 @@
 [project]
 name = "dobby-sdk"
-version = "0.2.4"
+version = "0.2.5"
 description = "Lightweight multi-provider LLM SDK with streaming and tools"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,6 +30,7 @@ dependencies = [
     "openai>=2.14.0",
     "pydantic>=2.12.5",
     "tavily-python>=0.7.17",
+    "tenacity>=9.1.2",
 ]
 
 [project.urls]

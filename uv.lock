@@ -166,7 +166,7 @@ wheels = [
 
 [[package]]
 name = "dobby-sdk"
-version = "0.2.4"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
@@ -175,6 +175,7 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
     { name = "tavily-python" },
+    { name = "tenacity" },
 ]
 
 [package.dev-dependencies]
@@ -194,6 +195,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.14.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "tavily-python", specifier = ">=0.7.17" },
+    { name = "tenacity", specifier = ">=9.1.2" },
 ]
 
 [package.metadata.requires-dev]
@@ -813,6 +815,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5f/eb/d7371ee68119380ab6561c6998eacf3031327ba89c6081d36128ab4a2184/tavily_python-0.7.17.tar.gz", hash = "sha256:437ba064639dfdce1acdbc37cbb73246abe500ab735e988a4b8698a8d5fb7df7", size = 21321, upload-time = "2025-12-17T17:08:39.3Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/ce/88565f0c9f7654bc90e19f1e76b3bffee7ff9c1741a2124ec2f2900fb080/tavily_python-0.7.17-py3-none-any.whl", hash = "sha256:a2725b9cba71e404e73d19ff277df916283c10100137c336e07f8e1bd7789fcf", size = 18214, upload-time = "2025-12-17T17:08:38.442Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0a/d4/2b0cd0fe285e14b36db076e78c93766ff1d529d70408bd1d2a5a84f1d929/tenacity-9.1.2.tar.gz", hash = "sha256:1169d376c297e7de388d18b4481760d478b0e99a777cad3a9c86e556f4b697cb", size = 48036, upload-time = "2025-04-02T08:25:09.966Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/30/643397144bfbfec6f6ef821f36f33e57d35946c44a2352d3c9f0ae847619/tenacity-9.1.2-py3-none-any.whl", hash = "sha256:f77bf36710d8b73a50b2dd155c97b870017ad21afe6ab300326b0371b3b05138", size = 28248, upload-time = "2025-04-02T08:25:07.678Z" },
 ]
 
 [[package]]

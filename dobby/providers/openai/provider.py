@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator, Iterable
 import json
 from typing import Any, Literal, overload
 
+import openai
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.responses import (
     ResponseFunctionCallOutputItemListParam,
@@ -35,6 +36,7 @@ from ...types import (
     UserMessagePart,
 )
 from .converters import OpenAIContentPart, content_part_to_openai
+from .._retry import with_retries
 
 __all__ = ["OpenAIProvider", "to_openai_messages"]
 
@@ -55,6 +57,8 @@ class OpenAIProvider:
     model: str
     azure_deployment_id: str | None
     client: AsyncOpenAI | AsyncAzureOpenAI
+    max_retries: int
+    _retry_errors: tuple[type[BaseException], ...]
 
     def __init__(
         self,
@@ -63,6 +67,7 @@ class OpenAIProvider:
         base_url: str | None = None,
         azure_deployment_id: str | None = None,
         azure_api_version: str = "2025-03-01-preview",
+        max_retries: int = 3,
     ):
         """Initialize OpenAI provider.
 
@@ -72,6 +77,7 @@ class OpenAIProvider:
             base_url: API endpoint URL. If contains 'azure', Azure client is used.
             azure_deployment_id: Azure deployment ID. Auto-set from model if using Azure.
             azure_api_version: Azure API version. Defaults to latest preview.
+            max_retries: Maximum retry attempts for transient errors. Defaults to 3.
 
         Note:
             Azure is automatically detected if 'azure' appears in base_url.
@@ -80,6 +86,13 @@ class OpenAIProvider:
         self.api_key = api_key
         self.base_url = base_url
         self.azure_deployment_id = azure_deployment_id
+        self.max_retries = max_retries
+        self._retry_errors = (
+            openai.RateLimitError,
+            openai.APIConnectionError,
+            openai.APITimeoutError,
+            openai.InternalServerError,
+        )
 
         if base_url is not None and "azure" in base_url:
             self.client = AsyncAzureOpenAI(
@@ -257,6 +270,7 @@ class OpenAIProvider:
             usage=usage,
         )
 
+    @with_retries
     async def _stream_chat_completion(
         self,
         messages: ResponseInputParam,
