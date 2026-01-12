@@ -35,8 +35,8 @@ from ...types import (
     Usage,
     UserMessagePart,
 )
-from .converters import OpenAIContentPart, content_part_to_openai
 from .._retry import with_retries
+from .converters import OpenAIContentPart, content_part_to_openai
 
 __all__ = ["OpenAIProvider", "to_openai_messages"]
 
