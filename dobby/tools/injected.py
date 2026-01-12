@@ -1,4 +1,3 @@
-
 class Injected[T]:
     """Marks a parameter as runtime-injected (hidden from LLM schema).
 

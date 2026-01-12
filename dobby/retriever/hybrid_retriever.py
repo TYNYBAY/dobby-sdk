@@ -32,7 +32,7 @@ class HybridRetriever[T: Document](BaseRetriever[T]):
     """
 
     client: AsyncOpenAI | AsyncAzureOpenAI
-    
+
     def __init__(
         self,
         vector_store: BaseVectorStore[T],

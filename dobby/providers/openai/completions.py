@@ -1,7 +1,7 @@
 """OpenAI Chat Completions API provider.
 
 NOTE: This module uses the legacy Chat Completions API.
-For new implementations, prefer openai.py which uses the Responses API.
+For new implementations, prefer adapter/OpenAIProvider which uses the Responses API.
 This module is kept for backwards compatibility but may be removed in future versions.
 """
 
@@ -36,8 +36,6 @@ from ..types import (
     ToolUsePart,
     Usage,
 )
-
-__all__ = ["OpenAICompletionsProvider", "to_openai_messages"]
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +317,9 @@ class OpenAICompletionsProvider:
                             )
                             parts.append(tool_part)
                         except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse tool arguments: {tool_data['arguments']}")
+                            logger.warning(
+                                f"Failed to parse tool arguments: {tool_data['arguments']}"
+                            )
 
                 usage_data: Usage | None = None
                 if chunk.usage:
@@ -431,9 +431,7 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
                         if part["source"]["type"] == "url"
                         else f"data:{part['source']['media_type']};base64,{part['source']['data']}"
                     )
-                    content_parts.append(
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    )
+                    content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
                 elif part_type == "document":
                     raise NotImplementedError("Documents not supported by Chat Completions API")
 

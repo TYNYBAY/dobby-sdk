@@ -92,9 +92,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
                 return await f(self, *args, **kwargs)
 
     @functools.wraps(f)
-    async def async_gen_wrapper(
-        self: Any, *args: Any, **kwargs: Any
-    ) -> AsyncIterator[Any]:
+    async def async_gen_wrapper(self: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         max_retries = getattr(self, "max_retries", 0)
         errors = getattr(self, "_retry_errors", ())
 

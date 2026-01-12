@@ -11,5 +11,7 @@ class ToolUsePart:
     name: str
 
     inputs: dict[str, Any]
+    
+    metadata: dict[str, Any] | None = None
 
     kind: Literal["tool_use"] = "tool_use"

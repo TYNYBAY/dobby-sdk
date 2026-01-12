@@ -19,9 +19,7 @@ from ...types import (
 )
 
 OpenAIContentPart = (
-    ResponseInputTextContentParam
-    | ResponseInputImageContentParam
-    | ResponseInputFileContentParam
+    ResponseInputTextContentParam | ResponseInputImageContentParam | ResponseInputFileContentParam
 )
 
 

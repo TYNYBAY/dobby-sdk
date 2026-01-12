@@ -14,8 +14,7 @@ try:
     from tavily import AsyncTavilyClient
 except ImportError as e:
     raise ImportError(
-        "Please install 'tavily-python' to use the Tavily search tool: "
-        "pip install tavily-python"
+        "Please install 'tavily-python' to use the Tavily search tool: pip install tavily-python"
     ) from e
 
 
@@ -91,7 +90,7 @@ class TavilySearchTool(Tool):
             query=query,
             search_depth=search_depth,
             topic=topic,
-            time_range=time_range, # type: ignore[reportUnknownMemberType]
+            time_range=time_range,  # type: ignore[reportUnknownMemberType]
         )
         return [
             TavilySearchResult(

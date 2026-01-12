@@ -8,7 +8,6 @@ from .usage import Usage
 
 
 class StreamStartEvent(BaseModel):
-
     type: Literal["stream_start"] = "stream_start"
 
     id: str
@@ -17,14 +16,12 @@ class StreamStartEvent(BaseModel):
 
 
 class TextDeltaEvent(BaseModel):
-
     type: Literal["text_delta"] = "text_delta"
 
     delta: str
 
 
 class ReasoningDeltaEvent(BaseModel):
-
     type: Literal["reasoning_delta"] = "reasoning_delta"
 
     delta: str
@@ -56,7 +53,7 @@ class StreamErrorEvent(BaseModel):
 
 class ToolUseEvent(BaseModel):
     """Event when LLM requests a tool call during streaming.
-    
+
     Note: This is different from ToolUsePart (TypedDict) which is used in message history.
     ToolUseEvent is a Pydantic model for streaming output, ToolUsePart is for input messages.
     """
@@ -71,9 +68,10 @@ class ToolUseEvent(BaseModel):
     inputs: dict[str, Any]
     """Arguments to pass to the tool."""
 
+    metadata: dict[str, Any] | None = None
+
 
 class StreamEndEvent(BaseModel):
-
     type: Literal["stream_end"] = "stream_end"
 
     model: str
@@ -88,7 +86,7 @@ class StreamEndEvent(BaseModel):
     This value will be a non-null string if one of the provided custom stop sequences was generated.
     `anthropic` returns `stop_reason`, this will be `None` for other providers like openai,
     """
-    
+
     usage: Usage | None
 
 

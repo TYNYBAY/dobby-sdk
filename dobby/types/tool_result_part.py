@@ -19,4 +19,3 @@ class ToolResultPart:
     is_error: bool = False
 
     kind: Literal["tool_result"] = "tool_result"
-

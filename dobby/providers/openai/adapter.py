@@ -36,27 +36,33 @@ from ...types import (
     UserMessagePart,
 )
 from .._retry import with_retries
+from ..base import Provider
 from .converters import OpenAIContentPart, content_part_to_openai
 
-__all__ = ["OpenAIProvider", "to_openai_messages"]
 
-
-class OpenAIProvider:
+class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
     """Provider for OpenAI and Azure OpenAI using Responses API.
+
+    Inherits from Provider base class and implements the chat() interface
+    for OpenAI's Responses API (not Chat Completions).
 
     Attributes:
         api_key: API key for authentication
         base_url: Base URL for API endpoint (None for default OpenAI)
-        model: Model name for OpenAI or deployment ID for Azure
         azure_deployment_id: Azure deployment ID (auto-set when using Azure)
-        client: Async client instance (OpenAI or Azure)
+
+    Inherited from Provider:
+        name: Returns "openai" or "azure-openai" based on configuration
+        model: Returns the model name or Azure deployment ID
+        client: Returns the AsyncOpenAI or AsyncAzureOpenAI client instance
+        max_retries: Maximum retry attempts (default: 3)
     """
 
     api_key: str | None
     base_url: str | None
-    model: str
+    _model: str
     azure_deployment_id: str | None
-    client: AsyncOpenAI | AsyncAzureOpenAI
+    _client: AsyncOpenAI | AsyncAzureOpenAI
     max_retries: int
     _retry_errors: tuple[type[BaseException], ...]
 
@@ -95,19 +101,36 @@ class OpenAIProvider:
         )
 
         if base_url is not None and "azure" in base_url:
-            self.client = AsyncAzureOpenAI(
+            self._client = AsyncAzureOpenAI(
                 api_key=api_key,
                 azure_endpoint=base_url,
                 azure_deployment=azure_deployment_id,
                 api_version=azure_api_version,
             )
-            self.model = azure_deployment_id
+            self._model = azure_deployment_id
         else:
-            self.client = AsyncOpenAI(
+            self._client = AsyncOpenAI(
                 base_url=base_url,
                 api_key=api_key,
             )
-            self.model = model
+            self._model = model
+
+    @property
+    def name(self) -> str:
+        """Provider name."""
+        if self.base_url and "azure" in self.base_url:
+            return "azure-openai"
+        return "openai"
+
+    @property
+    def model(self) -> str:
+        """Model identifier."""
+        return self._model
+
+    @property
+    def client(self) -> AsyncOpenAI | AsyncAzureOpenAI:
+        """Authenticated client instance."""
+        return self._client
 
     @staticmethod
     def _build_kwargs(
@@ -140,7 +163,7 @@ class OpenAIProvider:
             kwargs["tools"] = tools
         if reasoning is not None:
             kwargs["reasoning"] = reasoning
-        
+
         # logger.debug(f"kwargs: {kwargs}")
         return kwargs
 
@@ -204,8 +227,8 @@ class OpenAIProvider:
         if system_prompt is not None:
             openai_messages.insert(0, {"role": "system", "content": system_prompt})
 
-        # Determine model to use (override > instance > azure)
-        target_model = self.model or self.azure_deployment_id
+        # Determine model to use (instance model > azure deployment)
+        target_model = self._model or self.azure_deployment_id
 
         if stream:
             return self._stream_chat_completion(
@@ -224,7 +247,7 @@ class OpenAIProvider:
             tools=tools,
             reasoning=reasoning_param,
         )
-        response = await self.client.responses.create(stream=False, **create_kwargs)
+        response = await self._client.responses.create(stream=False, **create_kwargs)
 
         stop_reason: StopReason = "end_turn"
         parts: list[ResponsePart] = []
@@ -264,7 +287,7 @@ class OpenAIProvider:
             )
 
         return StreamEndEvent(
-            model=response.model or self.model or self.azure_deployment_id,
+            model=response.model or self._model or self.azure_deployment_id,
             parts=parts,
             stop_reason=stop_reason,
             usage=usage,
@@ -307,7 +330,7 @@ class OpenAIProvider:
             reasoning=reasoning_param,
         )
 
-        response_stream = await self.client.responses.create(stream=True, **create_kwargs)
+        response_stream = await self._client.responses.create(stream=True, **create_kwargs)
 
         response_id: str | None = None
         model_name: str = model
@@ -324,7 +347,7 @@ class OpenAIProvider:
                         id=response_id,
                         model=model_name,
                     )
-                
+
                 case "response.output_item.added":
                     # Reasoning starts when OpenAI adds a reasoning item (content=None initially)
                     if event.item.type == "reasoning" and event.item.content is None:
@@ -338,7 +361,7 @@ class OpenAIProvider:
                 case "response.reasoning_summary_text.delta":
                     accumulated_reasoning += event.delta
                     yield ReasoningDeltaEvent(delta=event.delta)
-                
+
                 case "response.reasoning_summary_text.done":
                     yield ReasoningEndEvent(type="reasoning_end")
 
@@ -364,11 +387,13 @@ class OpenAIProvider:
                         parts.append(TextPart(text=accumulated_text))
 
                     for tool_event in function_calls:
-                        parts.append(ToolUsePart(
-                            id=tool_event.id,
-                            name=tool_event.name,
-                            inputs=tool_event.inputs,
-                        ))
+                        parts.append(
+                            ToolUsePart(
+                                id=tool_event.id,
+                                name=tool_event.name,
+                                inputs=tool_event.inputs,
+                            )
+                        )
 
                     # Determine stop reason
                     stop_reason: StopReason = "tool_use" if function_calls else "end_turn"
@@ -449,14 +474,13 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> ResponseInputParam:
                 if assistant_message["content"]:
                     openai_messages.append(assistant_message)
 
-
                 if tool_calls:
                     openai_messages.extend(tool_calls)
 
             case UserMessagePart(parts=parts):
                 content_parts: list[OpenAIContentPart] = []
                 tool_outputs: list[Any] = []
-                
+
                 for p in parts:
                     if isinstance(p, ToolResultPart):
                         # Convert ToolResultPart to function_call_output
@@ -468,15 +492,17 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> ResponseInputParam:
                             output_parts.insert(
                                 0, {"type": "input_text", "text": "Failed to execute tool:"}
                             )
-                        tool_outputs.append({
-                            "type": "function_call_output",
-                            "output": output_parts,
-                            "call_id": p.tool_use_id,
-                            "status": "incomplete" if p.is_error else "completed",
-                        })
+                        tool_outputs.append(
+                            {
+                                "type": "function_call_output",
+                                "output": output_parts,
+                                "call_id": p.tool_use_id,
+                                "status": "incomplete" if p.is_error else "completed",
+                            }
+                        )
                     else:
                         content_parts.append(content_part_to_openai(p))
-                
+
                 if content_parts:
                     openai_messages.append(
                         {"type": "message", "role": "user", "content": content_parts}
@@ -485,4 +511,3 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> ResponseInputParam:
                     openai_messages.extend(tool_outputs)
 
     return openai_messages
-
