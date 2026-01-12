@@ -19,7 +19,7 @@ from typing import (
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
-from .base import ParameterType, ToolParameter, ToolSchema
+from .base import ParameterType, ToolParameter
 from .injected import Injected
 
 
@@ -64,7 +64,7 @@ def extract_pydantic_properties(model_class: type[BaseModel]) -> dict[str, ToolP
 
     return properties
 
-
+# TODO: i feel that this method can be optmized, check this
 def json_schema_to_tool_parameter(
     field_name: str, field_schema: dict, defs: dict | None = None
 ) -> ToolParameter:
@@ -353,8 +353,8 @@ def extract_parameter_from_annotation(
 
 
 def process_tool_definition(
-    func: Callable, name: str | None, description: str | None, version: str = "1.0.0"
-) -> tuple[ToolSchema, dict]:
+    func: Callable, description: str | None, version: str = "1.0.0"
+) -> tuple[list[ToolParameter], dict]:
     """Shared tool processing logic for both standalone and agent-bound decorators.
 
     This function extracts all the common logic for processing a function into a tool,
@@ -362,20 +362,15 @@ def process_tool_definition(
 
     Args:
         func: Function to process into a tool
-        name: Tool name (optional, defaults to function name)
-        description: Tool description (optional, uses docstring if not provided)
-        version: Tool version
+        name: Tool name (optional, defaults to function name) - unused here but kept for API compat
+        description: Tool description (optional, uses docstring if not provided) - unused here
+        version: Tool version - unused here
 
     Returns:
-        tuple: (ToolSchema for LLM, injected_params dict for runtime)
+        tuple: (List of ToolParameters for LLM, injected_params dict for runtime)
     """
-    func_name = name or func.__name__
     sig = inspect.signature(func)
     type_hints = get_type_hints(func, include_extras=True)
-
-    tool_description = (
-        description or (func.__doc__ and func.__doc__.strip()) or f"Function {func_name}"
-    )
 
     visible_params = []
     injected_params = {}
@@ -403,12 +398,6 @@ def process_tool_definition(
             if tool_param:
                 visible_params.append(tool_param)
 
-    # Create schema with only visible parameters
-    schema = ToolSchema(
-        name=func_name,
-        description=tool_description,
-        parameters=visible_params,  # Only non-injected params
-        version=version,
-    )
-
-    return schema, injected_params
+    # Return only parameters and injected params
+    # Name and description are handled by the caller (Tool class)
+    return visible_params, injected_params

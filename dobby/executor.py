@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from ._logging import logger
 from .exceptions import ApprovalRequired
-from .providers.openai import OpenAIProvider
+from .providers.base import Provider
 from .tools.tool import Tool
 from .types import (
     AssistantMessagePart,
@@ -41,7 +41,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
-        provider: The LLM provider type ('openai', 'azure-openai', 'anthropic')
+        provider: The LLM provider type ('openai', 'azure-openai', 'gemini', 'anthropic')
         llm: The LLM provider instance
         output_type: Pydantic model for structured output (optional)
         output_mode: How to get structured output ('tool' or 'native')
@@ -50,8 +50,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
     def __init__(
         self,
-        provider: Literal["openai", "azure-openai", "anthropic"],
-        llm: OpenAIProvider,
+        provider: Literal["openai", "azure-openai", "gemini", "anthropic"],
+        llm: Provider,
         tools: list[Tool] | None = None,
         output_type: type[OutputT] | None = None,
         output_mode: Literal["tool", "native"] = "tool",
@@ -70,49 +70,31 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         self.output_type = output_type
         self.output_mode = output_mode
         self.last_output: OutputT | None = None
-        
+
         self._tools: dict[str, Tool] = {}
         self._formatted_tools: list | None = None
-        self._output_tool_schema: dict | None = None
-        
-        # Validate output_mode
+
         if output_type and output_mode == "native":
             raise NotImplementedError("Native output mode not yet supported. Use 'tool' mode.")
-        
+
         # Create output tool schema if output_type is set
         if output_type and output_mode == "tool":
-            self._output_tool_schema = self._create_output_tool_schema(output_type)
-        
+            description = (
+                output_type.model_json_schema().get("description")
+                or f"Return the final structured result as {output_type.__name__}"
+            )
+            output_tool = Tool.from_model(output_type, name=OUTPUT_TOOL_NAME, description=description)
+            self._tools[output_tool.name] = output_tool
+
         if tools:
             for tool in tools:
-                self._tools[tool._tool_schema.name] = tool
-                logger.debug(f"Registered tool: {tool._tool_schema.name}")
-    
-    def _create_output_tool_schema(self, model: type[BaseModel]) -> dict:
-        """Create output tool schema from Pydantic model.
-        
-        Uses Pydantic's native JSON schema output directly to preserve all
-        type information including enums, nested objects, arrays, dates, etc.
-        
-        Args:
-            model: Pydantic BaseModel class for structured output
-            
-        Returns:
-            OpenAI-compatible tool schema dict with full JSON schema
-        """
-        json_schema = model.model_json_schema()
-        
-        return {
-            "type": "function",
-            "name": OUTPUT_TOOL_NAME,
-            "description": json_schema.get("description") or f"Return the final structured result as {model.__name__}",
-            "parameters": json_schema,
-        }
+                self._tools[tool.name] = tool
+                logger.debug(f"Registered tool: {tool.name}")
 
     @property
     def tools(self) -> dict[str, Tool]:
         """Get all registered tools by name.
-        
+
         Returns:
             Dictionary mapping tool names to Tool instances.
         """
@@ -128,25 +110,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             match self.provider:
                 case "openai" | "azure-openai":
                     self._formatted_tools = [
-                        tool.to_openai_format()
-                        for tool in self._tools.values()
+                        tool.to_openai_format() for tool in self._tools.values()
                     ]
-                    # Add output tool if output_type is set (already in OpenAI format)
-                    if self._output_tool_schema:
-                        self._formatted_tools.append(self._output_tool_schema)
+                case "gemini":
+                    from google.genai import types as genai_types
+
+                    declarations = [tool.to_gemini_format() for tool in self._tools.values()]
+                    self._formatted_tools = [genai_types.Tool(function_declarations=declarations)]
                 case "anthropic":
                     self._formatted_tools = [
-                        tool.to_anthropic_format()
-                        for tool in self._tools.values()
+                        tool.to_anthropic_format() for tool in self._tools.values()
                     ]
-                    # Add output tool for Anthropic format
-                    if self._output_tool_schema:
-                        # Convert OpenAI format to Anthropic format
-                        self._formatted_tools.append({
-                            "name": self._output_tool_schema["name"],
-                            "description": self._output_tool_schema["description"],
-                            "input_schema": self._output_tool_schema["parameters"],
-                        })
         return self._formatted_tools
 
     async def run_stream(
@@ -187,7 +161,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ApprovalRequired: When a tool with requires_approval=True is called
                 and its tool_call_id is not in approved_tool_calls
         """
-        tools = self.get_tools_schema() if (self._tools or self._output_tool_schema) else None
+        tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)
         approved = approved_tool_calls or set()
 
@@ -265,8 +239,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     result=result,
                     is_error=is_error,
                 )
-                
-                # TODO: see what is the requirement of this event ?, as if 
+
+                # TODO: see what is the requirement of this event ?, as if
                 # tool_result is generated that indicated too_use_end
                 yield ToolUseEndEvent(
                     type="tool_use_end",
@@ -275,18 +249,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 )
 
                 # Add to messages for next iteration
+                working_messages.append(AssistantMessagePart(parts=[tool_call]))
                 working_messages.append(
-                    AssistantMessagePart(parts=[tool_call])
-                )
-                working_messages.append(
-                    UserMessagePart(parts=[
-                        ToolResultPart(
-                            tool_use_id=tool_id,
-                            name=tool_name,
-                            parts=[TextPart(text=str(result))],
-                            is_error=is_error,
-                        )
-                    ])
+                    UserMessagePart(
+                        parts=[
+                            ToolResultPart(
+                                tool_use_id=tool_id,
+                                name=tool_name,
+                                parts=[TextPart(text=str(result))],
+                                is_error=is_error,
+                            )
+                        ]
+                    )
                 )
 
     async def _execute_tool_stream(

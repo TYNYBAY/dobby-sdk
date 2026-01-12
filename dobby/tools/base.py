@@ -3,8 +3,7 @@
 from enum import Enum
 from typing import Any
 
-from openai.types.responses import FunctionToolParam
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class ParameterType(str, Enum):
@@ -93,44 +92,3 @@ class ToolParameter(BaseModel):
 
         return schema
 
-
-class ToolSchema(BaseModel):
-    """Complete schema definition for a tool."""
-
-    name: str = Field(..., description="Name of the tool/function")
-    """Unique identifier for the tool."""
-
-    description: str = Field(..., description="What the tool does")
-    """Human-readable description of the tool's purpose and functionality."""
-
-    parameters: list[ToolParameter] = Field(default_factory=list)
-    """List of parameters the tool accepts."""
-
-    # Optional metadata
-    version: str = "1.0.0"
-    """Version of the tool schema."""
-
-    def to_openai_format(self) -> FunctionToolParam:
-        """Convert to OpenAI function calling format."""
-        return FunctionToolParam(
-            type="function",
-            name=self.name,
-            description=self.description,
-            parameters={
-                "type": "object",
-                "properties": {param.name: param.to_json_schema() for param in self.parameters},
-                "required": [p.name for p in self.parameters if p.required],
-            },
-        )
-
-    def to_anthropic_format(self) -> dict[str, Any]:
-        """Convert to Anthropic tool format."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": {param.name: param.to_json_schema() for param in self.parameters},
-                "required": [p.name for p in self.parameters if p.required],
-            },
-        }
