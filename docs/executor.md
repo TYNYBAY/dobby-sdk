@@ -85,8 +85,11 @@ The executor yields all provider events plus tool events:
 | `ReasoningDeltaEvent` | Reasoning chunk |
 | `ToolUseEvent` | Tool call from LLM |
 | `ToolStreamEvent` | Progress from streaming tool |
+| `ToolResultEvent` | Tool execution result (check `is_terminal` for terminal tools) |
 | `ToolUseEndEvent` | Tool finished |
 | `StreamEndEvent` | Stream/iteration finished |
+
+> For terminal tools that exit the loop, see [Terminal Tools](./tools/creating-tools.md#terminal-tools).
 
 ---
 
@@ -98,17 +101,22 @@ sequenceDiagram
     participant Executor
     participant LLM
     participant Tool
-    
+
     User->>Executor: run_stream(messages)
     loop Until no tool calls
         Executor->>LLM: chat(messages, tools)
         LLM-->>Executor: TextDelta / ToolUse
         Executor-->>User: yield events
-        
+
         alt Tool calls exist
             Executor->>Tool: execute(inputs, context)
             Tool-->>Executor: ToolResult
-            Executor->>Executor: Add to messages
+            alt Terminal tool (tool.terminal=True)
+                Executor-->>User: ToolResultEvent(is_terminal=True)
+                Note over Executor: Exit loop immediately
+            else Non-terminal tool
+                Executor->>Executor: Add to messages
+            end
         end
     end
     Executor-->>User: StreamEndEvent

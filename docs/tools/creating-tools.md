@@ -31,6 +31,7 @@ class SearchTool(Tool):
 | `max_retries` | `int` | 1 | Retry attempts on failure |
 | `requires_approval` | `bool` | False | Needs human approval |
 | `stream_output` | `bool` | False | Yields streaming events |
+| `terminal` | `bool` | False | Exits agent loop when called |
 
 ---
 
@@ -176,6 +177,134 @@ async for event in executor.run_stream(
             # Show approval UI
             pass
 ```
+
+---
+
+## Terminal Tools
+
+Terminal tools exit the agent loop when called. The result is not sent back to the LLM. Use for actions that end the conversation like hanging up calls, transferring to humans, or escalating.
+
+### Defining Terminal Tools
+
+```python
+from dataclasses import dataclass
+from typing import Annotated
+from dobby import Tool
+
+@dataclass
+class EndCallTool(Tool):
+    name = "end_call"
+    description = "End the call and hang up"
+    terminal = True  # Exits agent loop
+
+    async def __call__(
+        self,
+        reason: Annotated[str, "Reason for ending the call"],
+    ) -> dict:
+        return {"status": "ended", "reason": reason}
+
+@dataclass
+class TransferToHumanTool(Tool):
+    name = "transfer_to_human"
+    description = "Transfer the conversation to a human agent"
+    terminal = True
+
+    async def __call__(
+        self,
+        department: Annotated[str, "Department to transfer to"],
+        summary: Annotated[str, "Summary of the conversation"],
+    ) -> dict:
+        return {"department": department, "summary": summary}
+```
+
+### Complete Example with AgentExecutor
+
+```python
+import asyncio
+from dataclasses import dataclass
+from typing import Annotated
+
+from dobby import AgentExecutor, OpenAIProvider, Tool
+from dobby.types import (
+    TextDeltaEvent,
+    ToolResultEvent,
+    UserMessagePart,
+    TextPart,
+)
+
+# Define a regular tool
+@dataclass
+class SearchKnowledgeBase(Tool):
+    name = "search_kb"
+    description = "Search the knowledge base for information"
+
+    async def __call__(self, query: Annotated[str, "Search query"]) -> str:
+        return f"Found information about: {query}"
+
+# Define a terminal tool
+@dataclass
+class EndCallTool(Tool):
+    name = "end_call"
+    description = "End the call when conversation is complete"
+    terminal = True
+
+    async def __call__(
+        self,
+        reason: Annotated[str, "Reason for ending"],
+    ) -> dict:
+        return {"reason": reason}
+
+async def main():
+    provider = OpenAIProvider(model="gpt-4o")
+
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[SearchKnowledgeBase(), EndCallTool()],
+    )
+
+    messages = [
+        UserMessagePart(parts=[TextPart(text="Help me find info about Python, then end the call.")])
+    ]
+
+    async for event in executor.run_stream(
+        messages,
+        system_prompt="You are a helpful assistant. Use end_call when done.",
+    ):
+        if isinstance(event, TextDeltaEvent):
+            print(event.delta, end="", flush=True)
+
+        elif isinstance(event, ToolResultEvent):
+            if event.is_terminal:
+                # Terminal tool called - loop has exited
+                print(f"\n\n[Call ended: {event.result['reason']}]")
+                # Handle post-call actions here
+                await handle_call_end(event.result)
+            else:
+                # Regular tool result - loop continues
+                print(f"\n[Tool {event.name} returned: {event.result}]\n")
+
+async def handle_call_end(result: dict):
+    """Handle actions after terminal tool is called."""
+    print(f"Saving transcript...")
+    print(f"Call ended with reason: {result['reason']}")
+
+asyncio.run(main())
+```
+
+### How It Works
+
+1. **Regular tools** (`search_kb`): Result is sent back to LLM, loop continues
+2. **Terminal tools** (`end_call`): Result is yielded with `is_terminal=True`, loop exits immediately
+
+### Common Use Cases
+
+| Tool | Description |
+|------|-------------|
+| `end_call` / `hang_up` | End voice calls |
+| `transfer_to_human` | Hand off to human agent |
+| `escalate` | Escalate to supervisor |
+| `complete_task` | Mark task as done and exit |
 
 ---
 
