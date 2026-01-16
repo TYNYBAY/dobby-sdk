@@ -113,10 +113,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         tool.to_openai_format() for tool in self._tools.values()
                     ]
                 case "gemini":
-                    from google.genai import types as genai_types
-
-                    declarations = [tool.to_gemini_format() for tool in self._tools.values()]
-                    self._formatted_tools = [genai_types.Tool(function_declarations=declarations)]
+                    self._formatted_tools = [
+                        tool.to_gemini_format() for tool in self._tools.values()
+                    ]
                 case "anthropic":
                     self._formatted_tools = [
                         tool.to_anthropic_format() for tool in self._tools.values()
@@ -187,6 +186,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             if not tool_calls:
                 break
 
+            # TODO: If LLM returns multiple tools and one is terminal, remaining tools after
+            # the terminal one won't execute. Need to handle this edge case.
+
             for tool_call in tool_calls:
                 # Provider already yielded the ToolUseEvent
                 # Execute tool and yield stream events
@@ -218,6 +220,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         # TODO: Implement retry logic
                         raise
 
+                tool = self._tools.get(tool_name)
+                if not tool:
+                    logger.warning(f"Tool not found: {tool_name}")
+                    continue
+
                 result = None
                 is_error = False
                 try:
@@ -233,11 +240,23 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     result = {"error": str(e)}
                     is_error = True
 
+                if tool.terminal:
+                    yield ToolResultEvent(
+                        tool_use_id=tool_id,
+                        name=tool_name,
+                        result=result,
+                        is_error=is_error,
+                        is_terminal=True,
+                    )
+                    return
+
+                # Non-terminal tool: yield result and continue
                 yield ToolResultEvent(
                     tool_use_id=tool_id,
                     name=tool_name,
                     result=result,
                     is_error=is_error,
+                    is_terminal=False,
                 )
 
                 # TODO: see what is the requirement of this event ?, as if

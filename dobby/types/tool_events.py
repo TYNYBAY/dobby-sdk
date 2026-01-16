@@ -21,6 +21,8 @@ class ToolResultEvent(BaseModel):
     name: str
     result: Any
     is_error: bool = False
+    is_terminal: bool = False
+    """If True, this tool execution exits the agent loop."""
 
 
 class ToolUseEndEvent(BaseModel):
