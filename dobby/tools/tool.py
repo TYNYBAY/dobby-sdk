@@ -49,6 +49,18 @@ class Tool:
         max_retries: Maximum retry attempts on failure (default: 1)
         requires_approval: Whether tool needs human approval before execution (default: False)
         stream_output: Whether tool yields streaming events (default: False)
+        terminal: Whether tool exits the agent loop (default: False)
+
+    Terminal Tools:
+        When terminal=True, the AgentExecutor will:
+        1. Execute the tool
+        2. Yield a ToolResultEvent with is_terminal=True
+        3. Exit the loop without sending result to LLM
+
+        Use for actions that end the conversation:
+        - end_call, hang_up
+        - transfer_to_human
+        - escalate_to_supervisor
     """
 
     # Class Variables: These define tool configuration on the class itself.
@@ -58,6 +70,8 @@ class Tool:
     max_retries: ClassVar[int] = 1
     requires_approval: ClassVar[bool] = False
     stream_output: ClassVar[bool] = False
+    terminal: ClassVar[bool] = False
+    """If True, executing this tool exits the agent loop and returns control to caller."""
 
     # Auto-generated class variables (set by __init_subclass__)
     _parameters: ClassVar[list[ToolParameter]]
@@ -203,8 +217,16 @@ class Tool:
             "input_schema": input_schema,
         }
 
-    def to_gemini_format(self) -> genai_types.FunctionDeclaration:
-        """Get tool definition in Gemini FunctionDeclaration format."""
+    def to_gemini_format(self) -> genai_types.Tool:
+        """Get tool definition in Gemini Tool format.
+
+        Returns a genai_types.Tool containing this tool's FunctionDeclaration.
+        Can be passed directly to GeminiProvider.chat(tools=[...]).
+
+        Example:
+            tools = [my_tool.to_gemini_format()]
+            await provider.chat(messages, tools=tools)
+        """
         if self._model:
             parameters = self._model.model_json_schema()
         else:
@@ -215,8 +237,9 @@ class Tool:
                 "required": [p.name for p in self._parameters if p.required],
             }
 
-        return genai_types.FunctionDeclaration(
+        func_decl = genai_types.FunctionDeclaration(
             name=self.name,
             description=self.description,
             parameters=parameters,
         )
+        return genai_types.Tool(function_declarations=[func_decl])
