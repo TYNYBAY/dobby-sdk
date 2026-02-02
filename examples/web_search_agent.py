@@ -18,7 +18,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from dobby import AgentExecutor, OpenAIProvider
+from dobby import AgentExecutor
 from dobby.common_tools import TavilySearchTool
 from dobby.types import (
     ReasoningDeltaEvent,
@@ -51,11 +51,9 @@ class Colors:
 
 async def run_agent(query: str) -> None:
     """Run the web search agent with streaming output."""
-
     # Get API keys from environment
     azure_key = os.getenv("AZURE_OPENAI_API_KEY")
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
     tavily_key = os.getenv("TAVILY_API_KEY")
 
     if not azure_key:
@@ -71,17 +69,24 @@ async def run_agent(query: str) -> None:
         sys.exit(1)
 
     # Initialize Azure OpenAI provider
-    provider = OpenAIProvider(
-        base_url=azure_endpoint,
-        azure_deployment_id=azure_deployment,
-        api_key=azure_key,
+    # provider = OpenAIProvider(
+    #     base_url=azure_endpoint,
+    #     azure_deployment_id=azure_deployment,
+    #     api_key=azure_key,
+    # )
+
+    # Initialize Gemini provider
+    from dobby.providers.gemini import GeminiProvider
+    provider = GeminiProvider(
+         # api_key="...", # Uses env var GEMINI_API_KEY
+         model="gemini-2.5-flash",
     )
 
     search_tool = TavilySearchTool(api_key=tavily_key)
 
     # Create executor with tools
     executor = AgentExecutor(
-        provider="azure-openai",
+        provider="gemini",
         llm=provider,
         tools=[search_tool],
     )
@@ -153,7 +158,7 @@ Always cite your sources by mentioning the URLs."""
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} \"<your query>\"")
+        print(f'Usage: python {sys.argv[0]} "<your query>"')
         print("\nExample:")
         print(f'  python {sys.argv[0]} "What are the latest developments in AI?"')
         sys.exit(1)

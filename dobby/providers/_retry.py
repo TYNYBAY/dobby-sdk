@@ -15,6 +15,7 @@ from tenacity import (
 from tenacity.stop import stop_base
 
 from .._logging import logger
+from .base import RETRYABLE_ERRORS
 
 
 def create_retry_config(
@@ -68,7 +69,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
 
     For async generators, wraps only the initial API call that may fail.
     Reads `max_retries` from `self` if available, otherwise skips retry.
-    Uses provider-specific error types from `self._retry_errors`.
+    Retries on unified RETRYABLE_ERRORS from base module.
     """
 
     @functools.wraps(f)
@@ -77,13 +78,12 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
         if max_retries <= 0:
             return await f(self, *args, **kwargs)
 
-        errors = getattr(self, "_retry_errors", ())
         config = create_retry_config(
             max_retries=max_retries,
             min_seconds=4,
             max_seconds=60,
             stop_after_delay_seconds=120,
-            errors=errors,
+            errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
         )
 
@@ -94,7 +94,6 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
     @functools.wraps(f)
     async def async_gen_wrapper(self: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         max_retries = getattr(self, "max_retries", 0)
-        errors = getattr(self, "_retry_errors", ())
 
         if max_retries <= 0:
             async for item in f(self, *args, **kwargs):
@@ -106,25 +105,24 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
             min_seconds=4,
             max_seconds=60,
             stop_after_delay_seconds=120,
-            errors=errors,
+            errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
         )
 
         # Retry getting the async generator (where the API call happens)
-        gen: AsyncIterator[Any] | None = None
+        gen: AsyncIterator[Any] = f(self, *args, **kwargs)  # overwritten on first attempt
         first_item: Any = None
         async for attempt in AsyncRetrying(**config):
             with attempt:
                 gen = f(self, *args, **kwargs)
                 # Get first item to trigger any connection errors
-                first_item = await gen.__anext__()
+                first_item = await anext(gen)
 
         # If we get here, first_item was successful
         if first_item is not None:
             yield first_item
-        if gen is not None:
-            async for item in gen:
-                yield item
+        async for item in gen:
+            yield item
 
     # Detect if it's an async generator
     if inspect.isasyncgenfunction(f):

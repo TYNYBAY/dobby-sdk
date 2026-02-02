@@ -12,19 +12,70 @@ from ..types import MessagePart, StreamEndEvent, StreamEvent
 
 
 class ProviderError(Exception):
-    """Base exception for provider errors."""
+    """Base exception for all provider errors.
+
+    Non-retryable by default. Covers auth errors, bad requests, etc.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        status_code: int | None = None,
+    ):
+        self.provider = provider
+        self.status_code = status_code
+        super().__init__(message)
 
 
 class RateLimitError(ProviderError):
-    """Raised when the provider rate limit is exceeded."""
+    """HTTP 429 or equivalent. Retryable with backoff."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        retry_after: float | None = None,
+    ):
+        self.retry_after = retry_after  # seconds, from Retry-After header if available
+        super().__init__(message, provider=provider, status_code=429)
 
 
 class APIConnectionError(ProviderError):
-    """Raised when connection to the provider API fails."""
+    """Network/connection failure. Retryable."""
+
+    def __init__(self, message: str, *, provider: str | None = None):
+        super().__init__(message, provider=provider)
 
 
-class APITimeoutError(ProviderError):
-    """Raised when a request to the provider API times out."""
+class APITimeoutError(APIConnectionError):
+    """Request timed out. Retryable. Subclass of APIConnectionError."""
+
+    def __init__(self, message: str, *, provider: str | None = None):
+        super().__init__(message, provider=provider)
+
+
+class InternalServerError(ProviderError):
+    """HTTP 5xx from provider. Retryable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        status_code: int = 500,
+    ):
+        super().__init__(message, provider=provider, status_code=status_code)
+
+
+RETRYABLE_ERRORS: tuple[type[ProviderError], ...] = (
+    RateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+)
 
 
 class Provider[ClientT](ABC):
@@ -39,7 +90,6 @@ class Provider[ClientT](ABC):
     Attributes:
         _client: The underlying API client instance
         max_retries: Maximum number of retry attempts for transient errors
-        _retry_errors: Tuple of exception types that should trigger retries
 
     Example:
         ```python
@@ -60,7 +110,6 @@ class Provider[ClientT](ABC):
 
     _client: ClientT
     max_retries: int
-    _retry_errors: tuple[type[BaseException], ...]
 
     @property
     @abstractmethod
@@ -143,9 +192,10 @@ class Provider[ClientT](ABC):
 
         Raises:
             ProviderError: Base class for all provider-specific errors
-            RateLimitError: When rate limit is exceeded (may be retried)
-            APIConnectionError: When connection fails (may be retried)
-            APITimeoutError: When request times out (may be retried)
+            RateLimitError: When rate limit is exceeded (retryable)
+            APIConnectionError: When connection fails (retryable)
+            APITimeoutError: When request times out (retryable)
+            InternalServerError: When provider returns 5xx (retryable)
         """
         raise NotImplementedError()
 

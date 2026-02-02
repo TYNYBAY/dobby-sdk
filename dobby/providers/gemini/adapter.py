@@ -6,7 +6,7 @@ Google's Gemini API via the google-genai SDK.
 
 import base64
 from collections.abc import AsyncIterator, Iterable
-from typing import Any, Literal, overload
+from typing import Any, Literal, NoReturn, overload
 
 from google import genai
 from google.genai import (
@@ -29,7 +29,13 @@ from ...types import (
     Usage,
 )
 from .._retry import with_retries
-from ..base import Provider
+from ..base import (
+    APITimeoutError as DobbyAPITimeoutError,
+    InternalServerError as DobbyInternalServerError,
+    Provider,
+    ProviderError as DobbyProviderError,
+    RateLimitError as DobbyRateLimitError,
+)
 from .converters import to_gemini_messages
 
 __all__ = ["GeminiProvider"]
@@ -68,7 +74,6 @@ class GeminiProvider(Provider[genai.Client]):
     _model: str
     _client: genai.Client
     max_retries: int
-    _retry_errors: tuple[type[BaseException], ...]
 
     def __init__(
         self,
@@ -99,11 +104,6 @@ class GeminiProvider(Provider[genai.Client]):
         self._model = model
         self.max_retries = max_retries
 
-        self._retry_errors = (
-            gemini_errors.ClientError,  # Includes rate limit, auth errors
-            gemini_errors.ServerError,  # 5xx errors
-        )
-
         # Initialize client based on backend
         if vertexai:
             self._client = genai.Client(
@@ -128,6 +128,39 @@ class GeminiProvider(Provider[genai.Client]):
     def client(self) -> genai.Client:
         """Authenticated client instance."""
         return self._client
+
+    def _translate_error(self, e: Exception) -> NoReturn:
+        """Map Gemini SDK exceptions to unified dobby errors.
+
+        Always raises — never returns normally.
+
+        Args:
+            e: The original Gemini SDK exception.
+
+        Raises:
+            DobbyRateLimitError: For rate limit errors (429).
+            DobbyAPITimeoutError: For timeout errors (408).
+            DobbyAPIConnectionError: For connection failures.
+            DobbyInternalServerError: For server errors (5xx).
+            DobbyProviderError: For all other API errors.
+        """
+        match e:
+            case gemini_errors.ClientError() if getattr(e, "status", None) == 429:
+                raise DobbyRateLimitError(str(e), provider=self.name) from e
+            case gemini_errors.ClientError() if getattr(e, "status", None) == 408:
+                raise DobbyAPITimeoutError(str(e), provider=self.name) from e
+            case gemini_errors.ServerError():
+                status = getattr(e, "status", 500)
+                raise DobbyInternalServerError(
+                    str(e), provider=self.name, status_code=status
+                ) from e
+            case gemini_errors.ClientError():
+                status = getattr(e, "status", None)
+                raise DobbyProviderError(
+                    str(e), provider=self.name, status_code=status
+                ) from e
+            case _:
+                raise DobbyProviderError(str(e), provider=self.name) from e
 
     @overload
     async def chat(
@@ -197,12 +230,31 @@ class GeminiProvider(Provider[genai.Client]):
         if stream:
             return self._stream_chat_completion(gemini_contents, config)
 
-        # Non-streaming response
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=gemini_contents,
-            config=config,
-        )
+        return await self._non_stream_chat_completion(gemini_contents, config)
+
+    @with_retries
+    async def _non_stream_chat_completion(
+        self,
+        contents: list[genai_types.Content],
+        config: genai_types.GenerateContentConfig,
+    ) -> StreamEndEvent:
+        """Non-streaming chat completion with retry support.
+
+        Args:
+            contents: Gemini-formatted content list.
+            config: Generation configuration.
+
+        Returns:
+            StreamEndEvent with complete response.
+        """
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            self._translate_error(e)
 
         return self._parse_response(response)
 
@@ -300,11 +352,16 @@ class GeminiProvider(Provider[genai.Client]):
         final_usage: Usage | None = None
         stop_reason: StopReason = "end_turn"
 
-        async for chunk in await self._client.aio.models.generate_content_stream(
-            model=self._model,
-            contents=contents,
-            config=config,
-        ):
+        try:
+            stream_response = await self._client.aio.models.generate_content_stream(
+                model=self._model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            self._translate_error(e)
+
+        async for chunk in stream_response:
             # Emit stream start on first chunk
             if not stream_started:
                 yield StreamStartEvent(
