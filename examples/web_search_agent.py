@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 
 from dobby import AgentExecutor
 from dobby.common_tools import TavilySearchTool
-from dobby.providers.openai import OpenAIProvider
 from dobby.types import (
     ReasoningDeltaEvent,
     ReasoningEndEvent,
@@ -55,7 +54,6 @@ async def run_agent(query: str) -> None:
     # Get API keys from environment
     azure_key = os.getenv("AZURE_OPENAI_API_KEY")
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
     tavily_key = os.getenv("TAVILY_API_KEY")
 
     if not azure_key:

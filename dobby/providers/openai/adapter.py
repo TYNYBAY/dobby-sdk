@@ -261,6 +261,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             system_prompt: Optional system message to guide behavior
             temperature: Controls randomness (0.0-2.0, default 0.0)
             tools: Available tools for function calling
+            reasoning_effort: Reasoning effort level (e.g., "low", "medium", "high")
             **kwargs: Additional OpenAI-specific parameters
 
         Returns:

@@ -1,19 +1,18 @@
 """Tests for unified provider error handling."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from dobby.providers.base import (
+    RETRYABLE_ERRORS,
     APIConnectionError,
     APITimeoutError,
     InternalServerError,
     ProviderError,
     RateLimitError,
-    RETRYABLE_ERRORS,
 )
-
 
 # ---------------------------------------------------------------------------
 # Base error class tests
@@ -119,7 +118,7 @@ class TestRetryableErrors:
 class TestOpenAIErrorTranslation:
     """Test OpenAI adapter _translate_error method."""
 
-    def _make_provider(self) -> "OpenAIProvider":
+    def _make_provider(self):
         """Create an OpenAI provider with a mocked client."""
         from dobby.providers.openai.adapter import OpenAIProvider
 
@@ -257,7 +256,7 @@ class TestOpenAIErrorTranslation:
 class TestGeminiErrorTranslation:
     """Test Gemini adapter _translate_error method."""
 
-    def _make_provider(self) -> "GeminiProvider":
+    def _make_provider(self):
         """Create a Gemini provider with a mocked client."""
         from dobby.providers.gemini.adapter import GeminiProvider
 
@@ -271,7 +270,7 @@ class TestGeminiErrorTranslation:
         provider._client = MagicMock()
         return provider
 
-    def _make_gemini_client_error(self, status: int) -> "gemini_errors.ClientError":
+    def _make_gemini_client_error(self, status: int):
         from google.genai import errors as gemini_errors
 
         err = gemini_errors.ClientError.__new__(gemini_errors.ClientError)
@@ -279,7 +278,7 @@ class TestGeminiErrorTranslation:
         err.message = f"Client error {status}"
         return err
 
-    def _make_gemini_server_error(self, status: int = 500) -> "gemini_errors.ServerError":
+    def _make_gemini_server_error(self, status: int = 500):
         from google.genai import errors as gemini_errors
 
         err = gemini_errors.ServerError.__new__(gemini_errors.ServerError)

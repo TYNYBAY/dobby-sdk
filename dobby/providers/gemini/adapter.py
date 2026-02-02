@@ -30,7 +30,6 @@ from ...types import (
 )
 from .._retry import with_retries
 from ..base import (
-    APIConnectionError as DobbyAPIConnectionError,
     APITimeoutError as DobbyAPITimeoutError,
     InternalServerError as DobbyInternalServerError,
     Provider,

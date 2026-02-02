@@ -110,20 +110,19 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
         )
 
         # Retry getting the async generator (where the API call happens)
-        gen: AsyncIterator[Any] | None = None
+        gen: AsyncIterator[Any] = f(self, *args, **kwargs)  # overwritten on first attempt
         first_item: Any = None
         async for attempt in AsyncRetrying(**config):
             with attempt:
                 gen = f(self, *args, **kwargs)
                 # Get first item to trigger any connection errors
-                first_item = await gen.__anext__()
+                first_item = await anext(gen)
 
         # If we get here, first_item was successful
         if first_item is not None:
             yield first_item
-        if gen is not None:
-            async for item in gen:
-                yield item
+        async for item in gen:
+            yield item
 
     # Detect if it's an async generator
     if inspect.isasyncgenfunction(f):
