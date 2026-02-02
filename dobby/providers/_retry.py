@@ -15,6 +15,7 @@ from tenacity import (
 from tenacity.stop import stop_base
 
 from .._logging import logger
+from .base import RETRYABLE_ERRORS
 
 
 def create_retry_config(
@@ -68,7 +69,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
 
     For async generators, wraps only the initial API call that may fail.
     Reads `max_retries` from `self` if available, otherwise skips retry.
-    Uses provider-specific error types from `self._retry_errors`.
+    Retries on unified RETRYABLE_ERRORS from base module.
     """
 
     @functools.wraps(f)
@@ -77,13 +78,12 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
         if max_retries <= 0:
             return await f(self, *args, **kwargs)
 
-        errors = getattr(self, "_retry_errors", ())
         config = create_retry_config(
             max_retries=max_retries,
             min_seconds=4,
             max_seconds=60,
             stop_after_delay_seconds=120,
-            errors=errors,
+            errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
         )
 
@@ -94,7 +94,6 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
     @functools.wraps(f)
     async def async_gen_wrapper(self: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         max_retries = getattr(self, "max_retries", 0)
-        errors = getattr(self, "_retry_errors", ())
 
         if max_retries <= 0:
             async for item in f(self, *args, **kwargs):
@@ -106,7 +105,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
             min_seconds=4,
             max_seconds=60,
             stop_after_delay_seconds=120,
-            errors=errors,
+            errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
         )
 

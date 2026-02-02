@@ -1,6 +1,13 @@
 """Dobby providers package."""
 
-from .base import Provider as Provider
+from .base import (
+    APIConnectionError as APIConnectionError,
+    APITimeoutError as APITimeoutError,
+    InternalServerError as InternalServerError,
+    Provider as Provider,
+    ProviderError as ProviderError,
+    RateLimitError as RateLimitError,
+)
 from .gemini import (
     GeminiProvider as GeminiProvider,
     to_gemini_messages as to_gemini_messages,

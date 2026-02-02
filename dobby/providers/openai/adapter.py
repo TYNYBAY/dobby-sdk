@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator, Iterable
 import json
-from typing import Any, Literal, overload
+from typing import Any, Literal, NoReturn, overload
 
 import openai
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -36,7 +36,14 @@ from ...types import (
     UserMessagePart,
 )
 from .._retry import with_retries
-from ..base import Provider
+from ..base import (
+    APIConnectionError as DobbyAPIConnectionError,
+    APITimeoutError as DobbyAPITimeoutError,
+    InternalServerError as DobbyInternalServerError,
+    Provider,
+    ProviderError as DobbyProviderError,
+    RateLimitError as DobbyRateLimitError,
+)
 from .converters import OpenAIContentPart, content_part_to_openai
 
 
@@ -64,7 +71,6 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
     azure_deployment_id: str | None
     _client: AsyncOpenAI | AsyncAzureOpenAI
     max_retries: int
-    _retry_errors: tuple[type[BaseException], ...]
 
     def __init__(
         self,
@@ -93,12 +99,6 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         self.base_url = base_url
         self.azure_deployment_id = azure_deployment_id
         self.max_retries = max_retries
-        self._retry_errors = (
-            openai.RateLimitError,
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-            openai.InternalServerError,
-        )
 
         if base_url is not None and "azure" in base_url:
             self._client = AsyncAzureOpenAI(
@@ -166,6 +166,49 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
 
         # logger.debug(f"kwargs: {kwargs}")
         return kwargs
+
+    def _translate_error(self, e: Exception) -> NoReturn:
+        """Map OpenAI SDK exceptions to unified dobby errors.
+
+        Always raises — never returns normally.
+
+        Args:
+            e: The original OpenAI SDK exception.
+
+        Raises:
+            DobbyRateLimitError: For rate limit errors (429).
+            DobbyAPIConnectionError: For connection failures.
+            DobbyAPITimeoutError: For request timeouts.
+            DobbyInternalServerError: For server errors (5xx).
+            DobbyProviderError: For all other API errors.
+        """
+        match e:
+            case openai.RateLimitError():
+                retry_after = None
+                if hasattr(e, "response") and e.response is not None:
+                    raw = e.response.headers.get("retry-after")
+                    if raw is not None:
+                        try:
+                            retry_after = float(raw)
+                        except (ValueError, TypeError):
+                            pass
+                raise DobbyRateLimitError(
+                    str(e), provider=self.name, retry_after=retry_after
+                ) from e
+            case openai.APITimeoutError():
+                raise DobbyAPITimeoutError(str(e), provider=self.name) from e
+            case openai.APIConnectionError():
+                raise DobbyAPIConnectionError(str(e), provider=self.name) from e
+            case openai.InternalServerError():
+                raise DobbyInternalServerError(
+                    str(e), provider=self.name, status_code=e.status_code
+                ) from e
+            case openai.APIStatusError():
+                raise DobbyProviderError(
+                    str(e), provider=self.name, status_code=e.status_code
+                ) from e
+            case _:
+                raise DobbyProviderError(str(e), provider=self.name) from e
 
     @overload
     async def chat(
@@ -235,19 +278,44 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                 openai_messages, temperature, target_model, tools, reasoning_effort
             )
 
-        # non-streaming response logic ------
-        # Construct reasoning param if effort provided
+        return await self._non_stream_chat_completion(
+            openai_messages, target_model, tools, reasoning_effort
+        )
+
+    @with_retries
+    async def _non_stream_chat_completion(
+        self,
+        messages: ResponseInputParam,
+        model: str,
+        tools: list[ToolParam] | None = None,
+        reasoning_effort: str | None = None,
+    ) -> StreamEndEvent:
+        """Non-streaming chat completion with retry support.
+
+        Args:
+            messages: OpenAI-formatted input messages.
+            model: Model id.
+            tools: Optional tool definitions.
+            reasoning_effort: Optional reasoning effort level.
+
+        Returns:
+            StreamEndEvent with complete response.
+        """
         reasoning_param = None
         if reasoning_effort:
             reasoning_param = {"effort": reasoning_effort, "summary": "auto"}
 
         create_kwargs = self._build_kwargs(
-            model=target_model,
-            input=openai_messages,
+            model=model,
+            input=messages,
             tools=tools,
             reasoning=reasoning_param,
         )
-        response = await self._client.responses.create(stream=False, **create_kwargs)
+
+        try:
+            response = await self._client.responses.create(stream=False, **create_kwargs)
+        except Exception as e:
+            self._translate_error(e)
 
         stop_reason: StopReason = "end_turn"
         parts: list[ResponsePart] = []
@@ -330,7 +398,10 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             reasoning=reasoning_param,
         )
 
-        response_stream = await self._client.responses.create(stream=True, **create_kwargs)
+        try:
+            response_stream = await self._client.responses.create(stream=True, **create_kwargs)
+        except Exception as e:
+            self._translate_error(e)
 
         response_id: str | None = None
         model_name: str = model
