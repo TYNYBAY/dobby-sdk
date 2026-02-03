@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
 from .base import ParameterType, ToolParameter
-from .injected import Injected
+from .injected import is_injected
 
 
 def is_typeddict(tp: type) -> bool:
@@ -37,11 +37,7 @@ def is_injected_parameter(annotation) -> tuple[bool, type | None]:
     Returns:
         Tuple of (is_injected, inner_type)
     """
-    origin = get_origin(annotation)
-    if origin is Injected:
-        args = get_args(annotation)
-        return True, args[0] if args else None
-    return False, None
+    return is_injected(annotation)
 
 
 def extract_pydantic_properties(model_class: type[BaseModel]) -> dict[str, ToolParameter]:
