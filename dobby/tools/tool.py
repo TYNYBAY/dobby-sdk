@@ -24,14 +24,14 @@ Example:
 
 from dataclasses import dataclass
 import inspect
-from typing import Any, ClassVar, get_origin, get_type_hints
+from typing import Any, ClassVar, get_type_hints
 
 from google.genai import types as genai_types
 from openai.types.responses import FunctionToolParam
 from pydantic import BaseModel
 
 from .base import ToolParameter
-from .injected import Injected
+from .injected import is_injected
 from .schema_utils import process_tool_definition
 
 
@@ -114,14 +114,14 @@ class Tool:
         # Check if first param (after self) is Injected[T]
         takes_ctx = False
         try:
-            hints = get_type_hints(cls.__call__)
+            hints = get_type_hints(cls.__call__, include_extras=True)
             # Remove 'return' and 'self' from hints
             param_names = [k for k in hints.keys() if k not in ("return",)]
 
             if param_names:
                 first_param_type = hints[param_names[0]]
-                origin = get_origin(first_param_type)
-                if origin is Injected:
+                is_inj, _ = is_injected(first_param_type)
+                if is_inj:
                     takes_ctx = True
         except Exception:
             # If type hints fail, assume no context
