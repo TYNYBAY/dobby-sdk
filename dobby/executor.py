@@ -6,9 +6,10 @@ This module provides the AgentExecutor class which handles:
 - Tool execution with injected context
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 import inspect
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -31,6 +32,15 @@ from .types import (
 )
 
 OUTPUT_TOOL_NAME = "final_result"
+
+
+class ToolCallResult(NamedTuple):
+    """Result from executing a single tool call."""
+
+    tool_name: str
+    tool_call_id: str
+    result: Any
+    is_error: bool
 
 
 class AgentExecutor[ContextT, OutputT: BaseModel]:
@@ -122,6 +132,81 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     ]
         return self._formatted_tools
 
+    async def _invoke_tool(
+        self,
+        tool: Tool,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+    ) -> Any:
+        """Invoke a non-streaming tool, handling context injection and sync/async dispatch.
+
+        Args:
+            tool: The Tool instance to invoke
+            inputs: Tool input arguments from LLM
+            context: Context to inject if tool takes_ctx
+
+        Returns:
+            The tool's return value
+        """
+        logger.debug(f"Executing tool: {tool.name}")
+        kwargs = dict(inputs)
+        if tool.takes_ctx and context is not None:
+            if inspect.iscoroutinefunction(tool.__call__):
+                return await tool(context, **kwargs)
+            return tool(context, **kwargs)
+        if inspect.iscoroutinefunction(tool.__call__):
+            return await tool(**kwargs)
+        return tool(**kwargs)
+
+    def _emit_tool_result(
+        self,
+        tool_call: ToolUsePart,
+        result: Any,
+        is_error: bool,
+        working_messages: list[MessagePart],
+        *,
+        is_terminal: bool = False,
+    ) -> tuple[ToolResultEvent, ToolUseEndEvent]:
+        """Build result events and append tool round-trip messages.
+
+        Args:
+            tool_call: The original tool call from the LLM
+            result: The tool execution result (or error dict)
+            is_error: Whether the result represents an error
+            working_messages: Conversation message list to append to
+            is_terminal: Whether this tool ends the agent loop
+
+        Returns:
+            Tuple of (ToolResultEvent, ToolUseEndEvent) for the caller to yield
+        """
+        working_messages.append(AssistantMessagePart(parts=[tool_call]))
+        working_messages.append(
+            UserMessagePart(
+                parts=[
+                    ToolResultPart(
+                        tool_use_id=tool_call.id,
+                        name=tool_call.name,
+                        parts=[TextPart(text=str(result))],
+                        is_error=is_error,
+                    )
+                ]
+            )
+        )
+        return (
+            ToolResultEvent(
+                tool_use_id=tool_call.id,
+                name=tool_call.name,
+                result=result,
+                is_error=is_error,
+                is_terminal=is_terminal,
+            ),
+            ToolUseEndEvent(
+                type="tool_use_end",
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+            ),
+        )
+
     async def run_stream(
         self,
         messages: list[MessagePart],
@@ -176,121 +261,150 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ):
                 yield event
 
-                # Collect tool calls from stream_end event
                 if isinstance(event, StreamEndEvent):
                     for part in event.parts:
                         if isinstance(part, ToolUsePart):
                             tool_calls.append(part)
 
-            # No tool calls = done
             if not tool_calls:
                 break
 
-            # TODO: If LLM returns multiple tools and one is terminal, remaining tools after
-            # the terminal one won't execute. Need to handle this edge case.
-
-            for tool_call in tool_calls:
-                # Provider already yielded the ToolUseEvent
-                # Execute tool and yield stream events
-                tool_name = tool_call.name
-                tool_id = tool_call.id
-                tool_inputs = tool_call.inputs
-
-                # Check if this is the output tool (final_result)
-                if tool_name == OUTPUT_TOOL_NAME and self.output_type:
-                    # Validate output with Pydantic
+            # Handle output tool (final_result)
+            for tc in tool_calls:
+                if tc.name == OUTPUT_TOOL_NAME and self.output_type:
                     try:
-                        self.last_output = self.output_type.model_validate(tool_inputs)
+                        self.last_output = self.output_type.model_validate(tc.inputs)
                         logger.debug(f"Validated output: {self.last_output}")
-                        # Yield result event for the output tool
                         yield ToolResultEvent(
-                            tool_use_id=tool_id,
-                            name=tool_name,
-                            result=tool_inputs,
+                            tool_use_id=tc.id,
+                            name=tc.name,
+                            result=tc.inputs,
                             is_error=False,
                         )
                         yield ToolUseEndEvent(
                             type="tool_use_end",
-                            tool_use_id=tool_id,
-                            tool_name=tool_name,
+                            tool_use_id=tc.id,
+                            tool_name=tc.name,
                         )
-                        return  # End run - structured output received
+                        return
                     except Exception as e:
                         logger.error(f"Output validation error: {e}")
                         # TODO: Implement retry logic
                         raise
 
-                tool = self._tools.get(tool_name)
-                if not tool:
-                    logger.warning(f"Tool not found: {tool_name}")
+            # Categorize tool calls
+            streaming_calls: list[ToolUsePart] = []
+            parallel_calls: list[ToolUsePart] = []
+            terminal_calls: list[ToolUsePart] = []
+            for tc in tool_calls:
+                if tc.name == OUTPUT_TOOL_NAME:
                     continue
+                tool = self._tools.get(tc.name)
+                if not tool:
+                    logger.warning(f"Tool not found: {tc.name}")
+                    continue
+                if tool.terminal:
+                    terminal_calls.append(tc)
+                elif tool.stream_output:
+                    streaming_calls.append(tc)
+                else:
+                    parallel_calls.append(tc)
 
+            # Any sequential tool in the batch forces the entire batch to run
+            # sequentially to preserve execution-order guarantees
+            force_sequential = any(
+                self._tools[tc.name].sequential for tc in parallel_calls
+            )
+
+            # Execute non-streaming tools (parallel or sequential)
+            results: list[ToolCallResult | BaseException] = []
+            if parallel_calls:
+                if force_sequential or len(parallel_calls) == 1:
+                    for tc in parallel_calls:
+                        call_result = await self._execute_tool_call(
+                            tc.name, tc.id, tc.inputs, context, approved
+                        )
+                        results.append(call_result)
+                else:
+                    results = await asyncio.gather(
+                        *[
+                            self._execute_tool_call(
+                                tc.name, tc.id, tc.inputs, context, approved
+                            )
+                            for tc in parallel_calls
+                        ],
+                        return_exceptions=True,
+                    )
+
+            for tc, call_result in zip(parallel_calls, results, strict=True):
+                if isinstance(call_result, ApprovalRequired):
+                    raise call_result
+                if isinstance(call_result, BaseException):
+                    call_result = ToolCallResult(
+                        tc.name, tc.id, {"error": str(call_result)}, True,
+                    )
+
+                result_event, end_event = self._emit_tool_result(
+                    tc, call_result.result, call_result.is_error, working_messages,
+                )
+                yield result_event
+                yield end_event
+
+            # Execute streaming tools sequentially
+            for tc in streaming_calls:
                 result = None
                 is_error = False
                 try:
                     async for event_or_result in self._execute_tool_stream(
-                        tool_name, tool_id, tool_inputs, context, approved
+                        tc.name, tc.id, tc.inputs, context, approved
                     ):
                         if isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
                             result = event_or_result
                 except Exception as e:
-                    logger.error(f"Error executing tool {tool_name}: {e}")
+                    logger.error(f"Error executing streaming tool {tc.name}: {e}")
                     result = {"error": str(e)}
                     is_error = True
 
-                if tool.terminal:
-                    yield ToolResultEvent(
-                        tool_use_id=tool_id,
-                        name=tool_name,
-                        result=result,
-                        is_error=is_error,
-                        is_terminal=True,
-                    )
-                    return
-
-                # Non-terminal tool: yield result and continue
-                yield ToolResultEvent(
-                    tool_use_id=tool_id,
-                    name=tool_name,
-                    result=result,
-                    is_error=is_error,
-                    is_terminal=False,
+                result_event, end_event = self._emit_tool_result(
+                    tc, result, is_error, working_messages,
                 )
+                yield result_event
+                yield end_event
 
-                # TODO: see what is the requirement of this event ?, as if
-                # tool_result is generated that indicated too_use_end
-                yield ToolUseEndEvent(
-                    type="tool_use_end",
-                    tool_use_id=tool_id,
-                    tool_name=tool_name,
+            # Terminal tool exits the loop
+            if terminal_calls:
+                tc = terminal_calls[0]
+                result = None
+                is_error = False
+                try:
+                    async for event_or_result in self._execute_tool_stream(
+                        tc.name, tc.id, tc.inputs, context, approved
+                    ):
+                        if isinstance(event_or_result, ToolStreamEvent):
+                            yield event_or_result
+                        else:
+                            result = event_or_result
+                except Exception as e:
+                    logger.error(f"Error executing terminal tool {tc.name}: {e}")
+                    result = {"error": str(e)}
+                    is_error = True
+                result_event, _ = self._emit_tool_result(
+                    tc, result, is_error, working_messages, is_terminal=True,
                 )
+                yield result_event
+                return
 
-                # Add to messages for next iteration
-                working_messages.append(AssistantMessagePart(parts=[tool_call]))
-                working_messages.append(
-                    UserMessagePart(
-                        parts=[
-                            ToolResultPart(
-                                tool_use_id=tool_id,
-                                name=tool_name,
-                                parts=[TextPart(text=str(result))],
-                                is_error=is_error,
-                            )
-                        ]
-                    )
-                )
-
-    async def _execute_tool_stream(
+    async def _execute_tool_call(
         self,
         tool_name: str,
         tool_call_id: str,
         inputs: dict[str, Any],
         context: ContextT | None,
         approved_tool_calls: set[str],
-    ) -> AsyncIterator[ToolStreamEvent | Any]:
-        """Execute a tool.
+    ) -> ToolCallResult:
+        """Execute a single non-streaming tool call.
 
         Args:
             tool_name: Name of the tool to execute
@@ -299,8 +413,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             context: Context to inject if tool takes_ctx
             approved_tool_calls: Set of approved tool call IDs
 
-        Yields:
-            ToolStreamEvent for streaming tools, then final result
+        Returns:
+            ToolCallResult with tool_name, tool_call_id, result, and is_error
 
         Raises:
             ApprovalRequired: If tool requires approval and not approved
@@ -310,12 +424,54 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
             raise ApprovalRequired(tool_call_id, tool_name, inputs)
 
-        logger.debug(f"[x] Executing tool: {tool_name}")
+        try:
+            result = await self._invoke_tool(tool, inputs, context)
+            return ToolCallResult(tool_name, tool_call_id, result, False)
+        except ApprovalRequired:
+            raise
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {e}")
+            return ToolCallResult(tool_name, tool_call_id, {"error": str(e)}, True)
+
+    async def _execute_tool_stream(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+        approved_tool_calls: set[str],
+    ) -> AsyncIterator[ToolStreamEvent | Any]:
+        """Execute a tool, yielding streaming events for streaming tools or the final result.
+
+        For streaming tools (stream_output=True), yields ToolStreamEvent instances as
+        the tool produces them. The last yielded value is the final result.
+
+        For non-streaming tools, delegates to _invoke_tool and yields the result once.
+
+        Args:
+            tool_name: Name of the tool to execute
+            tool_call_id: Unique ID for this tool call
+            inputs: Tool input arguments from LLM
+            context: Context to inject if tool takes_ctx
+            approved_tool_calls: Set of approved tool call IDs
+
+        Yields:
+            ToolStreamEvent: Mid-execution streaming events (streaming tools only)
+            Any: The final tool result as the last yielded value
+
+        Raises:
+            ApprovalRequired: If tool requires approval and not approved
+        """
+        tool = self._tools[tool_name]
+
+        if tool.requires_approval and tool_call_id not in approved_tool_calls:
+            raise ApprovalRequired(tool_call_id, tool_name, inputs)
+
+        logger.debug(f"Executing tool: {tool_name}")
 
         kwargs = dict(inputs)
 
         if tool.stream_output:
-            # Streaming tool - yields events then final result
             if tool.takes_ctx and context is not None:
                 async for event in tool(context, **kwargs):  # type: ignore[misc]
                     yield event
@@ -323,15 +479,5 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 async for event in tool(**kwargs):  # type: ignore[misc]
                     yield event
         else:
-            # Non-streaming tool
-            if tool.takes_ctx and context is not None:
-                if inspect.iscoroutinefunction(tool.__call__):
-                    result = await tool(context, **kwargs)
-                else:
-                    result = tool(context, **kwargs)
-            else:
-                if inspect.iscoroutinefunction(tool.__call__):
-                    result = await tool(**kwargs)
-                else:
-                    result = tool(**kwargs)
+            result = await self._invoke_tool(tool, inputs, context)
             yield result
