@@ -50,6 +50,7 @@ class Tool:
         requires_approval: Whether tool needs human approval before execution (default: False)
         stream_output: Whether tool yields streaming events (default: False)
         terminal: Whether tool exits the agent loop (default: False)
+        sequential: Whether to force sequential execution in parallel batches (default: False)
 
     Terminal Tools:
         When terminal=True, the AgentExecutor will:
@@ -72,6 +73,8 @@ class Tool:
     stream_output: ClassVar[bool] = False
     terminal: ClassVar[bool] = False
     """If True, executing this tool exits the agent loop and returns control to caller."""
+    sequential: ClassVar[bool] = False
+    """If True, forces sequential execution when this tool is in a parallel batch."""
 
     # Auto-generated class variables (set by __init_subclass__)
     _parameters: ClassVar[list[ToolParameter]]
