@@ -215,6 +215,8 @@ class GeminiProvider(Provider[genai.Client]):
         # Convert messages to Gemini format
         gemini_contents = to_gemini_messages(messages)
 
+        max_tokens = kwargs.pop("max_tokens", None)
+
         config = genai_types.GenerateContentConfig(
             temperature=temperature,
             # Disable automatic function calling - we handle it manually
@@ -226,6 +228,9 @@ class GeminiProvider(Provider[genai.Client]):
 
         if tools:
             config.tools = tools # type: ignore[assignment]
+
+        if max_tokens is not None:
+            config.max_output_tokens = max_tokens
 
         if stream:
             return self._stream_chat_completion(gemini_contents, config)

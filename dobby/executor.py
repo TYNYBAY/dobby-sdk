@@ -214,6 +214,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         context: ContextT | None = None,
         max_iterations: int = 10,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
@@ -258,6 +259,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 tools=tools,
                 stream=True,
                 reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
             ):
                 yield event
 

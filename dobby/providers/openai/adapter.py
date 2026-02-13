@@ -138,6 +138,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         input: ResponseInputParam,
         tools: list[ToolParam] | None = None,
         reasoning: Reasoning | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Build kwargs for responses.create() excluding None values.
 
@@ -151,6 +152,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             reasoning: Optional reasoning configuration.
                 Options for effort: "minimal", "low", "medium", "high".
                 Options for summary: "auto", "concise", "detailed".
+            max_output_tokens: Optional maximum number of output tokens.
 
         Returns:
             Dictionary of kwargs to pass to responses.create().
@@ -163,6 +165,8 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             kwargs["tools"] = tools
         if reasoning is not None:
             kwargs["reasoning"] = reasoning
+        if max_output_tokens is not None:
+            kwargs["max_output_tokens"] = max_output_tokens
 
         # logger.debug(f"kwargs: {kwargs}")
         return kwargs
@@ -221,6 +225,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         tools: list[ToolParam] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> StreamEndEvent: ...
 
@@ -235,6 +240,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         tools: list[ToolParam] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamEvent]: ...
 
@@ -247,6 +253,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         temperature: float = 0.0,
         tools: list[ToolParam] | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
         """Generate response from messages using Responses API.
@@ -262,6 +269,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             temperature: Controls randomness (0.0-2.0, default 0.0)
             tools: Available tools for function calling
             reasoning_effort: Reasoning effort level (e.g., "low", "medium", "high")
+            max_tokens: Maximum number of output tokens
             **kwargs: Additional OpenAI-specific parameters
 
         Returns:
@@ -276,11 +284,11 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
 
         if stream:
             return self._stream_chat_completion(
-                openai_messages, temperature, target_model, tools, reasoning_effort
+                openai_messages, temperature, target_model, tools, reasoning_effort, max_tokens
             )
 
         return await self._non_stream_chat_completion(
-            openai_messages, target_model, tools, reasoning_effort
+            openai_messages, target_model, tools, reasoning_effort, max_tokens
         )
 
     @with_retries
@@ -290,6 +298,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         model: str,
         tools: list[ToolParam] | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -298,6 +307,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             model: Model id.
             tools: Optional tool definitions.
             reasoning_effort: Optional reasoning effort level.
+            max_tokens: Optional maximum number of output tokens.
 
         Returns:
             StreamEndEvent with complete response.
@@ -311,6 +321,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             input=messages,
             tools=tools,
             reasoning=reasoning_param,
+            max_output_tokens=max_tokens,
         )
 
         try:
@@ -370,6 +381,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         model: str,
         tools: list[ToolParam] | None = None,
         reasoning_effort: str | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
 
@@ -382,6 +394,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             model: Model id
             tools: Optional OpenAI-formatted tool definitions
             reasoning_effort: Reasoning effort level
+            max_tokens: Optional maximum number of output tokens
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
@@ -397,6 +410,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             input=messages,
             tools=tools,
             reasoning=reasoning_param,
+            max_output_tokens=max_tokens,
         )
 
         try:
