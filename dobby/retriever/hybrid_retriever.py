@@ -75,6 +75,17 @@ class HybridRetriever[T: Document](BaseRetriever[T]):
             logger.error(f"Failed to generate embedding: {e}")
             raise
 
+    async def _generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts in a single API call."""
+        try:
+            response = await self.client.embeddings.create(model=self.model, input=texts)
+            sorted_data = sorted(response.data, key=lambda d: d.index)
+            logger.debug(f"Generated {len(sorted_data)} embeddings in batch")
+            return [d.embedding for d in sorted_data]
+        except Exception as e:
+            logger.error(f"Failed to generate batch embeddings: {e}")
+            raise
+
     async def retrieve(
         self,
         query: str,
