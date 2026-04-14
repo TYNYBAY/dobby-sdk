@@ -213,7 +213,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         system_prompt: str | None = None,
         context: ContextT | None = None,
         max_iterations: int = 10,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:

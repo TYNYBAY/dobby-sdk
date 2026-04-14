@@ -46,6 +46,35 @@ from ..base import (
 )
 from .converters import OpenAIContentPart, content_part_to_openai
 
+EFFORT_ALLOWED = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+
+
+def _validate_reasoning_effort(reasoning_effort: str | int) -> str:
+    """Validate reasoning effort for OpenAI Responses API.
+
+    Args:
+        reasoning_effort: Must be a string, one of the allowed values.
+
+    Returns:
+        Cleaned (stripped, lowercased) effort string.
+
+    Raises:
+        TypeError: If reasoning_effort is not a string.
+        ValueError: If the value is not in the allowed set.
+    """
+    if not isinstance(reasoning_effort, str):
+        raise TypeError(
+            f"OpenAI provider requires reasoning_effort as str, "
+            f"got {type(reasoning_effort).__name__}"
+        )
+    cleaned = reasoning_effort.strip().lower()
+    if cleaned not in EFFORT_ALLOWED:
+        raise ValueError(
+            f"Invalid reasoning_effort {reasoning_effort!r}. "
+            f"Must be one of: {', '.join(sorted(EFFORT_ALLOWED))}"
+        )
+    return cleaned
+
 
 class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
     """Provider for OpenAI and Azure OpenAI using Responses API.
@@ -150,8 +179,9 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             input: OpenAI-formatted input messages.
             tools: Optional tool definitions for function calling.
             reasoning: Optional reasoning configuration.
-                Options for effort: "minimal", "low", "medium", "high".
-                Options for summary: "auto", "concise", "detailed".
+                Effort: "low", "medium", "high" (GPT-5.1 / Responses API only;
+                "minimal" is normalized to "low").
+                Summary: "auto", "concise", "detailed".
             max_output_tokens: Optional maximum number of output tokens.
 
         Returns:
@@ -224,7 +254,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         temperature: float = 0.0,
         tools: list[ToolParam] | None = None,
         model: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         **kwargs,
     ) -> StreamEndEvent: ...
@@ -239,7 +269,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         temperature: float = 0.0,
         tools: list[ToolParam] | None = None,
         model: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamEvent]: ...
@@ -252,7 +282,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[ToolParam] | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         **kwargs,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
@@ -297,7 +327,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         messages: ResponseInputParam,
         model: str,
         tools: list[ToolParam] | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
@@ -313,8 +343,9 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             StreamEndEvent with complete response.
         """
         reasoning_param = None
-        if reasoning_effort:
-            reasoning_param = {"effort": reasoning_effort, "summary": "auto"}
+        if reasoning_effort is not None:
+            effort = _validate_reasoning_effort(reasoning_effort)
+            reasoning_param = {"effort": effort, "summary": "auto"}
 
         create_kwargs = self._build_kwargs(
             model=model,
@@ -380,7 +411,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         temperature: float,
         model: str,
         tools: list[ToolParam] | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
@@ -402,8 +433,9 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         """
         # Construct reasoning param if effort provided
         reasoning_param = None
-        if reasoning_effort:
-            reasoning_param = {"effort": reasoning_effort, "summary": "auto"}
+        if reasoning_effort is not None:
+            effort = _validate_reasoning_effort(reasoning_effort)
+            reasoning_param = {"effort": effort, "summary": "auto"}
 
         create_kwargs = self._build_kwargs(
             model=model,

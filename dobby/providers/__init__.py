@@ -1,5 +1,9 @@
 """Dobby providers package."""
 
+from .anthropic import (
+    AnthropicProvider as AnthropicProvider,
+    to_anthropic_messages as to_anthropic_messages,
+)
 from .base import (
     APIConnectionError as APIConnectionError,
     APITimeoutError as APITimeoutError,

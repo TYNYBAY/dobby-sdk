@@ -184,7 +184,7 @@ class Provider[ClientT](ABC):
             system_prompt: Optional system instructions for the model
             temperature: Sampling temperature 0.0-2.0 (default: 0.0 for deterministic)
             tools: Tool definitions in provider-specific format (optional)
-            **kwargs: Provider-specific parameters (e.g., reasoning_effort for OpenAI)
+            **kwargs: Provider-specific parameters (e.g., reasoning_effort: str for OpenAI, int for Anthropic)
 
         Returns:
             StreamEndEvent: When stream=False, contains complete response with parts and usage
