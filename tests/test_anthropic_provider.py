@@ -1,7 +1,7 @@
 """Tests for Anthropic provider: error translation, message conversion, and converters."""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -11,6 +11,18 @@ from dobby.providers.base import (
     InternalServerError,
     ProviderError,
     RateLimitError,
+)
+from dobby.types import (
+    ReasoningDeltaEvent,
+    ReasoningEndEvent,
+    ReasoningPart,
+    ReasoningStartEvent,
+    StreamEndEvent,
+    StreamStartEvent,
+    TextDeltaEvent,
+    TextPart,
+    ToolUseEvent,
+    ToolUsePart,
 )
 
 # ---------------------------------------------------------------------------
@@ -483,3 +495,682 @@ class TestAnthropicReasoningEffort:
         if reasoning_effort is not None:
             thinking = {"type": "enabled", "budget_tokens": reasoning_effort}
         assert thinking is None
+
+
+# ---------------------------------------------------------------------------
+# Shared fakes for non-streaming + streaming
+# ---------------------------------------------------------------------------
+
+
+def _make_provider_with_mock_client():
+    """Build an Anthropic provider with messages.create mocked out."""
+    from dobby.providers.anthropic.adapter import AnthropicProvider
+
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    provider.api_key = "test"
+    provider.base_url = None
+    provider._model = "claude-sonnet-4-20250514"
+    provider.max_retries = 3
+    client = MagicMock()
+    client.messages = MagicMock()
+    client.messages.create = AsyncMock()
+    provider._client = client
+    return provider
+
+
+def _fake_response(blocks, stop_reason="end_turn", model="claude-sonnet-4-20250514",
+                   input_tokens=10, output_tokens=20,
+                   cache_creation_input_tokens=None, cache_read_input_tokens=None):
+    """Build a mock Anthropic response object for non-streaming tests."""
+    response = MagicMock()
+    response.content = blocks
+    response.stop_reason = stop_reason
+    response.model = model
+    usage = MagicMock()
+    usage.input_tokens = input_tokens
+    usage.output_tokens = output_tokens
+    usage.cache_creation_input_tokens = cache_creation_input_tokens
+    usage.cache_read_input_tokens = cache_read_input_tokens
+    response.usage = usage
+    return response
+
+
+def _text_block(text: str):
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    return block
+
+
+def _thinking_block(text: str, signature: str = "sig-xyz"):
+    block = MagicMock()
+    block.type = "thinking"
+    block.thinking = text
+    block.signature = signature
+    return block
+
+
+def _tool_use_block(tool_id: str, name: str, inputs: dict):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = name
+    block.input = inputs
+    return block
+
+
+class _AsyncIter:
+    """Minimal async iterator around an in-memory list."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
+
+
+def _event(type_, **fields):
+    """Build a mock streaming event."""
+    ev = MagicMock()
+    ev.type = type_
+    for k, v in fields.items():
+        setattr(ev, k, v)
+    return ev
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming chat tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicNonStreaming:
+    """Test non-streaming chat() path end-to-end with a mocked Anthropic client."""
+
+    def test_text_only_response(self) -> None:
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider = _make_provider_with_mock_client()
+        provider._client.messages.create.return_value = _fake_response(
+            blocks=[_text_block("Hello there!")],
+        )
+
+        async def run():
+            return await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="Hi")])],
+            )
+
+        result = asyncio.run(run())
+
+        assert isinstance(result, StreamEndEvent)
+        assert result.stop_reason == "end_turn"
+        assert len(result.parts) == 1
+        assert isinstance(result.parts[0], TextPart)
+        assert result.parts[0].text == "Hello there!"
+        assert result.usage is not None
+        assert result.usage.input_tokens == 10
+        assert result.usage.output_tokens == 20
+        assert result.usage.total_tokens == 30
+
+    def test_tool_use_response(self) -> None:
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider = _make_provider_with_mock_client()
+        provider._client.messages.create.return_value = _fake_response(
+            blocks=[
+                _text_block("Let me search."),
+                _tool_use_block("call_1", "search", {"q": "dobby"}),
+            ],
+            stop_reason="tool_use",
+        )
+
+        async def run():
+            return await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="look up dobby")])],
+                tools=[{"name": "search", "input_schema": {}}],
+            )
+
+        result = asyncio.run(run())
+
+        assert result.stop_reason == "tool_use"
+        tool_parts = [p for p in result.parts if isinstance(p, ToolUsePart)]
+        assert len(tool_parts) == 1
+        assert tool_parts[0].id == "call_1"
+        assert tool_parts[0].name == "search"
+        assert tool_parts[0].inputs == {"q": "dobby"}
+
+    def test_thinking_response(self) -> None:
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider = _make_provider_with_mock_client()
+        provider._client.messages.create.return_value = _fake_response(
+            blocks=[
+                _thinking_block("I need to compute...", signature="sig-1"),
+                _text_block("555"),
+            ],
+        )
+
+        async def run():
+            return await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="15 * 37")])],
+                reasoning_effort=5000,
+            )
+
+        result = asyncio.run(run())
+
+        reasoning_parts = [p for p in result.parts if isinstance(p, ReasoningPart)]
+        assert len(reasoning_parts) == 1
+        assert reasoning_parts[0].text == "I need to compute..."
+        assert reasoning_parts[0].signature == "sig-1"
+
+        # Verify thinking forced temperature=1.0 in the payload sent to Anthropic
+        call_kwargs = provider._client.messages.create.call_args.kwargs
+        assert call_kwargs["temperature"] == 1.0
+        assert call_kwargs["thinking"] == {
+            "type": "enabled",
+            "budget_tokens": 5000,
+        }
+
+    def test_max_tokens_and_system_prompt_forwarded(self) -> None:
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider = _make_provider_with_mock_client()
+        provider._client.messages.create.return_value = _fake_response(
+            blocks=[_text_block("ok")],
+        )
+
+        async def run():
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="hi")])],
+                system_prompt="Be brief.",
+                max_tokens=256,
+                temperature=0.3,
+            )
+
+        asyncio.run(run())
+
+        kwargs = provider._client.messages.create.call_args.kwargs
+        assert kwargs["system"] == "Be brief."
+        assert kwargs["max_tokens"] == 256
+        assert kwargs["temperature"] == 0.3
+        assert kwargs["stream"] is False
+
+    def test_non_streaming_error_translation(self) -> None:
+        import anthropic
+
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider = _make_provider_with_mock_client()
+
+        # Build a RateLimitError the same way the translation tests do
+        response = MagicMock()
+        response.status_code = 429
+        response.headers = {"retry-after": "7"}
+        err = anthropic.RateLimitError.__new__(anthropic.RateLimitError)
+        err.response = response
+        err.status_code = 429
+        err.message = "Rate limited"
+        err.body = None
+
+        provider._client.messages.create.side_effect = err
+        # Disable retries to keep the test fast
+        provider.max_retries = 1
+
+        async def run():
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="hi")])],
+            )
+
+        with pytest.raises(RateLimitError) as exc_info:
+            asyncio.run(run())
+
+        assert exc_info.value.provider == "anthropic"
+        assert exc_info.value.retry_after == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Streaming chat tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicStreaming:
+    """Test streaming chat() path by feeding synthetic Anthropic events."""
+
+    def _drive_stream(self, provider, events, **chat_kwargs):
+        """Invoke provider.chat(stream=True) with the given events and collect output."""
+        from dobby.types import TextPart as TP, UserMessagePart
+
+        provider._client.messages.create.return_value = _AsyncIter(events)
+
+        async def run():
+            out = []
+            stream = await provider.chat(
+                messages=[UserMessagePart(parts=[TP(text="hi")])],
+                stream=True,
+                **chat_kwargs,
+            )
+            async for ev in stream:
+                out.append(ev)
+            return out
+
+        return asyncio.run(run())
+
+    def test_streaming_text(self) -> None:
+        provider = _make_provider_with_mock_client()
+
+        msg_start = _event(
+            "message_start",
+            message=MagicMock(
+                id="msg_1",
+                model="claude-sonnet-4-20250514",
+                usage=MagicMock(
+                    input_tokens=5,
+                    cache_creation_input_tokens=None,
+                    cache_read_input_tokens=None,
+                ),
+            ),
+        )
+        cb_start = _event(
+            "content_block_start",
+            content_block=MagicMock(type="text"),
+        )
+        delta_hello = _event(
+            "content_block_delta",
+            delta=MagicMock(type="text_delta", text="Hello "),
+        )
+        delta_world = _event(
+            "content_block_delta",
+            delta=MagicMock(type="text_delta", text="world"),
+        )
+        cb_stop = _event("content_block_stop")
+        msg_delta = _event(
+            "message_delta",
+            delta=MagicMock(stop_reason="end_turn"),
+            usage=MagicMock(output_tokens=7),
+        )
+        msg_stop = _event("message_stop")
+
+        events = self._drive_stream(
+            provider,
+            [msg_start, cb_start, delta_hello, delta_world, cb_stop, msg_delta, msg_stop],
+        )
+
+        # First: stream start
+        assert isinstance(events[0], StreamStartEvent)
+        assert events[0].id == "msg_1"
+        assert events[0].model == "claude-sonnet-4-20250514"
+
+        # Text deltas
+        deltas = [e for e in events if isinstance(e, TextDeltaEvent)]
+        assert [d.delta for d in deltas] == ["Hello ", "world"]
+
+        # Final event has accumulated text and usage
+        end = [e for e in events if isinstance(e, StreamEndEvent)]
+        assert len(end) == 1
+        assert end[0].stop_reason == "end_turn"
+        text_parts = [p for p in end[0].parts if isinstance(p, TextPart)]
+        assert text_parts[0].text == "Hello world"
+        assert end[0].usage.input_tokens == 5
+        assert end[0].usage.output_tokens == 7
+        assert end[0].usage.total_tokens == 12
+
+    def test_streaming_tool_use_assembles_json(self) -> None:
+        """partial_json chunks should be concatenated and parsed."""
+        provider = _make_provider_with_mock_client()
+
+        msg_start = _event(
+            "message_start",
+            message=MagicMock(id="msg_2", model="claude-sonnet-4-20250514", usage=None),
+        )
+        _cb = MagicMock()
+        _cb.type = "tool_use"
+        _cb.id = "call_42"
+        _cb.name = "search"
+        tool_start = _event("content_block_start", content_block=_cb)
+        # The JSON "{\"q\":\"dobby\"}" arrives in three partial chunks
+        p1 = _event(
+            "content_block_delta",
+            delta=MagicMock(type="input_json_delta", partial_json='{"q":'),
+        )
+        p2 = _event(
+            "content_block_delta",
+            delta=MagicMock(type="input_json_delta", partial_json='"dob'),
+        )
+        p3 = _event(
+            "content_block_delta",
+            delta=MagicMock(type="input_json_delta", partial_json='by"}'),
+        )
+        tool_stop = _event("content_block_stop")
+        msg_delta = _event(
+            "message_delta",
+            delta=MagicMock(stop_reason="tool_use"),
+            usage=MagicMock(output_tokens=11),
+        )
+        msg_stop = _event("message_stop")
+
+        events = self._drive_stream(
+            provider,
+            [msg_start, tool_start, p1, p2, p3, tool_stop, msg_delta, msg_stop],
+        )
+
+        tool_events = [e for e in events if isinstance(e, ToolUseEvent)]
+        assert len(tool_events) == 1
+        assert tool_events[0].id == "call_42"
+        assert tool_events[0].name == "search"
+        assert tool_events[0].inputs == {"q": "dobby"}
+
+        end = next(e for e in events if isinstance(e, StreamEndEvent))
+        assert end.stop_reason == "tool_use"
+        tool_parts = [p for p in end.parts if isinstance(p, ToolUsePart)]
+        assert tool_parts[0].inputs == {"q": "dobby"}
+
+    def test_streaming_thinking(self) -> None:
+        """Thinking blocks should produce reasoning_start/delta/end and preserve signature."""
+        provider = _make_provider_with_mock_client()
+
+        msg_start = _event(
+            "message_start",
+            message=MagicMock(id="msg_3", model="claude-sonnet-4-20250514", usage=None),
+        )
+        think_start = _event(
+            "content_block_start",
+            content_block=MagicMock(type="thinking"),
+        )
+        think_delta = _event(
+            "content_block_delta",
+            delta=MagicMock(type="thinking_delta", thinking="Let me think "),
+        )
+        think_delta2 = _event(
+            "content_block_delta",
+            delta=MagicMock(type="thinking_delta", thinking="carefully."),
+        )
+        sig_delta = _event(
+            "content_block_delta",
+            delta=MagicMock(type="signature_delta", signature="sig-abc"),
+        )
+        think_stop = _event("content_block_stop")
+        msg_delta = _event(
+            "message_delta",
+            delta=MagicMock(stop_reason="end_turn"),
+            usage=MagicMock(output_tokens=3),
+        )
+        msg_stop = _event("message_stop")
+
+        events = self._drive_stream(
+            provider,
+            [msg_start, think_start, think_delta, think_delta2, sig_delta, think_stop,
+             msg_delta, msg_stop],
+            reasoning_effort=5000,
+        )
+
+        assert any(isinstance(e, ReasoningStartEvent) for e in events)
+        assert any(isinstance(e, ReasoningEndEvent) for e in events)
+        rdeltas = [e for e in events if isinstance(e, ReasoningDeltaEvent)]
+        assert "".join(d.delta for d in rdeltas) == "Let me think carefully."
+
+        end = next(e for e in events if isinstance(e, StreamEndEvent))
+        rparts = [p for p in end.parts if isinstance(p, ReasoningPart)]
+        assert rparts[0].text == "Let me think carefully."
+        assert rparts[0].signature == "sig-abc"
+
+    def test_stream_uses_stream_true_param(self) -> None:
+        """The SDK call must be issued with stream=True."""
+        provider = _make_provider_with_mock_client()
+
+        msg_start = _event(
+            "message_start",
+            message=MagicMock(id="x", model="m", usage=None),
+        )
+        msg_stop = _event("message_stop")
+        self._drive_stream(provider, [msg_start, msg_stop])
+
+        kwargs = provider._client.messages.create.call_args.kwargs
+        assert kwargs["stream"] is True
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn conversation context tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicMessageContext:
+    """Verify the full user -> assistant(tool_use) -> user(tool_result) round-trip."""
+
+    def test_full_tool_round_trip_conversion(self) -> None:
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import (
+            AssistantMessagePart,
+            TextPart as TP,
+            ToolResultPart,
+            ToolUsePart as TUP,
+            UserMessagePart,
+        )
+
+        messages = [
+            UserMessagePart(parts=[TP(text="Search for Dobby")]),
+            AssistantMessagePart(
+                parts=[
+                    TP(text="Let me search."),
+                    TUP(id="call_1", name="search", inputs={"q": "dobby"}),
+                ]
+            ),
+            UserMessagePart(
+                parts=[
+                    ToolResultPart(
+                        tool_use_id="call_1",
+                        name="search",
+                        parts=[TP(text="Dobby is a house-elf.")],
+                    )
+                ]
+            ),
+            AssistantMessagePart(parts=[TP(text="Dobby is a house-elf from Harry Potter.")]),
+        ]
+
+        result = to_anthropic_messages(messages)
+
+        assert [m["role"] for m in result] == ["user", "assistant", "user", "assistant"]
+        # Assistant turn combines text + tool_use
+        assert result[1]["content"][0]["type"] == "text"
+        assert result[1]["content"][1] == {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "search",
+            "input": {"q": "dobby"},
+        }
+        # Tool result travels back as a user message with tool_result block
+        assert result[2]["content"][0]["type"] == "tool_result"
+        assert result[2]["content"][0]["tool_use_id"] == "call_1"
+
+    def test_reasoning_preserved_across_turns(self) -> None:
+        """Reasoning blocks must round-trip with signature for multi-turn thinking."""
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import AssistantMessagePart, TextPart as TP, UserMessagePart
+
+        messages = [
+            UserMessagePart(parts=[TP(text="2 + 2?")]),
+            AssistantMessagePart(
+                parts=[
+                    ReasoningPart(text="Adding two and two.", signature="sig-99"),
+                    TP(text="4"),
+                ]
+            ),
+            UserMessagePart(parts=[TP(text="And 3 + 3?")]),
+        ]
+
+        result = to_anthropic_messages(messages)
+
+        assistant = result[1]
+        assert assistant["content"][0] == {
+            "type": "thinking",
+            "thinking": "Adding two and two.",
+            "signature": "sig-99",
+        }
+        assert assistant["content"][1] == {"type": "text", "text": "4"}
+
+    def test_empty_assistant_parts_skipped(self) -> None:
+        """An assistant turn with no parts should not create an empty message block."""
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import AssistantMessagePart, TextPart as TP, UserMessagePart
+
+        messages = [
+            UserMessagePart(parts=[TP(text="hi")]),
+            AssistantMessagePart(parts=[]),
+            UserMessagePart(parts=[TP(text="still here")]),
+        ]
+        result = to_anthropic_messages(messages)
+
+        # The two user turns get merged since the empty assistant was skipped
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert len(result[0]["content"]) == 2
+
+    def test_tool_result_is_error_flag_forwarded(self) -> None:
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import TextPart as TP, ToolResultPart, UserMessagePart
+
+        messages = [
+            UserMessagePart(
+                parts=[
+                    ToolResultPart(
+                        tool_use_id="call_err",
+                        name="search",
+                        parts=[TP(text="boom")],
+                        is_error=True,
+                    )
+                ]
+            )
+        ]
+        result = to_anthropic_messages(messages)
+
+        assert result[0]["content"][0]["is_error"] is True
+        assert result[0]["content"][0]["tool_use_id"] == "call_err"
+
+
+# ---------------------------------------------------------------------------
+# Tavily web search tool tests
+# ---------------------------------------------------------------------------
+
+
+class TestTavilySearchTool:
+    """Test the TavilySearchTool against a mocked AsyncTavilyClient."""
+
+    def _make_tool(self, search_result):
+        from dobby.common_tools import TavilySearchTool
+
+        tool = TavilySearchTool(api_key="tvly-fake")
+        tool.client = MagicMock()
+        tool.client.search = AsyncMock(return_value=search_result)
+        return tool
+
+    def test_returns_structured_results(self) -> None:
+        from dobby.common_tools import TavilySearchResult
+
+        tool = self._make_tool(
+            {
+                "results": [
+                    {
+                        "title": "Dobby on Wikipedia",
+                        "url": "https://en.wikipedia.org/wiki/Dobby",
+                        "content": "Dobby is a house-elf.",
+                        "score": 0.95,
+                    },
+                    {
+                        "title": "Dobby-SDK",
+                        "url": "https://github.com/tynybay/dobby-sdk",
+                        "content": "LLM SDK",
+                        "score": 0.82,
+                    },
+                ]
+            }
+        )
+
+        results = asyncio.run(tool(query="dobby"))
+
+        assert len(results) == 2
+        assert all(isinstance(r, TavilySearchResult) for r in results)
+        assert results[0].title == "Dobby on Wikipedia"
+        assert results[0].score == 0.95
+        assert results[1].url == "https://github.com/tynybay/dobby-sdk"
+
+    def test_passes_through_search_arguments(self) -> None:
+        tool = self._make_tool({"results": []})
+
+        asyncio.run(
+            tool(
+                query="latest AI news",
+                search_depth="advanced",
+                topic="news",
+                time_range="week",
+            )
+        )
+
+        tool.client.search.assert_awaited_once()
+        kwargs = tool.client.search.call_args.kwargs
+        assert kwargs["query"] == "latest AI news"
+        assert kwargs["search_depth"] == "advanced"
+        assert kwargs["topic"] == "news"
+        assert kwargs["time_range"] == "week"
+
+    def test_default_arguments(self) -> None:
+        tool = self._make_tool({"results": []})
+
+        asyncio.run(tool(query="python"))
+
+        kwargs = tool.client.search.call_args.kwargs
+        assert kwargs["search_depth"] == "basic"
+        assert kwargs["topic"] == "general"
+        assert kwargs["time_range"] is None
+
+    def test_empty_results(self) -> None:
+        tool = self._make_tool({"results": []})
+
+        results = asyncio.run(tool(query="no matches expected"))
+
+        assert results == []
+
+    def test_missing_fields_get_defaults(self) -> None:
+        """Malformed Tavily rows should not crash — missing fields get defaults."""
+        tool = self._make_tool({"results": [{"title": "Partial"}]})
+
+        results = asyncio.run(tool(query="partial"))
+
+        assert len(results) == 1
+        assert results[0].title == "Partial"
+        assert results[0].url == ""
+        assert results[0].content == ""
+        assert results[0].score == 0.0
+
+    def test_missing_results_key(self) -> None:
+        """If Tavily returns no 'results' key, tool should return []."""
+        tool = self._make_tool({})
+
+        results = asyncio.run(tool(query="anything"))
+
+        assert results == []
+
+    def test_client_error_propagates(self) -> None:
+        from dobby.common_tools import TavilySearchTool
+
+        tool = TavilySearchTool(api_key="tvly-fake")
+        tool.client = MagicMock()
+        tool.client.search = AsyncMock(side_effect=RuntimeError("tavily down"))
+
+        with pytest.raises(RuntimeError, match="tavily down"):
+            asyncio.run(tool(query="anything"))
+
+    def test_tool_schema_metadata(self) -> None:
+        """Basic Tool contract — name/description set, schema reflects __call__ params."""
+        from dobby.common_tools import TavilySearchTool
+
+        tool = TavilySearchTool(api_key="tvly-fake")
+        assert tool.name == "tavily_search"
+        assert "web" in tool.description.lower() or "search" in tool.description.lower()
+
+        # Sanity-check that __call__ takes the documented params
+        import inspect
+        sig = inspect.signature(tool.__call__)
+        assert {"query", "search_depth", "topic", "time_range"} <= set(sig.parameters)

@@ -9,7 +9,8 @@ from collections.abc import AsyncIterator, Iterable
 from typing import Any, Literal, NoReturn, overload
 
 import anthropic
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, AsyncAnthropicFoundry
+from anthropic.lib.foundry import AsyncAzureADTokenProvider
 
 from ..._logging import logger
 from ...types import (
@@ -50,24 +51,21 @@ DEFAULT_MAX_TOKENS = 8192
 class AnthropicProvider(Provider[AsyncAnthropic]):
     """Provider for Anthropic Claude and Azure-hosted Claude using Messages API.
 
-    Inherits from Provider base class and implements the chat() interface
-    for Anthropic's Messages API.
+    Supports direct Anthropic API and Azure AI Foundry deployments.
+    For Azure, uses AsyncAnthropicFoundry which sends the correct "api-key"
+    auth header and sets the proper base URL.
 
-    Attributes:
-        api_key: API key for authentication.
-        base_url: Base URL for API endpoint (None for default Anthropic).
-
-    Inherited from Provider:
-        name: Returns "anthropic" or "azure-anthropic" based on configuration.
-        model: Returns the model name.
-        client: Returns the AsyncAnthropic client instance.
-        max_retries: Maximum retry attempts (default: 3).
+    Azure env vars (read automatically by SDK if params not passed explicitly):
+        ANTHROPIC_FOUNDRY_API_KEY: Azure API key.
+        ANTHROPIC_FOUNDRY_RESOURCE: Azure resource name.
+        ANTHROPIC_FOUNDRY_BASE_URL: Full Azure base URL (alternative to resource).
     """
 
     api_key: str | None
     base_url: str | None
     _model: str
     _client: AsyncAnthropic
+    _is_azure: bool
     max_retries: int
 
     def __init__(
@@ -75,32 +73,52 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         model: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        resource: str | None = None,
+        azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
         max_retries: int = 3,
     ):
         """Initialize Anthropic provider.
 
-        Args:
-            model: Model name (e.g., 'claude-sonnet-4-20250514').
-            api_key: API key for authentication. Uses ANTHROPIC_API_KEY env var if not provided.
-            base_url: API endpoint URL. If contains 'azure', provider name becomes 'azure-anthropic'.
-            max_retries: Maximum retry attempts for transient errors. Defaults to 3.
+        For direct Anthropic:
+            api_key: Uses ANTHROPIC_API_KEY env var if not provided.
+
+        For Azure AI Foundry (uses AsyncAnthropicFoundry):
+            api_key: Azure key. Uses ANTHROPIC_FOUNDRY_API_KEY env var if not provided.
+            resource: Azure resource name (e.g. "my-resource"). Mutually exclusive with base_url.
+            base_url: Full Azure endpoint URL. Uses ANTHROPIC_FOUNDRY_BASE_URL env var if not provided.
+            azure_ad_token_provider: Callable returning Azure AD bearer token.
+                                     Mutually exclusive with api_key.
+
+        Azure is detected when any of resource, azure_ad_token_provider, or an
+        "azure"-containing base_url is provided.
         """
         self.api_key = api_key
         self.base_url = base_url
         self._model = model
         self.max_retries = max_retries
 
-        self._client = AsyncAnthropic(
-            api_key=api_key,
-            base_url=base_url,
+        self._is_azure = bool(
+            resource or azure_ad_token_provider or (base_url and "azure" in base_url)
         )
+
+        if self._is_azure:
+            self._client = AsyncAnthropicFoundry(
+                api_key=api_key,
+                base_url=base_url,
+                resource=resource,
+                azure_ad_token_provider=azure_ad_token_provider,
+            )
+        else:
+            self._client = AsyncAnthropic(
+                api_key=api_key,
+                base_url=base_url,
+            )
 
     @property
     def name(self) -> str:
         """Provider name."""
-        if self.base_url and "azure" in self.base_url:
-            return "azure-anthropic"
-        return "anthropic"
+        is_azure = getattr(self, "_is_azure", bool(self.base_url and "azure" in self.base_url))
+        return "azure-anthropic" if is_azure else "anthropic"
 
     @property
     def model(self) -> str:
