@@ -32,7 +32,7 @@ class ProviderConfig(BaseModel):
     foundry_api_key: str | None = None
     foundry_resource: str | None = None
     foundry_base_url: str | None = None
-    model: str = "claude-sonnet-4-6"
+    model: str = "claude-sonnet-4-5"
 
     @computed_field
     @property
@@ -46,7 +46,7 @@ class ProviderConfig(BaseModel):
             foundry_api_key=os.getenv("ANTHROPIC_FOUNDRY_API_KEY"),
             foundry_resource=os.getenv("ANTHROPIC_FOUNDRY_RESOURCE"),
             foundry_base_url=os.getenv("ANTHROPIC_FOUNDRY_BASE_URL"),
-            model=os.getenv("ANTHROPIC_FOUNDRY_MODEL", "claude-sonnet-4-6"),
+            model=os.getenv("ANTHROPIC_FOUNDRY_MODEL", "claude-sonnet-4-5"),
         )
 
 
@@ -203,12 +203,13 @@ EXTRACTION_PROMPT = (
 def _build_provider(cfg: ProviderConfig):
     from dobby.providers.anthropic import AnthropicProvider
     if cfg.use_azure:
-        return AnthropicProvider(
+        provider = AnthropicProvider(
             model=cfg.model,
             api_key=cfg.foundry_api_key,
             resource=cfg.foundry_resource,
             base_url=cfg.foundry_base_url,
         )
+        return provider
     return AnthropicProvider(model=cfg.model, api_key=cfg.api_key)
 
 
