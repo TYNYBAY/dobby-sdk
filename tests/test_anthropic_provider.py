@@ -1174,3 +1174,221 @@ class TestTavilySearchTool:
         import inspect
         sig = inspect.signature(tool.__call__)
         assert {"query", "search_depth", "topic", "time_range"} <= set(sig.parameters)
+
+
+# ---------------------------------------------------------------------------
+# Travel insurance claim accuracy tests (live — auto-skipped without API key)
+#
+# Run all:   uv run pytest tests/test_anthropic_provider.py -v -s -k "Travel"
+# Run one:   uv run pytest tests/test_anthropic_provider.py -v -s -k "cancellation"
+# ---------------------------------------------------------------------------
+
+import base64
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_FOUNDRY_KEY = os.getenv("ANTHROPIC_FOUNDRY_API_KEY")
+_FOUNDRY_RESOURCE = os.getenv("ANTHROPIC_FOUNDRY_RESOURCE")
+_FOUNDRY_BASE_URL = os.getenv("ANTHROPIC_FOUNDRY_BASE_URL")
+_FOUNDRY_MODEL = os.getenv("ANTHROPIC_FOUNDRY_MODEL")
+_DIRECT_KEY = os.getenv("ANTHROPIC_API_KEY")
+_USE_AZURE = bool(_FOUNDRY_KEY and (_FOUNDRY_RESOURCE or _FOUNDRY_BASE_URL))
+_HAS_KEY = _USE_AZURE or bool(_DIRECT_KEY)
+
+_requires_live = pytest.mark.skipif(
+    not _HAS_KEY,
+    reason="No API key — set ANTHROPIC_API_KEY or ANTHROPIC_FOUNDRY_* in .env",
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+_TRAVEL_GROUND_TRUTH = [
+    {
+        "file": "trip_cancellation_claim.pdf",
+        "label": "Trip Cancellation",
+        "fields": {
+            "claim_number": "CLM-2026-TC-00881",
+            "policy_number": "POL-TRVL-4492017",
+            "traveler_name": "Emily R. Thornton",
+            "destination": "Rome",
+            "departure_date": "2026-03-20",
+            "total_trip_cost": "8450",
+            "net_claim_amount": "7540",
+            "deductible": "250",
+            "cancellation_reason": "appendicitis",
+        },
+    },
+    {
+        "file": "trip_interruption_claim.pdf",
+        "label": "Trip Interruption",
+        "fields": {
+            "claim_number": "CLM-2026-TI-00334",
+            "policy_number": "POL-TRVL-3381092",
+            "traveler_name": "Kim",
+            "destination": "Bali",
+            "total_trip_cost": "12600",
+            "net_claim_amount": "6690",
+            "deductible": "500",
+            "interruption_reason": "stroke",
+        },
+    },
+    {
+        "file": "baggage_loss_claim.pdf",
+        "label": "Baggage Loss",
+        "fields": {
+            "claim_number": "CLM-2026-BG-01122",
+            "policy_number": "POL-TRVL-5510834",
+            "traveler_name": "Maria L. Santos",
+            "destination": "Tokyo",
+            "total_declared_value": "3970",
+            "net_claim_amount": "3320",
+            "deductible": "100",
+            "airline_pir": "JAL-PIR-2026-ORD-00891",
+        },
+    },
+    {
+        "file": "emergency_medical_claim.pdf",
+        "label": "Emergency Medical Evacuation",
+        "fields": {
+            "claim_number": "CLM-2026-EM-00219",
+            "policy_number": "POL-TRVL-7723561",
+            "traveler_name": "Daniel J. Owens",
+            "destination": "Cusco",
+            "diagnosis": "HAPE",
+            "total_medical_costs": "48180",
+            "net_claim_amount": "47930",
+            "deductible": "250",
+        },
+    },
+    {
+        "file": "travel_delay_claim.pdf",
+        "label": "Travel Delay",
+        "fields": {
+            "claim_number": "CLM-2026-TD-00667",
+            "policy_number": "POL-TRVL-6640293",
+            "traveler_name": "Russo",
+            "destination": "Cancun",
+            "total_expenses": "1028",
+            "net_claim_amount": "1028",
+            "deductible": "0",
+            "delay_cause": "thunderstorm",
+        },
+    },
+]
+
+_EXTRACTION_PROMPT = (
+    "Extract all structured fields from this travel insurance claim document. "
+    "Return ONLY a valid JSON object — no markdown fences, no explanation. "
+    "Include every claim number, policy number, traveler name, destination, "
+    "travel dates, dollar amounts, deductibles, and reason for claim."
+)
+
+
+def _make_live_provider():
+    from dobby.providers.anthropic import AnthropicProvider
+    model = _FOUNDRY_MODEL or "claude-sonnet-4-6"
+    if _USE_AZURE:
+        return AnthropicProvider(
+            model=model,
+            api_key=_FOUNDRY_KEY,
+            resource=_FOUNDRY_RESOURCE,
+            base_url=_FOUNDRY_BASE_URL,
+        )
+    return AnthropicProvider(model=model, api_key=_DIRECT_KEY)
+
+
+def _check_field(extracted: dict, value: str) -> bool:
+    flat = json.dumps(extracted).lower().replace(",", "").replace("$", "")
+    return value.lower().replace(",", "").replace("$", "") in flat
+
+
+def _run_claim_accuracy(gt: dict) -> tuple[int, int, float]:
+    from dobby.types import DocumentPart, TextPart, UserMessagePart
+    from dobby.types.document_part import Base64PDFSource
+
+    pdf_path = _FIXTURES / gt["file"]
+    assert pdf_path.exists(), (
+        f"Missing fixture: {pdf_path}\n"
+        f"Generate with: python tests/fixtures/generate_claim_pdfs.py"
+    )
+
+    pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode()
+    provider = _make_live_provider()
+
+    t0 = time.perf_counter()
+    result = asyncio.run(
+        provider.chat(
+            messages=[
+                UserMessagePart(parts=[
+                    TextPart(text=_EXTRACTION_PROMPT),
+                    DocumentPart(
+                        source=Base64PDFSource(data=pdf_b64, media_type="application/pdf"),
+                        filename=gt["file"],
+                    ),
+                ])
+            ],
+            system_prompt="You are a precise travel insurance data extraction system. Output only valid JSON.",
+            max_tokens=1024,
+            temperature=0.0,
+        )
+    )
+    latency = time.perf_counter() - t0
+
+    raw = next((p.text for p in result.parts if hasattr(p, "text")), "")
+    clean = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    clean = re.sub(r"\n?```$", "", clean.strip())
+    try:
+        extracted = json.loads(clean)
+    except json.JSONDecodeError:
+        extracted = {}
+
+    passed = 0
+    print(f"\n  [{gt['label']}]  latency={latency:.1f}s  provider={provider.name}")
+    for field, expected in gt["fields"].items():
+        hit = _check_field(extracted, expected)
+        print(f"    {'✓' if hit else '✗'} {field:<28} expected={expected!r}")
+        passed += hit
+
+    total = len(gt["fields"])
+    usage = result.usage
+    print(f"  → {passed}/{total} fields ({passed/total*100:.0f}%)  "
+          f"tokens: in={usage.input_tokens if usage else '?'} out={usage.output_tokens if usage else '?'}")
+    return passed, total, latency
+
+
+@_requires_live
+class TestTravelClaimAccuracy:
+    """Field-level extraction accuracy across 5 travel insurance claim PDFs.
+
+    Measures what the model correctly extracts vs known ground truth.
+    Pass threshold: 75% of fields per claim.
+
+    Run: uv run pytest tests/test_anthropic_provider.py -v -s -k "TravelClaim"
+    """
+
+    def test_trip_cancellation_accuracy(self) -> None:
+        passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[0])
+        assert passed >= total * 0.75, f"Trip cancellation: only {passed}/{total} fields found"
+
+    def test_trip_interruption_accuracy(self) -> None:
+        passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[1])
+        assert passed >= total * 0.75, f"Trip interruption: only {passed}/{total} fields found"
+
+    def test_baggage_loss_accuracy(self) -> None:
+        passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[2])
+        assert passed >= total * 0.75, f"Baggage loss: only {passed}/{total} fields found"
+
+    def test_emergency_medical_accuracy(self) -> None:
+        passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[3])
+        assert passed >= total * 0.75, f"Emergency medical: only {passed}/{total} fields found"
+
+    def test_travel_delay_accuracy(self) -> None:
+        passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[4])
+        assert passed >= total * 0.75, f"Travel delay: only {passed}/{total} fields found"
