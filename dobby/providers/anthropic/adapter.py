@@ -102,12 +102,19 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         )
 
         if self._is_azure:
-            self._client = AsyncAnthropicFoundry(
-                api_key=api_key,
-                base_url=base_url,
-                resource=resource,
-                azure_ad_token_provider=azure_ad_token_provider,
-            )
+            if base_url and not resource and not azure_ad_token_provider:
+                self._client = AsyncAnthropic(
+                    api_key=api_key,
+                    base_url=base_url,
+                    default_headers={"api-key": api_key} if api_key else None,
+                )
+            else:
+                self._client = AsyncAnthropicFoundry(
+                    api_key=api_key,
+                    base_url=base_url,
+                    resource=resource,
+                    azure_ad_token_provider=azure_ad_token_provider,
+                )
         else:
             self._client = AsyncAnthropic(
                 api_key=api_key,
