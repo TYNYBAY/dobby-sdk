@@ -1392,3 +1392,39 @@ class TestTravelClaimAccuracy:
     def test_travel_delay_accuracy(self) -> None:
         passed, total, _ = _run_claim_accuracy(_TRAVEL_GROUND_TRUTH[4])
         assert passed >= total * 0.75, f"Travel delay: only {passed}/{total} fields found"
+
+
+if __name__ == "__main__":
+    if not _HAS_KEY:
+        print(
+            "\nERROR: No API key found.\n"
+            "Set ANTHROPIC_API_KEY (direct) or\n"
+            "ANTHROPIC_FOUNDRY_API_KEY + ANTHROPIC_FOUNDRY_RESOURCE/BASE_URL (Azure) in .env\n"
+        )
+        raise SystemExit(1)
+
+    print("\n" + "=" * 65)
+    print("TRAVEL INSURANCE CLAIM EXTRACTION — ACCURACY REPORT")
+    print("=" * 65)
+
+    total_passed = 0
+    total_fields = 0
+    total_latency = 0.0
+
+    for gt in _TRAVEL_GROUND_TRUTH:
+        try:
+            p, t, lat = _run_claim_accuracy(gt)
+            total_passed += p
+            total_fields += t
+            total_latency += lat
+        except AssertionError as e:
+            print(f"  [FIXTURE ERROR] {e}")
+        except Exception as e:
+            print(f"  [ERROR] {gt['label']}: {e}")
+
+    print("\n" + "-" * 65)
+    overall = total_passed / total_fields * 100 if total_fields else 0
+    avg_lat = total_latency / len(_TRAVEL_GROUND_TRUTH)
+    print(f"OVERALL ACCURACY : {total_passed}/{total_fields} fields  ({overall:.1f}%)")
+    print(f"AVG LATENCY      : {avg_lat:.1f}s per claim")
+    print("=" * 65 + "\n")
