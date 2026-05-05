@@ -505,90 +505,173 @@ class TestLiveStreamingToolCalls:
 
 
 # ---------------------------------------------------------------------------
-# 5. PDF / document handling (claim underwriting)
+# 5. PDF / document handling — field-level accuracy against ground truth
 # ---------------------------------------------------------------------------
+
+import json
+import re
+import time
+
+_EXTRACTION_PROMPT = (
+    "Extract all structured fields from this insurance claim document. "
+    "Return ONLY a valid JSON object — no markdown fences, no explanation. "
+    "Include every claim number, policy number, name, date, and dollar amount you find."
+)
+
+_GROUND_TRUTH = [
+    {
+        "file": "auto_liability_claim.pdf",
+        "label": "Auto liability",
+        "fields": {
+            "claim_number": "CLM-2026-AL-00142",
+            "policy_number": "POL-AUTO-8823991",
+            "insured_name": "Jane R. Hartwell",
+            "date_of_loss": "2026-03-15",
+            "total_estimate": "9570",
+            "reserve": "14500",
+        },
+    },
+    {
+        "file": "property_damage_claim.pdf",
+        "label": "Property damage",
+        "fields": {
+            "claim_number": "CLM-2026-PD-00308",
+            "policy_number": "POL-COMM-1143772",
+            "business_name": "Hartfield Printing",
+            "date_of_loss": "2026-02-28",
+            "total_rcv": "157740",
+            "net_payable_acv": "103540",
+            "deductible": "5000",
+        },
+    },
+    {
+        "file": "workers_comp_claim.pdf",
+        "label": "Workers comp",
+        "fields": {
+            "claim_number": "CLM-2026-WC-00091",
+            "policy_number": "POL-WC-5567234",
+            "employee_name": "Carlos M. Reyes",
+            "date_of_injury": "2026-01-22",
+            "body_part": "knee",
+            "total_reserve": "44704",
+            "avg_weekly_wage": "1142",
+        },
+    },
+    {
+        "file": "medical_malpractice_claim.pdf",
+        "label": "Medical malpractice",
+        "fields": {
+            "claim_number": "CLM-2026-MM-00017",
+            "policy_number": "POL-MPL-0023491",
+            "provider_name": "Allard",
+            "claimant_name": "Vasquez",
+            "demand_amount": "1250000",
+            "total_reserve": "1075000",
+        },
+    },
+    {
+        "file": "homeowners_claim.pdf",
+        "label": "Homeowners",
+        "fields": {
+            "claim_number": "CLM-2026-HO-00522",
+            "policy_number": "POL-HO3-7734128",
+            "insured_name": "Webb",
+            "date_of_loss": "2026-04-02",
+            "total_rcv": "26490",
+            "net_acv_payment": "15670",
+            "deductible": "2500",
+        },
+    },
+]
+
+
+def _extract_fields(provider, pdf_file: str) -> tuple[dict, float]:
+    """Send PDF to provider, return (parsed_json, latency_seconds)."""
+    from dobby.types import DocumentPart, TextPart, UserMessagePart
+    from dobby.types.document_part import Base64PDFSource
+
+    pdf_b64 = base64.b64encode((FIXTURES_DIR / pdf_file).read_bytes()).decode()
+    t0 = time.perf_counter()
+    result = asyncio.run(
+        provider.chat(
+            messages=[
+                UserMessagePart(
+                    parts=[
+                        TextPart(text=_EXTRACTION_PROMPT),
+                        DocumentPart(
+                            source=Base64PDFSource(data=pdf_b64, media_type="application/pdf"),
+                            filename=pdf_file,
+                        ),
+                    ]
+                )
+            ],
+            system_prompt="You are a precise claims data extraction system. Output only valid JSON.",
+            max_tokens=1024,
+            temperature=0.0,
+        )
+    )
+    latency = time.perf_counter() - t0
+    raw = next((p.text for p in result.parts if hasattr(p, "text")), "")
+    clean = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    clean = re.sub(r"\n?```$", "", clean.strip())
+    try:
+        return json.loads(clean), latency
+    except json.JSONDecodeError:
+        return {}, latency
+
+
+def _field_hit(extracted: dict, value: str) -> bool:
+    return value.lower() in json.dumps(extracted).lower().replace(",", "").replace("$", "")
 
 
 @requires_anthropic
 class TestLiveDocumentHandling:
-    def test_auto_liability_claim_pdf(self):
-        """Send the auto liability claim PDF and ask Claude to extract key fields."""
-        from dobby.types import DocumentPart, TextPart, UserMessagePart
-        from dobby.types.document_part import Base64PDFSource
+    """Field-level extraction accuracy across all 5 claim PDFs."""
 
+    def _run_claim(self, gt: dict) -> None:
         provider = _provider()
-        pdf_data = _pdf_b64("auto_liability", "Claim: CLM-2026-AL-00142. Loss: $9,570. Policy: POL-AUTO-8823991.")
+        extracted, latency = _extract_fields(provider, gt["file"])
 
-        result = asyncio.run(
-            provider.chat(
-                messages=[
-                    UserMessagePart(
-                        parts=[
-                            TextPart(text="Extract the claim number, policy number, and total loss amount from this claim document. Reply in JSON."),
-                            DocumentPart(
-                                source=Base64PDFSource(data=pdf_data, media_type="application/pdf"),
-                                filename="auto_liability_claim.pdf",
-                            ),
-                        ]
-                    )
-                ],
-                system_prompt="You are a claims processing assistant. Extract structured data from insurance documents.",
-            )
+        passed, total = 0, len(gt["fields"])
+        print(f"\n  [{gt['label']}]  latency={latency:.1f}s")
+        for field, expected in gt["fields"].items():
+            hit = _field_hit(extracted, expected)
+            mark = "✓" if hit else "✗"
+            print(f"    {mark} {field:<22} expected={expected!r}")
+            passed += hit
+
+        pct = passed / total * 100
+        print(f"  → {passed}/{total} fields  ({pct:.0f}%)")
+        print(f"  → tokens: in={0}  raw_json_keys={list(extracted.keys())[:8]}")
+
+        assert passed >= total * 0.7, (
+            f"{gt['label']}: only {passed}/{total} fields found ({pct:.0f}%) — "
+            f"extracted keys: {list(extracted.keys())}"
         )
 
-        text = result.parts[0].text
-        print(f"\n  extracted: {text!r}")
-        assert result.stop_reason == "end_turn"
-        assert result.usage.input_tokens > 0
+    def test_auto_liability_claim(self):
+        self._run_claim(_GROUND_TRUTH[0])
 
-    def test_property_damage_claim_pdf(self):
-        """Send the property damage claim PDF and ask for underwriting recommendation."""
-        from dobby.types import DocumentPart, TextPart, UserMessagePart
-        from dobby.types.document_part import Base64PDFSource
+    def test_property_damage_claim(self):
+        self._run_claim(_GROUND_TRUTH[1])
 
-        provider = _provider()
+    def test_workers_comp_claim(self):
+        self._run_claim(_GROUND_TRUTH[2])
 
-        # Use the actual fixture if it was generated
-        path = FIXTURES_DIR / "property_damage_claim.pdf"
-        if path.exists():
-            pdf_data = base64.b64encode(path.read_bytes()).decode()
-        else:
-            pdf_data = _pdf_b64(
-                "property_damage",
-                "Commercial property water damage. Total estimate: $157,740. ACV: $108,540. Deductible: $5,000.",
-            )
+    def test_medical_malpractice_claim(self):
+        self._run_claim(_GROUND_TRUTH[3])
 
-        result = asyncio.run(
-            provider.chat(
-                messages=[
-                    UserMessagePart(
-                        parts=[
-                            TextPart(text="Review this property damage claim. Should we approve or investigate further? Give a brief underwriting decision with reasoning."),
-                            DocumentPart(
-                                source=Base64PDFSource(data=pdf_data, media_type="application/pdf"),
-                                filename="property_damage_claim.pdf",
-                            ),
-                        ]
-                    )
-                ],
-                system_prompt="You are a senior property underwriter. Provide concise, professional claim decisions.",
-                max_tokens=300,
-            )
-        )
-
-        text = result.parts[0].text
-        print(f"\n  underwriting decision:\n  {text!r}")
-        assert len(text) > 20
+    def test_homeowners_claim(self):
+        self._run_claim(_GROUND_TRUTH[4])
 
     def test_multi_pdf_comparison(self):
-        """Send two claim PDFs and ask Claude to compare them."""
+        """Model can compare two claims and identify higher financial exposure."""
         from dobby.types import DocumentPart, TextPart, UserMessagePart
         from dobby.types.document_part import Base64PDFSource
 
         provider = _provider()
-
-        pdf1 = _pdf_b64("workers_comp", "Workers comp knee injury. Reserve: $44,704. Status: Surgery scheduled.")
-        pdf2 = _pdf_b64("medical_malpractice", "Medical malpractice bile duct injury. Demand: $1,250,000. Reserve: $1,075,000.")
+        pdf1 = base64.b64encode((FIXTURES_DIR / "workers_comp_claim.pdf").read_bytes()).decode()
+        pdf2 = base64.b64encode((FIXTURES_DIR / "medical_malpractice_claim.pdf").read_bytes()).decode()
 
         result = asyncio.run(
             provider.chat(
@@ -614,7 +697,9 @@ class TestLiveDocumentHandling:
 
         text = result.parts[0].text
         print(f"\n  comparison: {text!r}")
-        assert len(text) > 20
+        # Medical malpractice ($1.075M) >> workers comp ($44K)
+        assert "malpractice" in text.lower() or "1,075" in text or "1075" in text or "million" in text.lower()
+        assert len(text) > 30
 
 
 # ---------------------------------------------------------------------------

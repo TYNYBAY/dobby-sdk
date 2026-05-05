@@ -102,19 +102,18 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         )
 
         if self._is_azure:
-            if base_url and not resource and not azure_ad_token_provider:
-                self._client = AsyncAnthropic(
-                    api_key=api_key,
-                    base_url=base_url,
-                    default_headers={"api-key": api_key} if api_key else None,
-                )
-            else:
-                self._client = AsyncAnthropicFoundry(
-                    api_key=api_key,
-                    base_url=base_url,
-                    resource=resource,
-                    azure_ad_token_provider=azure_ad_token_provider,
-                )
+            # resource and base_url are mutually exclusive in AsyncAnthropicFoundry.
+            # Pass only whichever is set; the SDK constructs the URL from resource
+            # as https://{resource}.services.ai.azure.com/anthropic/ automatically.
+            foundry_kwargs: dict = {"api_key": api_key}
+            if azure_ad_token_provider:
+                del foundry_kwargs["api_key"]
+                foundry_kwargs["azure_ad_token_provider"] = azure_ad_token_provider
+            if resource:
+                foundry_kwargs["resource"] = resource
+            elif base_url:
+                foundry_kwargs["base_url"] = base_url
+            self._client = AsyncAnthropicFoundry(**foundry_kwargs)
         else:
             self._client = AsyncAnthropic(
                 api_key=api_key,

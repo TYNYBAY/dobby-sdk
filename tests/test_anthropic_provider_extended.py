@@ -28,7 +28,6 @@ from dobby.types import (
 )
 from dobby.types.document_part import Base64PDFSource, PlainTextSource, URLSource
 
-
 # ---------------------------------------------------------------------------
 # Shared factories
 # ---------------------------------------------------------------------------
