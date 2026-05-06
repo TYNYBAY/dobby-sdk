@@ -126,6 +126,25 @@ Include every field you can find: claim numbers, policy numbers, names, dates, d
 reserve figures, deductibles, and any other structured data.
 Return ONLY valid JSON, no markdown fences, no explanation."""
 
+UNDERWRITING_PROMPT = """\
+You are a senior claims underwriter. Review the extracted claim data below and provide a \
+structured underwriting analysis as a JSON object with these exact keys:
+
+- coverage_determination: "covered" | "not_covered" | "pending_investigation"
+- liability_assessment: one-sentence summary of fault/liability
+- reserve_adequacy: "adequate" | "understated" | "overstated"
+- reserve_commentary: brief explanation of reserve position
+- red_flags: list of strings (fraud indicators, inconsistencies, missing docs) — empty list if none
+- recommendation: "approve" | "deny" | "investigate" | "approve_with_conditions"
+- recommendation_rationale: one or two sentences explaining the recommendation
+- key_issues: list of strings — top items requiring attention before closure
+- coverage_gaps: list of strings — exposures not covered by this policy, if any
+
+Return ONLY valid JSON, no markdown fences, no explanation.
+
+Extracted claim data:
+{extracted_json}"""
+
 
 # ---------------------------------------------------------------------------
 # Field matching
@@ -186,6 +205,11 @@ class ClaimResult:
     extracted_json: dict[str, Any] = field(default_factory=dict)
     input_tokens: int = 0
     output_tokens: int = 0
+    extraction_prompt: str = ""
+    underwriting_analysis: dict[str, Any] = field(default_factory=dict)
+    underwriting_latency_s: float = 0.0
+    underwriting_tokens_in: int = 0
+    underwriting_tokens_out: int = 0
 
     @property
     def accuracy(self) -> float:
@@ -200,6 +224,15 @@ class ClaimResult:
     @property
     def total(self) -> int:
         return len(self.field_results)
+
+
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    text = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    text = re.sub(r"\n?```$", "", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {}
 
 
 async def eval_claim(
@@ -222,6 +255,7 @@ async def eval_claim(
 
     pdf_b64 = base64.b64encode(pdf_path.read_bytes()).decode()
 
+    # --- Pass 1: field extraction ---
     start = time.perf_counter()
     try:
         result: StreamEndEvent = await provider.chat(
@@ -248,21 +282,15 @@ async def eval_claim(
             field_results=[],
             latency_s=latency,
             error=str(exc),
+            extraction_prompt=EXTRACTION_PROMPT,
         )
 
     latency = time.perf_counter() - start
     raw_text = next((p.text for p in result.parts if isinstance(p, TextPart)), "")
+    extracted = _parse_json_response(raw_text)
 
-    # Parse JSON — strip markdown fences if model included them
-    json_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
-    json_text = re.sub(r"\n?```$", "", json_text.strip())
-
-    try:
-        extracted = json.loads(json_text)
-    except json.JSONDecodeError:
-        extracted = {}
-        if verbose:
-            print(f"  [warn] JSON parse failed. Raw:\n{raw_text[:500]}")
+    if not extracted and verbose:
+        print(f"  [warn] JSON parse failed. Raw:\n{raw_text[:500]}")
 
     field_results = [
         FieldResult(
@@ -275,6 +303,40 @@ async def eval_claim(
     ]
 
     usage = result.usage
+
+    # --- Pass 2: underwriting analysis ---
+    uw_analysis: dict[str, Any] = {}
+    uw_latency = 0.0
+    uw_tok_in = 0
+    uw_tok_out = 0
+
+    if extracted:
+        uw_prompt = UNDERWRITING_PROMPT.format(
+            extracted_json=json.dumps(extracted, indent=2)
+        )
+        uw_start = time.perf_counter()
+        try:
+            uw_result: StreamEndEvent = await provider.chat(
+                messages=[
+                    UserMessagePart(parts=[TextPart(text=uw_prompt)])
+                ],
+                system_prompt=(
+                    "You are a senior insurance claims underwriter with 20 years of experience. "
+                    "Provide precise, actionable underwriting assessments. Output only valid JSON."
+                ),
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            uw_latency = time.perf_counter() - uw_start
+            uw_raw = next((p.text for p in uw_result.parts if isinstance(p, TextPart)), "")
+            uw_analysis = _parse_json_response(uw_raw)
+            if uw_result.usage:
+                uw_tok_in = uw_result.usage.input_tokens
+                uw_tok_out = uw_result.usage.output_tokens
+        except Exception as exc:
+            uw_latency = time.perf_counter() - uw_start
+            uw_analysis = {"error": str(exc)}
+
     return ClaimResult(
         description=ground_truth.description,
         pdf_file=ground_truth.pdf_file,
@@ -284,6 +346,11 @@ async def eval_claim(
         extracted_json=extracted,
         input_tokens=usage.input_tokens if usage else 0,
         output_tokens=usage.output_tokens if usage else 0,
+        extraction_prompt=EXTRACTION_PROMPT,
+        underwriting_analysis=uw_analysis,
+        underwriting_latency_s=uw_latency,
+        underwriting_tokens_in=uw_tok_in,
+        underwriting_tokens_out=uw_tok_out,
     )
 
 
@@ -304,36 +371,63 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
     for r in results:
         status = "ERROR" if r.error else f"{r.passed}/{r.total} fields"
         pct = f"{r.accuracy * 100:.0f}%" if not r.error else "N/A"
-        latency = f"{r.latency_s:.2f}s"
 
-        print(f"\n{r.description}")
-        print(f"  File:     {r.pdf_file}")
-        print(f"  Accuracy: {pct}  ({status})  [{latency}]")
+        print(f"\n{'─' * 70}")
+        print(f"{r.description}")
+        print(f"  File:         {r.pdf_file}")
+        print(f"  Accuracy:     {pct}  ({status})  [{r.latency_s:.2f}s extraction]")
 
         if r.error:
-            print(f"  Error:    {r.error}")
+            print(f"  Error:        {r.error}")
             continue
 
         if r.input_tokens or r.output_tokens:
-            print(f"  Tokens:   in={r.input_tokens}  out={r.output_tokens}")
+            print(f"  Tokens (ext): in={r.input_tokens}  out={r.output_tokens}")
 
-        print(f"  Fields:")
-        for fr in r.field_results:
-            mark = "✓" if fr.found else "✗"
-            print(f"    {mark} {fr.field:<25} expected: {fr.expected}")
+        print(f"\n  INPUT PROMPT (extraction):")
+        for line in r.extraction_prompt.splitlines():
+            print(f"    {line}")
 
-        print(f"\n  Claude response (extracted JSON):")
+        print(f"\n  OUTPUT (extracted JSON):")
         if r.extracted_json:
-            formatted = json.dumps(r.extracted_json, indent=4)
-            for line in formatted.splitlines():
+            for line in json.dumps(r.extracted_json, indent=4).splitlines():
                 print(f"    {line}")
         elif r.raw_response:
             print(f"    [JSON parse failed] Raw: {r.raw_response[:300]}")
         else:
             print(f"    [no response]")
 
-        if verbose and r.raw_response and not r.extracted_json:
-            print(f"\n  Full raw response:\n{r.raw_response}")
+        print(f"\n  FIELD ACCURACY:")
+        for fr in r.field_results:
+            mark = "✓" if fr.found else "✗"
+            print(f"    {mark} {fr.field:<25} expected: {fr.expected}")
+
+        if r.underwriting_analysis and "error" not in r.underwriting_analysis:
+            uw = r.underwriting_analysis
+            print(f"\n  UNDERWRITING ANALYSIS  [{r.underwriting_latency_s:.2f}s  "
+                  f"in={r.underwriting_tokens_in} out={r.underwriting_tokens_out}]")
+            print(f"    Coverage:      {uw.get('coverage_determination', '—')}")
+            print(f"    Liability:     {uw.get('liability_assessment', '—')}")
+            print(f"    Reserve:       {uw.get('reserve_adequacy', '—')} — {uw.get('reserve_commentary', '')}")
+            print(f"    Recommendation:{uw.get('recommendation', '—')}")
+            print(f"    Rationale:     {uw.get('recommendation_rationale', '—')}")
+            flags = uw.get("red_flags", [])
+            if flags:
+                print(f"    Red flags:")
+                for f in flags:
+                    print(f"      ⚑  {f}")
+            issues = uw.get("key_issues", [])
+            if issues:
+                print(f"    Key issues:")
+                for i in issues:
+                    print(f"      •  {i}")
+            gaps = uw.get("coverage_gaps", [])
+            if gaps:
+                print(f"    Coverage gaps:")
+                for g in gaps:
+                    print(f"      ○  {g}")
+        elif r.underwriting_analysis.get("error"):
+            print(f"\n  UNDERWRITING ANALYSIS: ERROR — {r.underwriting_analysis['error']}")
 
         total_fields += r.total
         total_passed += r.passed
@@ -433,16 +527,21 @@ def write_markdown_report(
     w(f"**Claims evaluated:** {len(results)}  ")
     w("")
 
+    total_uw_in = sum(r.underwriting_tokens_in for r in good)
+    total_uw_out = sum(r.underwriting_tokens_out for r in good)
+    total_tok_in = total_in + total_uw_in
+    total_tok_out = total_out + total_uw_out
+
     # --- Executive Summary ---
     w("## Executive Summary")
     w("")
     w("| Metric | Value |")
     w("|--------|-------|")
     w(f"| Overall field accuracy | **{overall_pct:.1f}%** ({total_passed}/{total_fields} fields) |")
-    w(f"| Average latency | {avg_latency:.2f}s per claim |")
-    w(f"| Total tokens (input) | {total_in:,} |")
-    w(f"| Total tokens (output) | {total_out:,} |")
-    w(f"| Total tokens | {total_in + total_out:,} |")
+    w(f"| Average extraction latency | {avg_latency:.2f}s per claim |")
+    w(f"| Extraction tokens (in / out) | {total_in:,} / {total_out:,} |")
+    w(f"| Underwriting tokens (in / out) | {total_uw_in:,} / {total_uw_out:,} |")
+    w(f"| **Total tokens** | **{total_tok_in + total_tok_out:,}** |")
     w("")
 
     error_results = [r for r in results if r.error]
@@ -455,13 +554,13 @@ def write_markdown_report(
     # --- Rankings ---
     w("## Rankings")
     w("")
-    w("Claims sorted from lowest to highest accuracy.")
+    w("Claims sorted from lowest to highest extraction accuracy.")
     w("")
-    w("| Rank | Claim | Accuracy | Fields | Latency | Tokens (in/out) |")
-    w("|------|-------|----------|--------|---------|-----------------|")
+    w("| Rank | Claim | Accuracy | Fields | Ext. Latency | UW Recommendation |")
+    w("|------|-------|----------|--------|--------------|-------------------|")
     for i, r in enumerate(sorted(good, key=lambda x: x.accuracy), 1):
-        tok = f"{r.input_tokens:,} / {r.output_tokens:,}" if (r.input_tokens or r.output_tokens) else "—"
-        w(f"| {i} | {r.description} | {r.accuracy * 100:.1f}% | {r.passed}/{r.total} | {r.latency_s:.2f}s | {tok} |")
+        uw_rec = r.underwriting_analysis.get("recommendation", "—") if r.underwriting_analysis else "—"
+        w(f"| {i} | {r.description} | {r.accuracy * 100:.1f}% | {r.passed}/{r.total} | {r.latency_s:.2f}s | {uw_rec} |")
     w("")
 
     # --- Per-Claim Results ---
@@ -472,10 +571,11 @@ def write_markdown_report(
         w(f"### {r.description}")
         w("")
         w(f"- **File:** `{r.pdf_file}`")
-        w(f"- **Accuracy:** {pct} ({r.passed}/{r.total} fields)")
-        w(f"- **Latency:** {r.latency_s:.2f}s")
+        w(f"- **Extraction accuracy:** {pct} ({r.passed}/{r.total} fields) in {r.latency_s:.2f}s")
         if r.input_tokens or r.output_tokens:
-            w(f"- **Tokens:** {r.input_tokens:,} in / {r.output_tokens:,} out")
+            w(f"- **Extraction tokens:** {r.input_tokens:,} in / {r.output_tokens:,} out")
+        if r.underwriting_tokens_in or r.underwriting_tokens_out:
+            w(f"- **Underwriting tokens:** {r.underwriting_tokens_in:,} in / {r.underwriting_tokens_out:,} out ({r.underwriting_latency_s:.2f}s)")
         w("")
 
         if r.error:
@@ -483,7 +583,14 @@ def write_markdown_report(
             w("")
             continue
 
-        w("#### Field Extraction Results")
+        w("#### Input Prompt (Extraction)")
+        w("")
+        w("```")
+        w(r.extraction_prompt)
+        w("```")
+        w("")
+
+        w("#### Output: Extracted Fields")
         w("")
         w("| Status | Field | Expected |")
         w("|--------|-------|----------|")
@@ -492,7 +599,7 @@ def write_markdown_report(
             w(f"| {mark} | `{fr.field}` | `{fr.expected}` |")
         w("")
 
-        w("#### Claude Response")
+        w("#### Output: Claude Extracted JSON")
         w("")
         if r.extracted_json:
             w("```json")
@@ -507,6 +614,46 @@ def write_markdown_report(
         else:
             w("> No response captured.")
         w("")
+
+        if r.underwriting_analysis and "error" not in r.underwriting_analysis:
+            uw = r.underwriting_analysis
+            w("#### Underwriting Analysis")
+            w("")
+            w("| Dimension | Assessment |")
+            w("|-----------|------------|")
+            w(f"| Coverage determination | `{uw.get('coverage_determination', '—')}` |")
+            w(f"| Reserve adequacy | `{uw.get('reserve_adequacy', '—')}` |")
+            w(f"| **Recommendation** | **`{uw.get('recommendation', '—')}`** |")
+            w("")
+            w(f"**Liability:** {uw.get('liability_assessment', '—')}")
+            w("")
+            w(f"**Reserve commentary:** {uw.get('reserve_commentary', '—')}")
+            w("")
+            w(f"**Recommendation rationale:** {uw.get('recommendation_rationale', '—')}")
+            w("")
+            flags = uw.get("red_flags", [])
+            if flags:
+                w("**Red flags:**")
+                for f in flags:
+                    w(f"- ⚑ {f}")
+                w("")
+            issues = uw.get("key_issues", [])
+            if issues:
+                w("**Key issues before closure:**")
+                for i in issues:
+                    w(f"- {i}")
+                w("")
+            gaps = uw.get("coverage_gaps", [])
+            if gaps:
+                w("**Coverage gaps:**")
+                for g in gaps:
+                    w(f"- {g}")
+                w("")
+        elif r.underwriting_analysis.get("error"):
+            w("#### Underwriting Analysis")
+            w("")
+            w(f"> ❌ Analysis failed: {r.underwriting_analysis['error']}")
+            w("")
 
     # --- Field Hit Rate ---
     field_hits: dict[str, list[bool]] = defaultdict(list)

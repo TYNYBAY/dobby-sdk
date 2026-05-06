@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -151,6 +152,72 @@ async def test_claim_extraction(provider, claim: dict) -> None:
         print(f"    [JSON parse failed] Raw: {raw[:300]}")
 
 
+def _write_smoke_report(results: list[dict], model: str, provider_name: str) -> Path:
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out = Path(__file__).parent / "reports" / f"smoke_{timestamp}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    w = lines.append
+
+    w("# Anthropic Provider Smoke Test Report")
+    w("")
+    w(f"**Provider:** {provider_name}  ")
+    w(f"**Model:** `{model}`  ")
+    w(f"**Generated:** {generated_at}  ")
+    w("")
+
+    total_passed = sum(r["passed"] for r in results)
+    total_fields = sum(r["total"] for r in results)
+    overall_pct = total_passed / total_fields * 100 if total_fields else 0
+
+    w("## Summary")
+    w("")
+    w("| Metric | Value |")
+    w("|--------|-------|")
+    w(f"| Claims tested | {len(results)} |")
+    w(f"| Overall field accuracy | **{overall_pct:.1f}%** ({total_passed}/{total_fields}) |")
+    w("")
+
+    w("## Per-Claim Results")
+    w("")
+    for r in results:
+        pct = r["passed"] / r["total"] * 100 if r["total"] else 0
+        w(f"### {r['label']}")
+        w("")
+        w(f"- **File:** `{r['file']}`")
+        w(f"- **Accuracy:** {pct:.0f}% ({r['passed']}/{r['total']} fields)")
+        if r.get("usage"):
+            w(f"- **Tokens:** {r['usage']['in']} in / {r['usage']['out']} out")
+        w("")
+        w("**Input prompt:**")
+        w("")
+        w("```")
+        w(EXTRACTION_PROMPT)
+        w("```")
+        w("")
+        w("**Field results:**")
+        w("")
+        w("| Status | Field | Expected |")
+        w("|--------|-------|----------|")
+        for field, expected, hit in r["fields"]:
+            w(f"| {'✅' if hit else '❌'} | `{field}` | `{expected}` |")
+        w("")
+        w("**Claude extracted JSON:**")
+        w("")
+        if r.get("extracted"):
+            w("```json")
+            w(json.dumps(r["extracted"], indent=2))
+            w("```")
+        else:
+            w("> JSON parse failed or no response.")
+        w("")
+
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
 async def main() -> None:
     provider = _provider()
     print(f"Provider : {provider.name}")
@@ -159,8 +226,63 @@ async def main() -> None:
     await test_basic_chat(provider)
 
     print("\n--- Claim Extraction ---")
+    smoke_results: list[dict] = []
     for claim in CLAIMS:
-        await test_claim_extraction(provider, claim)
+        result = await _claim_extraction_result(provider, claim)
+        smoke_results.append(result)
+
+    report_path = _write_smoke_report(smoke_results, model=MODEL, provider_name=provider.name)
+    print(f"\nMarkdown report saved → {report_path}")
+
+
+async def _claim_extraction_result(provider, claim: dict) -> dict:
+    from dobby.types import DocumentPart, TextPart, UserMessagePart
+    from dobby.types.document_part import Base64PDFSource
+
+    path = FIXTURES / claim["file"]
+    if not path.exists():
+        print(f"\n[{claim['label']}]  SKIP — {claim['file']} not found")
+        return {"label": claim["label"], "file": claim["file"], "passed": 0, "total": len(claim["fields"]), "fields": [], "extracted": {}}
+
+    pdf_b64 = base64.b64encode(path.read_bytes()).decode()
+    result = await provider.chat(
+        messages=[
+            UserMessagePart(parts=[
+                TextPart(text=EXTRACTION_PROMPT),
+                DocumentPart(
+                    source=Base64PDFSource(data=pdf_b64, media_type="application/pdf"),
+                    filename=claim["file"],
+                ),
+            ])
+        ],
+        system_prompt="You are a precise claims data extraction system. Output only valid JSON.",
+        max_tokens=1024,
+        temperature=0.0,
+    )
+
+    raw = next((p.text for p in result.parts if hasattr(p, "text")), "")
+    extracted = _parse_json(raw)
+
+    field_rows = [(f, v, _field_hit(extracted, v)) for f, v in claim["fields"].items()]
+    passed = sum(1 for _, _, hit in field_rows if hit)
+    total = len(field_rows)
+    pct = passed / total * 100 if total else 0
+
+    print(f"\n[{claim['label']}]  {passed}/{total} fields ({pct:.0f}%)")
+    for field, expected, hit in field_rows:
+        print(f"  {'✓' if hit else '✗'} {field:<25} {expected!r}")
+    if result.usage:
+        print(f"  tokens: in={result.usage.input_tokens} out={result.usage.output_tokens}")
+
+    print(f"  Claude response:")
+    if extracted:
+        for line in json.dumps(extracted, indent=4).splitlines():
+            print(f"    {line}")
+    else:
+        print(f"    [JSON parse failed] Raw: {raw[:300]}")
+
+    usage_dict = {"in": result.usage.input_tokens, "out": result.usage.output_tokens} if result.usage else None
+    return {"label": claim["label"], "file": claim["file"], "passed": passed, "total": total, "fields": field_rows, "extracted": extracted, "usage": usage_dict}
 
 
 if __name__ == "__main__":
