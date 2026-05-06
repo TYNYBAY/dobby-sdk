@@ -337,12 +337,69 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
         total_input_tokens += r.input_tokens
         total_output_tokens += r.output_tokens
 
+    # ---- Summary ----
     print("\n" + "-" * 70)
     overall_pct = (total_passed / total_fields * 100) if total_fields else 0
     print(f"OVERALL ACCURACY: {total_passed}/{total_fields} fields  ({overall_pct:.1f}%)")
     avg_latency = sum(r.latency_s for r in results) / len(results) if results else 0
     print(f"AVG LATENCY:      {avg_latency:.2f}s per claim")
     print(f"TOTAL TOKENS:     in={total_input_tokens}  out={total_output_tokens}  total={total_input_tokens + total_output_tokens}")
+
+    good_results = [r for r in results if not r.error]
+
+    # ---- Rankings: worst → best ----
+    print("\n" + "-" * 70)
+    print("RANKINGS (worst → best)")
+    for r in sorted(good_results, key=lambda x: x.accuracy):
+        bar = ("█" * r.passed) + ("░" * (r.total - r.passed))
+        print(f"  {r.accuracy * 100:5.1f}%  [{bar}]  {r.description}")
+
+    # ---- Field-level hit rate across all claims ----
+    from collections import defaultdict
+    field_hits: dict[str, list[bool]] = defaultdict(list)
+    for r in good_results:
+        for fr in r.field_results:
+            field_hits[fr.field].append(fr.found)
+
+    if field_hits:
+        print("\n" + "-" * 70)
+        print("FIELD HIT RATE (aggregated)")
+        for fname, hits in sorted(field_hits.items(), key=lambda x: sum(x[1]) / len(x[1])):
+            n = len(hits)
+            passed_n = sum(hits)
+            pct = passed_n / n * 100
+            bar = ("█" * passed_n) + ("░" * (n - passed_n))
+            print(f"  {pct:5.1f}%  [{bar}]  {fname}")
+
+    # ---- Failure patterns: failed fields + what Claude extracted ----
+    failures = [
+        (r.description, fr)
+        for r in good_results
+        for fr in r.field_results
+        if not fr.found
+    ]
+    if failures:
+        print("\n" + "-" * 70)
+        print("FAILURE PATTERNS")
+        for desc, fr in failures:
+            extracted_val = fr.extracted_json.get(fr.field) if fr.extracted_json else None
+            if extracted_val is None:
+                # field key missing — search for closest key
+                candidates = [
+                    f"{k}={v!r}"
+                    for k, v in fr.extracted_json.items()
+                    if fr.field.split("_")[-1] in k.lower()
+                ] if fr.extracted_json else []
+                extracted_str = f"key absent (similar: {', '.join(candidates[:2])})" if candidates else "key absent"
+            else:
+                extracted_str = repr(extracted_val)
+            print(f"  ✗ [{desc}] {fr.field}")
+            print(f"      expected:  {fr.expected!r}")
+            print(f"      extracted: {extracted_str}")
+    else:
+        print("\n" + "-" * 70)
+        print("FAILURE PATTERNS: none — all fields matched")
+
     print("=" * 70 + "\n")
 
 
