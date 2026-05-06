@@ -643,7 +643,22 @@ def write_report(results: list[ClaimResult], model: str, provider_name: str) -> 
         w(f"- **Claims recommended for approval:** {', '.join(r.label for r in approve)}.")
         w("")
 
-    out.write_text("\n".join(lines), encoding="utf-8")
+    content = "\n".join(lines)
+
+    # Always print to stdout — works on remote/CI where files aren't accessible
+    print("\n" + "=" * 70)
+    print("MARKDOWN REPORT")
+    print("=" * 70)
+    print(content)
+    print("=" * 70 + "\n")
+
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(content, encoding="utf-8")
+        print(f"Report also saved → {out}")
+    except Exception as exc:
+        print(f"[warn] Could not save report to disk: {exc}")
+
     return out
 
 
