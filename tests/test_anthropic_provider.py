@@ -143,6 +143,13 @@ async def test_claim_extraction(provider, claim: dict) -> None:
     if result.usage:
         print(f"  tokens: in={result.usage.input_tokens} out={result.usage.output_tokens}")
 
+    print(f"  Claude response:")
+    if extracted:
+        for line in json.dumps(extracted, indent=4).splitlines():
+            print(f"    {line}")
+    else:
+        print(f"    [JSON parse failed] Raw: {raw[:300]}")
+
 
 async def main() -> None:
     provider = _provider()

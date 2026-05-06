@@ -180,6 +180,9 @@ class ClaimResult:
     latency_s: float
     error: str | None = None
     raw_response: str = ""
+    extracted_json: dict[str, Any] = field(default_factory=dict)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def accuracy(self) -> float:
@@ -268,12 +271,16 @@ async def eval_claim(
         for field_name, expected_value in ground_truth.expected.items()
     ]
 
+    usage = result.usage
     return ClaimResult(
         description=ground_truth.description,
         pdf_file=ground_truth.pdf_file,
         field_results=field_results,
         latency_s=latency,
         raw_response=raw_text,
+        extracted_json=extracted,
+        input_tokens=usage.input_tokens if usage else 0,
+        output_tokens=usage.output_tokens if usage else 0,
     )
 
 
@@ -288,6 +295,8 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
 
     total_fields = 0
     total_passed = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
 
     for r in results:
         status = "ERROR" if r.error else f"{r.passed}/{r.total} fields"
@@ -302,21 +311,38 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
             print(f"  Error:    {r.error}")
             continue
 
+        if r.input_tokens or r.output_tokens:
+            print(f"  Tokens:   in={r.input_tokens}  out={r.output_tokens}")
+
+        print(f"  Fields:")
         for fr in r.field_results:
             mark = "✓" if fr.found else "✗"
             print(f"    {mark} {fr.field:<25} expected: {fr.expected}")
 
-        if verbose and r.raw_response:
-            print(f"\n  Raw response:\n{r.raw_response[:800]}")
+        print(f"\n  Claude response (extracted JSON):")
+        if r.extracted_json:
+            formatted = json.dumps(r.extracted_json, indent=4)
+            for line in formatted.splitlines():
+                print(f"    {line}")
+        elif r.raw_response:
+            print(f"    [JSON parse failed] Raw: {r.raw_response[:300]}")
+        else:
+            print(f"    [no response]")
+
+        if verbose and r.raw_response and not r.extracted_json:
+            print(f"\n  Full raw response:\n{r.raw_response}")
 
         total_fields += r.total
         total_passed += r.passed
+        total_input_tokens += r.input_tokens
+        total_output_tokens += r.output_tokens
 
     print("\n" + "-" * 70)
     overall_pct = (total_passed / total_fields * 100) if total_fields else 0
     print(f"OVERALL ACCURACY: {total_passed}/{total_fields} fields  ({overall_pct:.1f}%)")
     avg_latency = sum(r.latency_s for r in results) / len(results) if results else 0
     print(f"AVG LATENCY:      {avg_latency:.2f}s per claim")
+    print(f"TOTAL TOKENS:     in={total_input_tokens}  out={total_output_tokens}  total={total_input_tokens + total_output_tokens}")
     print("=" * 70 + "\n")
 
 
