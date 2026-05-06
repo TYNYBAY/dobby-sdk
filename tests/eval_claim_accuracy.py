@@ -7,6 +7,7 @@ Usage:
     uv run python tests/eval_claim_accuracy.py
     uv run python tests/eval_claim_accuracy.py --model claude-sonnet-4-6
     uv run python tests/eval_claim_accuracy.py --verbose
+    uv run python tests/eval_claim_accuracy.py --report reports/eval.md
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -355,7 +358,6 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
         print(f"  {r.accuracy * 100:5.1f}%  [{bar}]  {r.description}")
 
     # ---- Field-level hit rate across all claims ----
-    from collections import defaultdict
     field_hits: dict[str, list[bool]] = defaultdict(list)
     for r in good_results:
         for fr in r.field_results:
@@ -404,10 +406,194 @@ def print_report(results: list[ClaimResult], verbose: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Markdown report
+# ---------------------------------------------------------------------------
+
+def write_markdown_report(
+    results: list[ClaimResult],
+    model: str,
+    output_path: Path,
+) -> None:
+    good = [r for r in results if not r.error]
+    total_fields = sum(r.total for r in good)
+    total_passed = sum(r.passed for r in good)
+    overall_pct = (total_passed / total_fields * 100) if total_fields else 0
+    avg_latency = sum(r.latency_s for r in good) / len(good) if good else 0
+    total_in = sum(r.input_tokens for r in good)
+    total_out = sum(r.output_tokens for r in good)
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines: list[str] = []
+    w = lines.append
+
+    w("# Claim Extraction Accuracy Report")
+    w("")
+    w(f"**Model:** `{model}`  ")
+    w(f"**Generated:** {generated_at}  ")
+    w(f"**Claims evaluated:** {len(results)}  ")
+    w("")
+
+    # --- Executive Summary ---
+    w("## Executive Summary")
+    w("")
+    w("| Metric | Value |")
+    w("|--------|-------|")
+    w(f"| Overall field accuracy | **{overall_pct:.1f}%** ({total_passed}/{total_fields} fields) |")
+    w(f"| Average latency | {avg_latency:.2f}s per claim |")
+    w(f"| Total tokens (input) | {total_in:,} |")
+    w(f"| Total tokens (output) | {total_out:,} |")
+    w(f"| Total tokens | {total_in + total_out:,} |")
+    w("")
+
+    error_results = [r for r in results if r.error]
+    if error_results:
+        w("> **Note:** The following claims failed to evaluate:")
+        for r in error_results:
+            w(f"> - `{r.pdf_file}`: {r.error}")
+        w("")
+
+    # --- Rankings ---
+    w("## Rankings")
+    w("")
+    w("Claims sorted from lowest to highest accuracy.")
+    w("")
+    w("| Rank | Claim | Accuracy | Fields | Latency | Tokens (in/out) |")
+    w("|------|-------|----------|--------|---------|-----------------|")
+    for i, r in enumerate(sorted(good, key=lambda x: x.accuracy), 1):
+        tok = f"{r.input_tokens:,} / {r.output_tokens:,}" if (r.input_tokens or r.output_tokens) else "—"
+        w(f"| {i} | {r.description} | {r.accuracy * 100:.1f}% | {r.passed}/{r.total} | {r.latency_s:.2f}s | {tok} |")
+    w("")
+
+    # --- Per-Claim Results ---
+    w("## Per-Claim Results")
+    w("")
+    for r in results:
+        pct = f"{r.accuracy * 100:.1f}%" if not r.error else "ERROR"
+        w(f"### {r.description}")
+        w("")
+        w(f"- **File:** `{r.pdf_file}`")
+        w(f"- **Accuracy:** {pct} ({r.passed}/{r.total} fields)")
+        w(f"- **Latency:** {r.latency_s:.2f}s")
+        if r.input_tokens or r.output_tokens:
+            w(f"- **Tokens:** {r.input_tokens:,} in / {r.output_tokens:,} out")
+        w("")
+
+        if r.error:
+            w(f"> ❌ **Error:** {r.error}")
+            w("")
+            continue
+
+        w("#### Field Extraction Results")
+        w("")
+        w("| Status | Field | Expected |")
+        w("|--------|-------|----------|")
+        for fr in r.field_results:
+            mark = "✅" if fr.found else "❌"
+            w(f"| {mark} | `{fr.field}` | `{fr.expected}` |")
+        w("")
+
+        w("#### Claude Response")
+        w("")
+        if r.extracted_json:
+            w("```json")
+            w(json.dumps(r.extracted_json, indent=2))
+            w("```")
+        elif r.raw_response:
+            w("> ⚠️ JSON parse failed. Raw output:")
+            w("")
+            w("```")
+            w(r.raw_response[:500])
+            w("```")
+        else:
+            w("> No response captured.")
+        w("")
+
+    # --- Field Hit Rate ---
+    field_hits: dict[str, list[bool]] = defaultdict(list)
+    for r in good:
+        for fr in r.field_results:
+            field_hits[fr.field].append(fr.found)
+
+    if field_hits:
+        w("## Field Hit Rate")
+        w("")
+        w("Aggregated accuracy per field type across all claims, sorted worst → best.")
+        w("")
+        w("| Field | Hit Rate | Passed / Total |")
+        w("|-------|----------|----------------|")
+        for fname, hits in sorted(field_hits.items(), key=lambda x: sum(x[1]) / len(x[1])):
+            n = len(hits)
+            p = sum(hits)
+            w(f"| `{fname}` | {p / n * 100:.1f}% | {p}/{n} |")
+        w("")
+
+    # --- Failure Patterns ---
+    failures = [
+        (r.description, fr)
+        for r in good
+        for fr in r.field_results
+        if not fr.found
+    ]
+
+    w("## Failure Patterns")
+    w("")
+    if not failures:
+        w("✅ No failures — all fields matched across all claims.")
+    else:
+        w(f"{len(failures)} field extraction failure(s) identified.")
+        w("")
+        for desc, fr in failures:
+            extracted_val = fr.extracted_json.get(fr.field) if fr.extracted_json else None
+            if extracted_val is None:
+                candidates = [
+                    f"`{k}` = `{v}`"
+                    for k, v in fr.extracted_json.items()
+                    if fr.field.split("_")[-1] in k.lower()
+                ] if fr.extracted_json else []
+                note = f"Key absent from output. Similar keys: {', '.join(candidates[:3])}" if candidates else "Key absent from output."
+            else:
+                note = f"Extracted `{extracted_val!r}` — value present but did not match expected."
+            w(f"### ❌ `{fr.field}` — {desc}")
+            w("")
+            w(f"- **Expected:** `{fr.expected}`")
+            w(f"- **Result:** {note}")
+            w("")
+
+    # --- Notes & Recommendations ---
+    w("## Notes & Recommendations")
+    w("")
+    if overall_pct == 100:
+        w("- All fields extracted correctly. Model performance is excellent on this eval set.")
+    elif overall_pct >= 80:
+        w("- Good overall accuracy. Review failure patterns above for targeted prompt improvements.")
+    else:
+        w("- Accuracy below 80%. Consider prompt refinement or few-shot examples for failing field types.")
+    w("")
+
+    hard_fields = [
+        fname for fname, hits in field_hits.items()
+        if hits and sum(hits) / len(hits) < 0.6
+    ]
+    if hard_fields:
+        w(f"- **Consistently difficult fields:** {', '.join(f'`{f}`' for f in hard_fields)}.")
+        w("  These may benefit from explicit extraction instructions in the prompt.")
+        w("")
+
+    slow = [r for r in good if r.latency_s > 5]
+    if slow:
+        w(f"- **Slow claims (>5s):** {', '.join(r.description for r in slow)}. Consider streaming or async batching.")
+        w("")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\nMarkdown report saved → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def run(model: str, verbose: bool) -> None:
+async def run(model: str, verbose: bool, report: Path | None) -> None:
     if not (_USE_AZURE or ANTHROPIC_API_KEY):
         print(
             "ERROR: No API key configured.\n"
@@ -430,6 +616,13 @@ async def run(model: str, verbose: bool) -> None:
 
     print_report(results, verbose=verbose)
 
+    if report:
+        write_markdown_report(results, model=model, output_path=report)
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        default_path = Path(__file__).parent / "reports" / f"eval_{timestamp}.md"
+        write_markdown_report(results, model=model, output_path=default_path)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Claim extraction accuracy eval")
@@ -443,8 +636,15 @@ def main() -> None:
         action="store_true",
         help="Print raw model responses",
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write markdown report to this path (default: tests/reports/eval_<timestamp>.md)",
+    )
     args = parser.parse_args()
-    asyncio.run(run(model=args.model, verbose=args.verbose))
+    asyncio.run(run(model=args.model, verbose=args.verbose, report=args.report))
 
 
 if __name__ == "__main__":
