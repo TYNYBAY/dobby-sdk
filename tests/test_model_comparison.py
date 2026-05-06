@@ -9,9 +9,8 @@ Models compared by default:
   - gpt-4o (OpenAI)
 
 Usage:
-    uv run python tests/test_anthropic_provider.py
-    uv run python tests/test_anthropic_provider.py --models sonnet haiku
-    uv run python tests/test_anthropic_provider.py --models sonnet haiku gpt
+    uv run python tests/test_model_comparison.py
+    uv run python tests/test_model_comparison.py --models sonnet haiku gpt
 """
 
 from __future__ import annotations
@@ -33,24 +32,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Fallback direct Anthropic key
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-# Sonnet — separate Azure deployment
-ANTHROPIC_SONNET_FOUNDRY_API_KEY  = os.getenv("ANTHROPIC_SONNET_FOUNDRY_API_KEY")
-ANTHROPIC_SONNET_FOUNDRY_RESOURCE = os.getenv("ANTHROPIC_SONNET_FOUNDRY_RESOURCE")
-ANTHROPIC_SONNET_FOUNDRY_BASE_URL = os.getenv("ANTHROPIC_SONNET_FOUNDRY_BASE_URL")
-ANTHROPIC_SONNET_FOUNDRY_MODEL    = os.getenv("ANTHROPIC_SONNET_FOUNDRY_MODEL", "claude-sonnet-4-6")
-
-# Haiku — separate Azure deployment
-ANTHROPIC_HAIKU_FOUNDRY_API_KEY   = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_API_KEY")
-ANTHROPIC_HAIKU_FOUNDRY_RESOURCE  = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_RESOURCE")
-ANTHROPIC_HAIKU_FOUNDRY_BASE_URL  = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_BASE_URL")
-ANTHROPIC_HAIKU_FOUNDRY_MODEL     = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_MODEL", "claude-haiku-4-5-20251001")
-
-# OpenAI
+ANTHROPIC_FOUNDRY_API_KEY = os.getenv("ANTHROPIC_FOUNDRY_API_KEY")
+ANTHROPIC_FOUNDRY_RESOURCE = os.getenv("ANTHROPIC_FOUNDRY_RESOURCE")
+ANTHROPIC_FOUNDRY_BASE_URL = os.getenv("ANTHROPIC_FOUNDRY_BASE_URL")
+ANTHROPIC_FOUNDRY_MODEL = os.getenv("ANTHROPIC_FOUNDRY_MODEL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+_USE_AZURE = bool(
+    ANTHROPIC_FOUNDRY_API_KEY and (ANTHROPIC_FOUNDRY_RESOURCE or ANTHROPIC_FOUNDRY_BASE_URL)
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -59,8 +51,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # ---------------------------------------------------------------------------
 
 MODEL_ALIASES: dict[str, tuple[str, str]] = {
-    "sonnet": ("anthropic", ANTHROPIC_SONNET_FOUNDRY_MODEL),
-    "haiku":  ("anthropic", ANTHROPIC_HAIKU_FOUNDRY_MODEL),
+    "sonnet": ("anthropic", "claude-sonnet-4-6"),
+    "haiku":  ("anthropic", "claude-haiku-4-5-20251001"),
     "gpt":    ("openai",    OPENAI_MODEL),
 }
 
@@ -167,35 +159,18 @@ Extracted claim data:
 # Provider factory
 # ---------------------------------------------------------------------------
 
-_AZURE_CREDS: dict[str, dict] = {
-    "sonnet": {
-        "api_key":  ANTHROPIC_SONNET_FOUNDRY_API_KEY,
-        "resource": ANTHROPIC_SONNET_FOUNDRY_RESOURCE,
-        "base_url": ANTHROPIC_SONNET_FOUNDRY_BASE_URL,
-    },
-    "haiku": {
-        "api_key":  ANTHROPIC_HAIKU_FOUNDRY_API_KEY,
-        "resource": ANTHROPIC_HAIKU_FOUNDRY_RESOURCE,
-        "base_url": ANTHROPIC_HAIKU_FOUNDRY_BASE_URL,
-    },
-}
-
-
 def _make_provider(alias: str):
     provider_type, model_id = MODEL_ALIASES[alias]
 
     if provider_type == "anthropic":
         from dobby.providers.anthropic import AnthropicProvider
-        creds = _AZURE_CREDS.get(alias, {})
-        if creds.get("api_key") and (creds.get("resource") or creds.get("base_url")):
-            # Use this model's dedicated Azure deployment
+        if _USE_AZURE:
             return AnthropicProvider(
                 model=model_id,
-                api_key=creds["api_key"],
-                resource=creds.get("resource"),
-                base_url=creds.get("base_url"),
+                api_key=ANTHROPIC_FOUNDRY_API_KEY,
+                resource=ANTHROPIC_FOUNDRY_RESOURCE,
+                base_url=ANTHROPIC_FOUNDRY_BASE_URL,
             )
-        # Fall back to direct Anthropic API
         return AnthropicProvider(model=model_id, api_key=ANTHROPIC_API_KEY)
 
     if provider_type == "openai":
@@ -744,14 +719,8 @@ def main() -> None:
     missing: list[str] = []
     for alias in args.models:
         ptype, _ = MODEL_ALIASES[alias]
-        if ptype == "anthropic":
-            creds = _AZURE_CREDS.get(alias, {})
-            has_azure = creds.get("api_key") and (creds.get("resource") or creds.get("base_url"))
-            if not has_azure and not ANTHROPIC_API_KEY:
-                missing.append(
-                    f"ANTHROPIC_{alias.upper()}_FOUNDRY_API_KEY + RESOURCE "
-                    f"(or ANTHROPIC_API_KEY as fallback) needed for {alias}"
-                )
+        if ptype == "anthropic" and not (_USE_AZURE or ANTHROPIC_API_KEY):
+            missing.append(f"ANTHROPIC_API_KEY (needed for {alias})")
         if ptype == "openai" and not OPENAI_API_KEY:
             missing.append(f"OPENAI_API_KEY (needed for {alias})")
     if missing:
