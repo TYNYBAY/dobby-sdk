@@ -48,9 +48,11 @@ ANTHROPIC_HAIKU_FOUNDRY_RESOURCE  = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_RESOURCE"
 ANTHROPIC_HAIKU_FOUNDRY_BASE_URL  = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_BASE_URL")
 ANTHROPIC_HAIKU_FOUNDRY_MODEL     = os.getenv("ANTHROPIC_HAIKU_FOUNDRY_MODEL", "claude-haiku-4-5-20251001")
 
-# OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")
+# GPT — Azure OpenAI deployment
+OPENAI_AZURE_API_KEY       = os.getenv("OPENAI_AZURE_API_KEY")
+OPENAI_AZURE_BASE_URL      = os.getenv("OPENAI_AZURE_BASE_URL")
+OPENAI_AZURE_DEPLOYMENT_ID = os.getenv("OPENAI_AZURE_DEPLOYMENT_ID", "gpt-4o")
+OPENAI_AZURE_API_VERSION   = os.getenv("OPENAI_AZURE_API_VERSION", "2025-03-01-preview")
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -61,7 +63,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "sonnet": ("anthropic", ANTHROPIC_SONNET_FOUNDRY_MODEL),
     "haiku":  ("anthropic", ANTHROPIC_HAIKU_FOUNDRY_MODEL),
-    "gpt":    ("openai",    OPENAI_MODEL),
+    "gpt":    ("openai",    OPENAI_AZURE_DEPLOYMENT_ID),
 }
 
 DEFAULT_MODELS = ["sonnet", "haiku", "gpt"]
@@ -200,7 +202,12 @@ def _make_provider(alias: str):
 
     if provider_type == "openai":
         from dobby.providers.openai import OpenAIProvider
-        return OpenAIProvider(model=model_id, api_key=OPENAI_API_KEY)
+        return OpenAIProvider(
+            api_key=OPENAI_AZURE_API_KEY,
+            base_url=OPENAI_AZURE_BASE_URL,
+            azure_deployment_id=OPENAI_AZURE_DEPLOYMENT_ID,
+            azure_api_version=OPENAI_AZURE_API_VERSION,
+        )
 
     raise ValueError(f"Unknown provider type: {provider_type}")
 
@@ -752,8 +759,8 @@ def main() -> None:
                     f"ANTHROPIC_{alias.upper()}_FOUNDRY_API_KEY + RESOURCE "
                     f"(or ANTHROPIC_API_KEY as fallback) needed for {alias}"
                 )
-        if ptype == "openai" and not OPENAI_API_KEY:
-            missing.append(f"OPENAI_API_KEY (needed for {alias})")
+        if ptype == "openai" and not (OPENAI_AZURE_API_KEY and OPENAI_AZURE_BASE_URL):
+            missing.append(f"OPENAI_AZURE_API_KEY + OPENAI_AZURE_BASE_URL (needed for {alias})")
     if missing:
         for m in missing:
             print(f"ERROR: missing {m}")
