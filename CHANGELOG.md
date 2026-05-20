@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.15] - 2026-05-20
+
+### Changed
+- Relaxed the `google-genai` requirement from `>=2.4.0` to `>=1.68.0,<2`. The 2.4.0 pin made dobby-sdk impossible to install alongside ecosystems that cap `google-genai` below 2.0 (e.g. pipecat's `google-genai>=1.68.0,<2`). `parameters_json_schema` — which the Gemini tool-schema fix relies on — is available across the 1.x line, so no functionality is lost; verified against 1.75.0 including a live structured-output call.
+
 ## [0.2.14] - 2026-05-20
 
 ### Fixed
