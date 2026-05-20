@@ -226,6 +226,13 @@ class Tool:
         Returns a genai_types.Tool containing this tool's FunctionDeclaration.
         Can be passed directly to GeminiProvider.chat(tools=[...]).
 
+        The parameter schema is passed as raw JSON Schema via
+        ``parameters_json_schema``. Unlike the ``parameters`` field (a restricted
+        OpenAPI subset), this accepts the full JSON Schema family Pydantic emits
+        for nested/rich models (``$ref``/``$defs``, ``allOf``, ``oneOf``,
+        ``const``, ``prefixItems``); Gemini dereferences and normalizes it
+        server-side. The two fields are mutually exclusive, so only this one is set.
+
         Example:
             tools = [my_tool.to_gemini_format()]
             await provider.chat(messages, tools=tools)
@@ -243,6 +250,6 @@ class Tool:
         func_decl = genai_types.FunctionDeclaration(
             name=self.name,
             description=self.description,
-            parameters=parameters,
+            parameters_json_schema=parameters,
         )
         return genai_types.Tool(function_declarations=[func_decl])
