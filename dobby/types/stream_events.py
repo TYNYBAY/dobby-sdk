@@ -3,7 +3,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 from .message import ResponsePart, StopReason
-from .tool_events import ToolResultEvent, ToolStreamEvent, ToolUseEndEvent
+from .tool_events import ContextEditEvent, ToolResultEvent, ToolStreamEvent, ToolUseEndEvent
 from .usage import Usage
 
 
@@ -101,6 +101,7 @@ type StreamEvent = Annotated[
     | ToolStreamEvent
     | ToolResultEvent
     | ToolUseEndEvent
+    | ContextEditEvent
     | StreamEndEvent,
     Field(discriminator="type"),
 ]

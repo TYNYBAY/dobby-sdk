@@ -39,8 +39,10 @@ from .stream_events import (
 )
 from .text_part import TextPart as TextPart
 
-# Tool events
+# Tool and context events
 from .tool_events import (
+    AppliedEdit as AppliedEdit,
+    ContextEditEvent as ContextEditEvent,
     ToolResultEvent as ToolResultEvent,
     ToolStreamEvent as ToolStreamEvent,
     ToolUseEndEvent as ToolUseEndEvent,
