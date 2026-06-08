@@ -7,6 +7,7 @@ from .base import (
     Provider as Provider,
     ProviderError as ProviderError,
     RateLimitError as RateLimitError,
+    ToolCallTruncatedError as ToolCallTruncatedError,
 )
 from .gemini import (
     GeminiProvider as GeminiProvider,

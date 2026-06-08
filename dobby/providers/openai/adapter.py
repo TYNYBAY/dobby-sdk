@@ -30,6 +30,7 @@ from ...types import (
     TextDeltaEvent,
     TextPart,
     ToolResultPart,
+    ToolUseErrorEvent,
     ToolUseEvent,
     ToolUsePart,
     Usage,
@@ -43,6 +44,7 @@ from ..base import (
     Provider,
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
+    ToolCallTruncatedError,
 )
 from .converters import OpenAIContentPart, content_part_to_openai
 
@@ -348,11 +350,22 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
 
                     case "function_call":
                         stop_reason = "tool_use"
+                        try:
+                            tool_inputs = json.loads(output.arguments)
+                        except json.JSONDecodeError as e:
+                            raise ToolCallTruncatedError(
+                                f"Tool call '{output.name}' arguments were truncated "
+                                f"or malformed (likely max_tokens): {e}",
+                                provider=self.name,
+                                tool_name=output.name,
+                                tool_id=output.id,
+                                partial_inputs=output.arguments,
+                            ) from e
                         parts.append(
                             ToolUsePart(
                                 id=output.id,
                                 name=output.name,
-                                inputs=json.loads(output.arguments),
+                                inputs=tool_inputs,
                             )
                         )
                     case _:
@@ -456,10 +469,23 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                         # Text message already handled via deltas
                         pass
                     elif event.item.type == "function_call":
+                        try:
+                            tool_inputs = json.loads(event.item.arguments)
+                        except json.JSONDecodeError as e:
+                            # Truncated/malformed tool arguments (e.g. max_tokens):
+                            # surface a typed event and keep the stream alive so
+                            # any valid tool calls in this stream still deliver.
+                            yield ToolUseErrorEvent(
+                                id=event.item.call_id,
+                                name=event.item.name,
+                                raw_arguments=event.item.arguments,
+                                error=str(e),
+                            )
+                            continue
                         tool_event = ToolUseEvent(
                             id=event.item.call_id,
                             name=event.item.name,
-                            inputs=json.loads(event.item.arguments),
+                            inputs=tool_inputs,
                         )
                         function_calls.append(tool_event)
                         yield tool_event
@@ -485,6 +511,53 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                     stop_reason: StopReason = "tool_use" if function_calls else "end_turn"
 
                     usage_data: Usage | None = None
+                    if event.response and event.response.usage:
+                        usage_data = Usage(
+                            input_tokens=event.response.usage.input_tokens,
+                            output_tokens=event.response.usage.output_tokens,
+                            total_tokens=event.response.usage.total_tokens,
+                        )
+
+                    yield StreamEndEvent(
+                        model=model_name,
+                        parts=parts,
+                        stop_reason=stop_reason,
+                        usage=usage_data,
+                    )
+
+                case "response.incomplete":
+                    # A truncated response (e.g. max_output_tokens) ends with
+                    # `response.incomplete`, NOT `response.completed`. Emit the
+                    # terminal StreamEndEvent so the stream still closes cleanly,
+                    # mapping the cutoff to stop_reason="max_tokens". Any truncated
+                    # tool call was already surfaced as a ToolUseErrorEvent above
+                    # and is intentionally absent from parts.
+                    parts = []
+                    if accumulated_reasoning:
+                        parts.append(ReasoningPart(text=accumulated_reasoning))
+                    if accumulated_text:
+                        parts.append(TextPart(text=accumulated_text))
+                    for tool_event in function_calls:
+                        parts.append(
+                            ToolUsePart(
+                                id=tool_event.id,
+                                name=tool_event.name,
+                                inputs=tool_event.inputs,
+                            )
+                        )
+
+                    incomplete_reason = (
+                        event.response.incomplete_details.reason
+                        if event.response and event.response.incomplete_details
+                        else None
+                    )
+                    stop_reason = (
+                        "max_tokens"
+                        if incomplete_reason == "max_output_tokens"
+                        else "end_turn"
+                    )
+
+                    usage_data = None
                     if event.response and event.response.usage:
                         usage_data = Usage(
                             input_tokens=event.response.usage.input_tokens,

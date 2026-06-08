@@ -71,6 +71,31 @@ class ToolUseEvent(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class ToolUseErrorEvent(BaseModel):
+    """Event when a streamed tool call's arguments could not be parsed.
+
+    Emitted when a tool call's argument payload is truncated (e.g. by
+    ``max_tokens``) or otherwise malformed during streaming. The broken tool is
+    NOT appended to the final ``StreamEndEvent.parts`` and the stream keeps
+    delivering subsequent events, so a valid tool call in the same stream still
+    arrives. Consumers matching on ``event.type`` should add a branch for
+    ``"tool_use_error"`` or it will fall through their dispatch silently.
+    """
+
+    type: Literal["tool_use_error"] = "tool_use_error"
+
+    id: str
+
+    name: str
+    """Name of the tool whose arguments failed to parse."""
+
+    raw_arguments: str
+    """The raw, unparsed tool argument payload (possibly truncated)."""
+
+    error: str
+    """Human-readable description of the parse failure."""
+
+
 class StreamEndEvent(BaseModel):
     type: Literal["stream_end"] = "stream_end"
 
@@ -98,6 +123,7 @@ type StreamEvent = Annotated[
     | ReasoningEndEvent
     | StreamErrorEvent
     | ToolUseEvent
+    | ToolUseErrorEvent
     | ToolStreamEvent
     | ToolResultEvent
     | ToolUseEndEvent

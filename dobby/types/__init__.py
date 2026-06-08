@@ -35,6 +35,7 @@ from .stream_events import (
     StreamEvent as StreamEvent,
     StreamStartEvent as StreamStartEvent,
     TextDeltaEvent as TextDeltaEvent,
+    ToolUseErrorEvent as ToolUseErrorEvent,
     ToolUseEvent as ToolUseEvent,
 )
 from .text_part import TextPart as TextPart

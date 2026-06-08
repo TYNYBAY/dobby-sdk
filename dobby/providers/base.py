@@ -70,6 +70,32 @@ class InternalServerError(ProviderError):
         super().__init__(message, provider=provider, status_code=status_code)
 
 
+class ToolCallTruncatedError(ProviderError):
+    """A tool call's arguments were truncated by the model (e.g. ``max_tokens``).
+
+    Raised by non-streaming completions when the provider cut a response off
+    mid tool call, leaving partial or empty arguments. Surfaced as a typed,
+    catchable error rather than executing a tool on garbage input.
+
+    Deliberately NOT in ``RETRYABLE_ERRORS``: truncation is deterministic, so a
+    retry with the same ``max_tokens`` reproduces it. Raise the budget instead.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        tool_name: str | None = None,
+        tool_id: str | None = None,
+        partial_inputs: Any = None,
+    ):
+        self.tool_name = tool_name
+        self.tool_id = tool_id
+        self.partial_inputs = partial_inputs
+        super().__init__(message, provider=provider)
+
+
 RETRYABLE_ERRORS: tuple[type[ProviderError], ...] = (
     RateLimitError,
     APIConnectionError,
