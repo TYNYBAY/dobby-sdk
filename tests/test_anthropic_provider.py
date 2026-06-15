@@ -454,7 +454,6 @@ class TestAnthropicReasoningEffort:
 
     def test_int_reasoning_effort_builds_thinking(self) -> None:
         """Int budget_tokens should produce a thinking config."""
-        provider = self._make_provider()
         # chat() builds thinking dict before delegating; test indirectly via the logic
         # We verify the contract: int → thinking dict, str → TypeError
         # Direct unit test of the validation branch:
@@ -483,3 +482,217 @@ class TestAnthropicReasoningEffort:
         if reasoning_effort is not None:
             thinking = {"type": "enabled", "budget_tokens": reasoning_effort}
         assert thinking is None
+
+
+# ---------------------------------------------------------------------------
+# stop_reason mapping tests
+# ---------------------------------------------------------------------------
+
+
+class TestMapStopReason:
+    """Test _map_stop_reason normalization."""
+
+    @pytest.mark.parametrize(
+        "reason",
+        ["end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal", "pause_turn"],
+    )
+    def test_known_reasons_pass_through(self, reason: str) -> None:
+        from dobby.providers.anthropic.adapter import _map_stop_reason
+
+        assert _map_stop_reason(reason) == reason
+
+    def test_none_falls_back_to_end_turn(self) -> None:
+        from dobby.providers.anthropic.adapter import _map_stop_reason
+
+        assert _map_stop_reason(None) == "end_turn"
+
+    def test_unknown_falls_back_to_end_turn(self) -> None:
+        from dobby.providers.anthropic.adapter import _map_stop_reason
+
+        assert _map_stop_reason("some_future_reason") == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# kwargs passthrough tests
+# ---------------------------------------------------------------------------
+
+
+class TestKwargsPassthrough:
+    """Test that _build_kwargs forwards provider-native params via extra."""
+
+    def test_extra_forwarded(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        kwargs = AnthropicProvider._build_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[],
+            extra={"top_p": 0.9, "stop_sequences": ["END"]},
+        )
+        assert kwargs["top_p"] == 0.9
+        assert kwargs["stop_sequences"] == ["END"]
+
+    def test_extra_never_clobbers_core_fields(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        kwargs = AnthropicProvider._build_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[],
+            temperature=0.0,
+            extra={"model": "evil", "temperature": 0.9},
+        )
+        assert kwargs["model"] == "claude-sonnet-4-20250514"
+        assert kwargs["temperature"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# redacted_thinking round-trip tests
+# ---------------------------------------------------------------------------
+
+
+class TestRedactedThinking:
+    """Test redacted_thinking preservation through the converter."""
+
+    def test_redacted_reasoning_emits_redacted_block(self) -> None:
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import AssistantMessagePart, ReasoningPart
+
+        messages = [
+            AssistantMessagePart(
+                parts=[ReasoningPart(text="ENCRYPTED_BLOB", redacted=True)]
+            )
+        ]
+        result = to_anthropic_messages(messages)
+
+        assert result[0]["content"] == [
+            {"type": "redacted_thinking", "data": "ENCRYPTED_BLOB"}
+        ]
+
+    def test_normal_reasoning_still_emits_thinking_block(self) -> None:
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import AssistantMessagePart, ReasoningPart
+
+        messages = [
+            AssistantMessagePart(parts=[ReasoningPart(text="thinking", signature="s")])
+        ]
+        result = to_anthropic_messages(messages)
+
+        assert result[0]["content"] == [
+            {"type": "thinking", "thinking": "thinking", "signature": "s"}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Azure config validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestAzureValidation:
+    """Test fail-fast validation of mutually exclusive Azure params."""
+
+    def test_api_key_and_token_provider_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="api_key or azure_ad_token_provider"):
+            AnthropicProvider(
+                model="claude-sonnet-4-5",
+                api_key="k",
+                azure_ad_token_provider=lambda: "token",
+                resource="my-resource",
+            )
+
+    def test_resource_and_base_url_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="resource or base_url"):
+            AnthropicProvider(
+                model="claude-sonnet-4-5",
+                api_key="k",
+                resource="my-resource",
+                base_url="https://my-resource.services.ai.azure.com/anthropic/",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Per-call model override + passthrough (end-to-end via mocked client)
+# ---------------------------------------------------------------------------
+
+
+class TestChatModelOverride:
+    """Test that chat() honors per-call model and forwards kwargs."""
+
+    def _make_provider(self):
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider.api_key = "test"
+        provider.base_url = None
+        provider._model = "claude-sonnet-4-5"
+        provider.max_retries = 3
+        provider._client = MagicMock()
+        return provider
+
+    def _run_chat(self, provider, **chat_kwargs):
+        from dobby.types import TextPart, UserMessagePart
+
+        captured: dict = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            resp = MagicMock()
+            resp.content = []
+            resp.stop_reason = "end_turn"
+            resp.model = kwargs["model"]
+            resp.usage = None
+            return resp
+
+        provider._client.messages.create = fake_create
+        result = asyncio.get_event_loop().run_until_complete(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                **chat_kwargs,
+            )
+        )
+        return captured, result
+
+    def test_model_override_used(self) -> None:
+        provider = self._make_provider()
+        captured, _ = self._run_chat(provider, model="claude-opus-4-8")
+        assert captured["model"] == "claude-opus-4-8"
+
+    def test_defaults_to_instance_model(self) -> None:
+        provider = self._make_provider()
+        captured, _ = self._run_chat(provider)
+        assert captured["model"] == "claude-sonnet-4-5"
+
+    def test_kwargs_forwarded_to_create(self) -> None:
+        provider = self._make_provider()
+        captured, _ = self._run_chat(provider, top_p=0.5)
+        assert captured["top_p"] == 0.5
+
+    def test_redacted_thinking_block_parsed(self) -> None:
+        from dobby.types import ReasoningPart, TextPart, UserMessagePart
+
+        provider = self._make_provider()
+        captured: dict = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            block = MagicMock()
+            block.type = "redacted_thinking"
+            block.data = "ENC"
+            resp = MagicMock()
+            resp.content = [block]
+            resp.stop_reason = "end_turn"
+            resp.model = kwargs["model"]
+            resp.usage = None
+            return resp
+
+        provider._client.messages.create = fake_create
+        result = asyncio.get_event_loop().run_until_complete(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])])
+        )
+        redacted = [
+            p for p in result.parts if isinstance(p, ReasoningPart) and p.redacted
+        ]
+        assert len(redacted) == 1
+        assert redacted[0].text == "ENC"

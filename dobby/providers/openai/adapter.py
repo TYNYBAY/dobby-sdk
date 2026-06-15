@@ -168,6 +168,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         tools: list[ToolParam] | None = None,
         reasoning: Reasoning | None = None,
         max_output_tokens: int | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build kwargs for responses.create() excluding None values.
 
@@ -183,6 +184,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                 "minimal" is normalized to "low").
                 Summary: "auto", "concise", "detailed".
             max_output_tokens: Optional maximum number of output tokens.
+            extra: Provider-native passthrough params forwarded to responses.create().
 
         Returns:
             Dictionary of kwargs to pass to responses.create().
@@ -197,6 +199,11 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             kwargs["reasoning"] = reasoning
         if max_output_tokens is not None:
             kwargs["max_output_tokens"] = max_output_tokens
+        # Forward provider-native params last, never clobbering core fields.
+        if extra:
+            for key, value in extra.items():
+                if key not in kwargs:
+                    kwargs[key] = value
 
         # logger.debug(f"kwargs: {kwargs}")
         return kwargs
@@ -282,6 +289,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[ToolParam] | None = None,
+        model: str | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         **kwargs,
@@ -298,9 +306,12 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             system_prompt: Optional system message to guide behavior
             temperature: Controls randomness (0.0-2.0, default 0.0)
             tools: Available tools for function calling
+            model: Per-call model override. Falls back to the instance model
+                (or Azure deployment id).
             reasoning_effort: Reasoning effort level (e.g., "low", "medium", "high")
             max_tokens: Maximum number of output tokens
-            **kwargs: Additional OpenAI-specific parameters
+            **kwargs: Additional OpenAI-specific parameters forwarded verbatim to
+                responses.create() (e.g. top_p, metadata).
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming
@@ -309,16 +320,16 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         if system_prompt is not None:
             openai_messages.insert(0, {"role": "system", "content": system_prompt})
 
-        # Determine model to use (instance model > azure deployment)
-        target_model = self._model or self.azure_deployment_id
+        # Determine model to use (per-call override > instance model > azure deployment)
+        target_model = model or self._model or self.azure_deployment_id
 
         if stream:
             return self._stream_chat_completion(
-                openai_messages, temperature, target_model, tools, reasoning_effort, max_tokens
+                openai_messages, temperature, target_model, tools, reasoning_effort, max_tokens, kwargs
             )
 
         return await self._non_stream_chat_completion(
-            openai_messages, target_model, tools, reasoning_effort, max_tokens
+            openai_messages, target_model, tools, reasoning_effort, max_tokens, kwargs
         )
 
     @with_retries
@@ -329,6 +340,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         tools: list[ToolParam] | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -338,6 +350,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             tools: Optional tool definitions.
             reasoning_effort: Optional reasoning effort level.
             max_tokens: Optional maximum number of output tokens.
+            extra: Provider-native passthrough params forwarded to responses.create().
 
         Returns:
             StreamEndEvent with complete response.
@@ -353,6 +366,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             tools=tools,
             reasoning=reasoning_param,
             max_output_tokens=max_tokens,
+            extra=extra,
         )
 
         try:
@@ -413,6 +427,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         tools: list[ToolParam] | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
 
@@ -426,6 +441,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             tools: Optional OpenAI-formatted tool definitions
             reasoning_effort: Reasoning effort level
             max_tokens: Optional maximum number of output tokens
+            extra: Provider-native passthrough params forwarded to responses.create().
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
@@ -443,6 +459,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
             tools=tools,
             reasoning=reasoning_param,
             max_output_tokens=max_tokens,
+            extra=extra,
         )
 
         try:

@@ -4,9 +4,9 @@ Implements the Provider interface for Anthropic's Messages API,
 supporting both direct Anthropic API and Azure-hosted Claude endpoints.
 """
 
-import json
 from collections.abc import AsyncIterator, Iterable
-from typing import Any, Literal, NoReturn, overload
+import json
+from typing import Any, Literal, NoReturn, cast, overload
 
 import anthropic
 from anthropic import AsyncAnthropic, AsyncAnthropicFoundry
@@ -46,6 +46,24 @@ from ..base import (
 from .converters import AnthropicContentBlock, content_part_to_anthropic
 
 DEFAULT_MAX_TOKENS = 8192
+
+# Anthropic stop_reason values that map 1:1 onto Dobby's StopReason.
+_KNOWN_STOP_REASONS: frozenset[str] = frozenset(
+    {"end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal", "pause_turn"}
+)
+
+
+def _map_stop_reason(reason: str | None) -> StopReason:
+    """Map an Anthropic stop_reason onto Dobby's StopReason, with a safe fallback.
+
+    Unknown or absent reasons collapse to ``"end_turn"`` so a future Anthropic
+    value never produces an out-of-contract StopReason.
+    """
+    if reason in _KNOWN_STOP_REASONS:
+        return cast(StopReason, reason)
+    if reason is not None:
+        logger.debug(f"Unhandled Anthropic stop_reason: {reason}")
+    return "end_turn"
 
 
 class AnthropicProvider(Provider[AsyncAnthropic]):
@@ -102,13 +120,25 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         )
 
         if self._is_azure:
+            # These pairs are mutually exclusive; fail fast on conflicting config
+            # rather than silently picking a winner.
+            if api_key and azure_ad_token_provider:
+                raise ValueError(
+                    "Pass either api_key or azure_ad_token_provider for Azure, not both."
+                )
+            if resource and base_url:
+                raise ValueError(
+                    "Pass either resource or base_url for Azure, not both."
+                )
+
             # resource and base_url are mutually exclusive in AsyncAnthropicFoundry.
             # Pass only whichever is set; the SDK constructs the URL from resource
             # as https://{resource}.services.ai.azure.com/anthropic/ automatically.
-            foundry_kwargs: dict = {"api_key": api_key}
+            foundry_kwargs: dict[str, Any] = {}
             if azure_ad_token_provider:
-                del foundry_kwargs["api_key"]
                 foundry_kwargs["azure_ad_token_provider"] = azure_ad_token_provider
+            else:
+                foundry_kwargs["api_key"] = api_key
             if resource:
                 foundry_kwargs["resource"] = resource
             elif base_url:
@@ -123,6 +153,8 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
     @property
     def name(self) -> str:
         """Provider name."""
+        # getattr fallback keeps this robust when the instance is built via
+        # __new__ (e.g. in tests) without running __init__.
         is_azure = getattr(self, "_is_azure", bool(self.base_url and "azure" in self.base_url))
         return "azure-anthropic" if is_azure else "anthropic"
 
@@ -145,6 +177,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.0,
         thinking: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build kwargs for messages.create() excluding None values.
 
@@ -156,6 +189,9 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             tools: Optional tool definitions.
             temperature: Sampling temperature.
             thinking: Optional extended thinking configuration.
+            extra: Provider-native passthrough params forwarded verbatim to the
+                SDK (e.g. top_p, stop_sequences, metadata). Never overrides the
+                core fields above.
 
         Returns:
             Dictionary of kwargs to pass to messages.create().
@@ -176,6 +212,12 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             kwargs["tools"] = tools
         if thinking is not None:
             kwargs["thinking"] = thinking
+        # Forward provider-native params last, but never let them clobber the
+        # core request fields constructed above.
+        if extra:
+            for key, value in extra.items():
+                if key not in kwargs:
+                    kwargs[key] = value
 
         return kwargs
 
@@ -260,6 +302,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         **kwargs,
@@ -272,14 +315,17 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             system_prompt: Optional system message to guide behavior.
             temperature: Controls randomness (0.0-1.0, default 0.0).
             tools: Available tools for function calling.
+            model: Per-call model override. Falls back to the instance model.
             reasoning_effort: Thinking budget as int (budget_tokens). Pass None to disable.
             max_tokens: Maximum number of output tokens. Defaults to 8192.
-            **kwargs: Additional Anthropic-specific parameters.
+            **kwargs: Additional Anthropic-specific parameters forwarded verbatim
+                to messages.create() (e.g. top_p, stop_sequences, metadata).
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
         """
         anthropic_messages = to_anthropic_messages(messages)
+        target_model = model or self._model
 
         # Build thinking config from reasoning effort (must be int budget_tokens)
         thinking = None
@@ -296,22 +342,24 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         if stream:
             return self._stream_chat_completion(
                 anthropic_messages,
-                self._model,
+                target_model,
                 system=system_prompt,
                 tools=tools,
                 temperature=temperature,
                 max_tokens=effective_max_tokens,
                 thinking=thinking,
+                extra=kwargs,
             )
 
         return await self._non_stream_chat_completion(
             anthropic_messages,
-            self._model,
+            target_model,
             system=system_prompt,
             tools=tools,
             temperature=temperature,
             max_tokens=effective_max_tokens,
             thinking=thinking,
+            extra=kwargs,
         )
 
     @with_retries
@@ -324,6 +372,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         temperature: float = 0.0,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -335,6 +384,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             temperature: Sampling temperature.
             max_tokens: Maximum output tokens.
             thinking: Optional extended thinking configuration.
+            extra: Provider-native passthrough params forwarded to messages.create().
 
         Returns:
             StreamEndEvent with complete response.
@@ -347,6 +397,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             tools=tools,
             temperature=temperature,
             thinking=thinking,
+            extra=extra,
         )
 
         try:
@@ -363,6 +414,10 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                     parts.append(
                         ReasoningPart(text=block.thinking, signature=block.signature)
                     )
+                case "redacted_thinking":
+                    # Opaque encrypted reasoning; preserve verbatim so multi-turn
+                    # thinking continuity survives the round-trip.
+                    parts.append(ReasoningPart(text=block.data, redacted=True))
                 case "tool_use":
                     parts.append(
                         ToolUsePart(id=block.id, name=block.name, inputs=block.input)
@@ -370,8 +425,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                 case _:
                     logger.debug(f"Unhandled content block type: {block.type}")
 
-        # Anthropic stop_reason maps directly to Dobby StopReason
-        stop_reason: StopReason = response.stop_reason or "end_turn"
+        stop_reason: StopReason = _map_stop_reason(response.stop_reason)
 
         usage: Usage | None = None
         if response.usage:
@@ -406,6 +460,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         temperature: float = 0.0,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
 
@@ -420,6 +475,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             temperature: Sampling temperature.
             max_tokens: Maximum output tokens.
             thinking: Optional extended thinking configuration.
+            extra: Provider-native passthrough params forwarded to messages.create().
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
@@ -433,6 +489,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
             tools=tools,
             temperature=temperature,
             thinking=thinking,
+            extra=extra,
         )
 
         try:
@@ -461,7 +518,20 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         cache_read_input_tokens: int | None = None
         stop_reason: StopReason = "end_turn"
 
-        async for event in stream:
+        # Opaque encrypted reasoning blocks, preserved verbatim for round-trip.
+        redacted_thinking_data: list[str] = []
+
+        # Iterate manually so mid-stream transport errors route through the same
+        # unified error translation as the initial request.
+        stream_iter = stream.__aiter__()
+        while True:
+            try:
+                event = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                self._translate_error(e)
+
             match event.type:
                 case "message_start":
                     response_id = event.message.id
@@ -483,6 +553,10 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                     current_block_type = event.content_block.type
                     if current_block_type == "thinking":
                         yield ReasoningStartEvent(type="reasoning_start")
+                    elif current_block_type == "redacted_thinking":
+                        data = getattr(event.content_block, "data", None)
+                        if data:
+                            redacted_thinking_data.append(data)
                     elif current_block_type == "tool_use":
                         current_tool_id = event.content_block.id
                         current_tool_name = event.content_block.name
@@ -517,7 +591,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
 
                 case "message_delta":
                     if event.delta.stop_reason:
-                        stop_reason = event.delta.stop_reason
+                        stop_reason = _map_stop_reason(event.delta.stop_reason)
                     if event.usage:
                         output_tokens = event.usage.output_tokens
 
@@ -530,6 +604,8 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                                 signature=reasoning_signature,
                             )
                         )
+                    for data in redacted_thinking_data:
+                        parts.append(ReasoningPart(text=data, redacted=True))
                     if accumulated_text:
                         parts.append(TextPart(text=accumulated_text))
                     for tool_event in function_calls:
@@ -602,14 +678,21 @@ def to_anthropic_messages(messages: Iterable[MessagePart]) -> list[dict[str, Any
                                     "input": inputs,
                                 }
                             )
-                        case ReasoningPart(text=text, signature=signature):
-                            block: dict[str, Any] = {
-                                "type": "thinking",
-                                "thinking": text,
-                            }
-                            if signature:
-                                block["signature"] = signature
-                            content.append(block)
+                        case ReasoningPart(
+                            text=text, signature=signature, redacted=redacted
+                        ):
+                            if redacted:
+                                content.append(
+                                    {"type": "redacted_thinking", "data": text}
+                                )
+                            else:
+                                block: dict[str, Any] = {
+                                    "type": "thinking",
+                                    "thinking": text,
+                                }
+                                if signature:
+                                    block["signature"] = signature
+                                content.append(block)
 
                 if content:
                     raw_messages.append({"role": "assistant", "content": content})

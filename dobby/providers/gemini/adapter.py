@@ -171,6 +171,7 @@ class GeminiProvider(Provider[genai.Client]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> StreamEndEvent: ...
 
@@ -183,6 +184,7 @@ class GeminiProvider(Provider[genai.Client]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]: ...
 
@@ -194,6 +196,7 @@ class GeminiProvider(Provider[genai.Client]):
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
         """Generate response from messages using Gemini API.
@@ -207,13 +210,16 @@ class GeminiProvider(Provider[genai.Client]):
             system_prompt: Optional system message to guide behavior
             temperature: Controls randomness (0.0-2.0, default 0.0)
             tools: List of Gemini Tool objects (pre-converted by executor)
-            **kwargs: Additional Gemini-specific parameters
+            model: Per-call model override. Falls back to the instance model.
+            **kwargs: Additional Gemini-specific parameters forwarded verbatim to
+                GenerateContentConfig (e.g. top_p, stop_sequences).
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming
         """
         # Convert messages to Gemini format
         gemini_contents = to_gemini_messages(messages)
+        target_model = model or self._model
 
         max_tokens = kwargs.pop("max_tokens", None)
 
@@ -221,6 +227,8 @@ class GeminiProvider(Provider[genai.Client]):
             temperature=temperature,
             # Disable automatic function calling - we handle it manually
             automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
+            # Forward provider-native params verbatim (e.g. top_p, stop_sequences).
+            **kwargs,
         )
 
         if system_prompt:
@@ -233,41 +241,46 @@ class GeminiProvider(Provider[genai.Client]):
             config.max_output_tokens = max_tokens
 
         if stream:
-            return self._stream_chat_completion(gemini_contents, config)
+            return self._stream_chat_completion(gemini_contents, config, target_model)
 
-        return await self._non_stream_chat_completion(gemini_contents, config)
+        return await self._non_stream_chat_completion(gemini_contents, config, target_model)
 
     @with_retries
     async def _non_stream_chat_completion(
         self,
         contents: list[genai_types.Content],
         config: genai_types.GenerateContentConfig,
+        model: str,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
         Args:
             contents: Gemini-formatted content list.
             config: Generation configuration.
+            model: Model id to generate with.
 
         Returns:
             StreamEndEvent with complete response.
         """
         try:
             response = await self._client.aio.models.generate_content(
-                model=self._model,
+                model=model,
                 contents=contents,
                 config=config,
             )
         except Exception as e:
             self._translate_error(e)
 
-        return self._parse_response(response)
+        return self._parse_response(response, model)
 
-    def _parse_response(self, response: genai_types.GenerateContentResponse) -> StreamEndEvent:
+    def _parse_response(
+        self, response: genai_types.GenerateContentResponse, model: str
+    ) -> StreamEndEvent:
         """Parse a non-streaming Gemini response into StreamEndEvent.
 
         Args:
             response: Gemini GenerateContentResponse object
+            model: Model id used for the request
 
         Returns:
             StreamEndEvent with parsed parts and usage
@@ -325,7 +338,7 @@ class GeminiProvider(Provider[genai.Client]):
             )
 
         return StreamEndEvent(
-            model=self._model,
+            model=model,
             parts=parts,
             stop_reason=stop_reason,
             usage=usage,
@@ -336,6 +349,7 @@ class GeminiProvider(Provider[genai.Client]):
         self,
         contents: list[genai_types.Content],
         config: genai_types.GenerateContentConfig,
+        model: str,
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
 
@@ -346,6 +360,7 @@ class GeminiProvider(Provider[genai.Client]):
         Args:
             contents: Gemini-formatted content list
             config: Generation configuration
+            model: Model id to generate with
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
@@ -359,7 +374,7 @@ class GeminiProvider(Provider[genai.Client]):
 
         try:
             stream_response = await self._client.aio.models.generate_content_stream(
-                model=self._model,
+                model=model,
                 contents=contents,
                 config=config,
             )
@@ -370,8 +385,8 @@ class GeminiProvider(Provider[genai.Client]):
             # Emit stream start on first chunk
             if not stream_started:
                 yield StreamStartEvent(
-                    id=f"gemini_{self._model}",
-                    model=self._model,
+                    id=f"gemini_{model}",
+                    model=model,
                 )
                 stream_started = True
 
@@ -450,7 +465,7 @@ class GeminiProvider(Provider[genai.Client]):
             stop_reason = "tool_use"
 
         yield StreamEndEvent(
-            model=self._model,
+            model=model,
             parts=parts,
             stop_reason=stop_reason,
             usage=final_usage,

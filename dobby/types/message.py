@@ -15,7 +15,15 @@ type ContentPart = TextPart | ImagePart | DocumentPart | ToolResultPart
 type ResponsePart = TextPart | ReasoningPart | ToolUsePart
 
 
-type StopReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use", "content_filter"]
+type StopReason = Literal[
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "content_filter",
+    "refusal",
+    "pause_turn",
+]
 """Reason why the model stopped generating.
 
 - `"end_turn"`: the model reached a natural stopping point
@@ -23,7 +31,9 @@ type StopReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use",
 - `"stop_sequence"`: one of the provided custom `stop_sequences` was generated
 - `"tool_use"`: the model invoked tools
 - `"content_filter"`: content was omitted due to content filters
-In non-streaming mode this value is always non-null. In streaming mode, 
+- `"refusal"`: the model declined to generate for safety reasons (Anthropic)
+- `"pause_turn"`: a long-running turn was paused and may be continued (Anthropic)
+In non-streaming mode this value is always non-null. In streaming mode,
 only non-null in the last response.
 """
 
