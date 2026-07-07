@@ -281,6 +281,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "azure-search-documents" },
+    { name = "google-auth", extra = ["requests"] },
     { name = "google-genai" },
     { name = "logfire" },
     { name = "openai" },
@@ -304,6 +305,7 @@ lint = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.75.0" },
     { name = "azure-search-documents", specifier = ">=11.6.0" },
+    { name = "google-auth", extras = ["requests"], specifier = ">=2.53.0" },
     { name = "google-genai", specifier = ">=1.68.0,<2" },
     { name = "logfire", specifier = ">=4.16.0" },
     { name = "openai", specifier = ">=2.14.0" },
