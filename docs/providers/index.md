@@ -8,7 +8,8 @@ Providers are the interface between Dobby and LLM APIs. Each provider handles me
 |----------|--------|-----|
 | [OpenAI](./openai.md) | ✅ Stable | Responses API |
 | Azure OpenAI | ✅ Stable | Responses API |
-| Anthropic | 🚧 Planned | Messages API |
+| Anthropic | ✅ Stable | Messages API |
+| [Vertex AI](./vertexai.md) | ✅ Stable | Chat Completions API (OpenAI-compatible) |
 
 ## Common Interface
 
@@ -49,3 +50,4 @@ async for event in await provider.chat(messages, stream=True):
 ## Next
 
 - [OpenAI Provider](./openai.md) - Detailed OpenAI/Azure configuration
+- [Vertex AI Provider](./vertexai.md) - Detailed Vertex AI Model Garden configuration

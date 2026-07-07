@@ -16,3 +16,7 @@ from .openai import (
     OpenAIProvider as OpenAIProvider,
     to_openai_messages as to_openai_messages,
 )
+from .vertexai import (
+    VertexAIProvider as VertexAIProvider,
+    to_vertexai_messages as to_vertexai_messages,
+)
