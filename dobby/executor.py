@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from ._logging import logger
 from .exceptions import ApprovalRequired
 from .providers.base import Provider
+from .providers.vertexai.converters import to_vertexai_tool
 from .tools.tool import Tool
 from .types import (
     AssistantMessagePart,
@@ -51,7 +52,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
-        provider: The LLM provider type ('openai', 'azure-openai', 'gemini', 'anthropic')
+        provider: The LLM provider type ('openai', 'azure-openai', 'gemini', 'anthropic',
+            'vertexai')
         llm: The LLM provider instance
         output_type: Pydantic model for structured output (optional)
         output_mode: How to get structured output ('tool' or 'native')
@@ -60,7 +62,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
     def __init__(
         self,
-        provider: Literal["openai", "azure-openai", "gemini", "anthropic"],
+        provider: Literal["openai", "azure-openai", "gemini", "anthropic", "vertexai"],
         llm: Provider,
         tools: list[Tool] | None = None,
         output_type: type[OutputT] | None = None,
@@ -129,6 +131,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 case "anthropic":
                     self._formatted_tools = [
                         tool.to_anthropic_format() for tool in self._tools.values()
+                    ]
+                case "vertexai":
+                    self._formatted_tools = [
+                        to_vertexai_tool(tool) for tool in self._tools.values()
                     ]
         return self._formatted_tools
 

@@ -13,11 +13,14 @@ serializes to the wire as ``parametersJsonSchema`` (never ``parameters``).
 from dataclasses import dataclass
 import os
 from typing import Any, ClassVar, Literal
+from unittest.mock import AsyncMock
 
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 import pytest
 
+from dobby.executor import AgentExecutor
+from dobby.providers.vertexai.converters import to_vertexai_tool
 from dobby.tools import Tool
 from dobby.types import ToolUsePart
 
@@ -259,6 +262,82 @@ def test_old_parameters_path_would_have_failed() -> None:
 
     with pytest.raises(Exception):  # noqa: B017 - SDK raises pydantic ValidationError
         genai_types.FunctionDeclaration(name="t", parameters=schema)
+
+
+# --- AgentExecutor.get_tools_schema() provider dispatch -------------------------
+#
+# Regression coverage for dobby/executor.py's `match self.provider:` in
+# get_tools_schema(). Confirms "vertexai" is wired to to_vertexai_tool()'s nested
+# Chat-Completions shape (not to_openai_format()'s flat Responses-API shape, and
+# not merged into the "openai" | "azure-openai" case), and that every other
+# existing case is unaffected by that addition.
+
+
+class TestGetToolsSchemaProviderDispatch:
+    """Locks in each provider case of AgentExecutor.get_tools_schema()'s dispatch."""
+
+    def _make_executor(self, provider: str, tool: Tool) -> AgentExecutor:
+        return AgentExecutor(provider=provider, llm=AsyncMock(), tools=[tool])  # type: ignore[arg-type]
+
+    def test_vertexai_dispatch_uses_nested_chat_completions_shape(self) -> None:
+        """The vertexai case produces to_vertexai_tool()'s nested {"type", "function": {...}} shape."""
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        schema = self._make_executor("vertexai", tool).get_tools_schema()
+
+        assert schema == [to_vertexai_tool(tool)]
+        entry = schema[0]
+        assert entry["type"] == "function"
+        assert set(entry["function"]) == {"name", "description", "parameters"}
+        # Not the flat Responses-API shape: name/description/parameters must NOT
+        # be top-level keys on the entry itself.
+        assert "name" not in entry
+        assert "description" not in entry
+        assert "parameters" not in entry
+
+    def test_vertexai_dispatch_is_not_flat_openai_responses_shape(self) -> None:
+        """The vertexai schema differs from tool.to_openai_format()'s flat shape.
+
+        Guards against reintroducing the plan-review-caught mistake of reusing
+        to_openai_format() (or merging "vertexai" into the openai/azure-openai
+        case) for the Chat-Completions-shaped Vertex endpoint.
+        """
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        flat = tool.to_openai_format()
+
+        entry = self._make_executor("vertexai", tool).get_tools_schema()[0]
+
+        assert entry != flat
+        assert entry["function"]["parameters"] == flat["parameters"]
+
+    def test_openai_dispatch_unaffected(self) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        schema = self._make_executor("openai", tool).get_tools_schema()
+
+        assert schema == [tool.to_openai_format()]
+        assert "function" not in schema[0]
+
+    def test_azure_openai_dispatch_unaffected(self) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        schema = self._make_executor("azure-openai", tool).get_tools_schema()
+
+        assert schema == [tool.to_openai_format()]
+
+    def test_gemini_dispatch_unaffected(self) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        schema = self._make_executor("gemini", tool).get_tools_schema()
+
+        assert schema == [tool.to_gemini_format()]
+
+    def test_anthropic_dispatch_unaffected(self) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        schema = self._make_executor("anthropic", tool).get_tools_schema()
+
+        assert schema == [tool.to_anthropic_format()]
 
 
 # --- Optional credential-gated live smoke test ---------------------------------
