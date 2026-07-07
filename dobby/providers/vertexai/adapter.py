@@ -25,8 +25,12 @@ from ...types import (
     ResponsePart,
     StopReason,
     StreamEndEvent,
+    StreamErrorEvent,
     StreamEvent,
+    StreamStartEvent,
+    TextDeltaEvent,
     TextPart,
+    ToolUseEvent,
     ToolUsePart,
     Usage,
 )
@@ -54,6 +58,22 @@ _FINISH_REASON_MAP: dict[str, StopReason] = {
     "tool_calls": "tool_use",
     "content_filter": "content_filter",
 }
+
+
+# Bounds for the streaming tool-call accumulator (see _stream_chat_completion).
+# The target of this provider includes self-deployed/third-party Model Garden
+# containers (per the origin document's scope) — a less-trusted boundary than
+# native OpenAI — so an unbounded per-`index` accumulator keyed by
+# backend-supplied data is a resource-exhaustion vector worth closing.
+#
+# 64 distinct tool-call indices comfortably covers any realistic parallel
+# tool-call fan-out (real-world usage rarely exceeds single digits) while
+# still bounding worst-case dict growth.
+_MAX_TOOL_CALL_INDICES = 64
+# ~1MB across all indices combined comfortably covers realistic tool-call
+# argument payloads (JSON objects with many/large string fields) while
+# bounding worst-case memory growth from a misbehaving or malicious stream.
+_MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH = 1_000_000
 
 
 def _map_finish_reason(reason: str | None) -> StopReason:
@@ -227,9 +247,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         """Generate a response from conversation messages.
 
         Converts provider-agnostic messages to Chat Completions format and
-        delegates to the non-streaming or streaming implementation. Streaming
-        (`stream=True`) is not yet implemented — it lands in a later unit
-        (U4) of the Vertex AI provider plan.
+        delegates to the non-streaming or streaming implementation.
 
         Args:
             messages: Conversation history with user/assistant/tool messages.
@@ -410,17 +428,179 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         temperature: float = 0.0,
         tools: list[Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Streaming chat completion.
+        """Streaming chat completion with retry support.
 
-        Not yet implemented — lands in a later unit (U4) of the Vertex AI
-        provider plan, which parses Chat Completions SSE delta chunks into
-        Dobby's discriminated StreamEvent sequence.
+        Parses Chat Completions SSE delta chunks (`choices[0].delta`) into
+        Dobby's discriminated StreamEvent sequence. No manual auth handling at
+        this call site — same as `_non_stream_chat_completion`.
 
-        Raises:
-            NotImplementedError: Always, until U4 lands.
+        Tool-call fragments are keyed by `index` (the only safe correlation
+        key across chunks — `id` may not appear on every fragment) and merged
+        idempotently: `id`/`function.name` are set-if-present on *any* chunk
+        for that index, not assumed to only arrive on the first one. `usage`
+        is captured via `chunk.usage is not None`, independent of whether
+        `chunk.choices` is empty — real third-party (often vLLM-backed)
+        OpenAI-compatible servers have shipped both deviations from native
+        OpenAI's streaming conventions. See the accumulator bound constants
+        above for the resource-exhaustion mitigation this implies.
+
+        Args:
+            messages: Chat-Completions-formatted messages.
+            model: Model id (per-call override or instance model).
+            temperature: Sampling temperature.
+            tools: Optional, already Chat-Completions-formatted tool schemas.
+
+        Yields:
+            StreamEvent objects: StreamStartEvent, TextDeltaEvent,
+            ToolUseEvent, StreamErrorEvent, StreamEndEvent.
         """
-        raise NotImplementedError(
-            "VertexAIProvider streaming chat completions are not yet implemented "
-            "(land in a later unit)."
+        create_kwargs = self._build_kwargs(
+            model=model, messages=messages, temperature=temperature, tools=tools
         )
-        yield  # pragma: no cover - unreachable; makes this an async generator.
+        create_kwargs["stream"] = True
+        create_kwargs["stream_options"] = {"include_usage": True}
+
+        try:
+            stream = await self._client.chat.completions.create(**create_kwargs)
+        except Exception as e:
+            self._translate_error(e)
+
+        stream_started = False
+        model_name: str = model
+        accumulated_text: str = ""
+        finish_reason: str | None = None
+        usage: Usage | None = None
+
+        # index -> {"id": str | None, "name": str | None, "arguments": str}
+        tool_call_accumulator: dict[int, dict[str, Any]] = {}
+        tool_call_order: list[int] = []
+        accumulated_arguments_length = 0
+
+        # Iterate manually so mid-stream transport errors route through the same
+        # unified error translation as the initial request (mirrors
+        # AnthropicProvider._stream_chat_completion's manual __anext__ pattern).
+        stream_iter = stream.__aiter__()
+        while True:
+            try:
+                chunk = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                self._translate_error(e)
+
+            if not stream_started:
+                yield StreamStartEvent(
+                    id=getattr(chunk, "id", None) or f"vertexai_{model}",
+                    model=getattr(chunk, "model", None) or model_name,
+                )
+                stream_started = True
+
+            if getattr(chunk, "model", None):
+                model_name = chunk.model
+
+            # Checked independent of `choices` length: some OpenAI-compatible
+            # (vLLM-backed) servers don't guarantee a dedicated empty-choices
+            # usage chunk the way native OpenAI does.
+            if chunk.usage is not None:
+                usage = Usage(
+                    input_tokens=chunk.usage.prompt_tokens,
+                    output_tokens=chunk.usage.completion_tokens,
+                    total_tokens=chunk.usage.total_tokens,
+                )
+
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            if delta.content:
+                accumulated_text += delta.content
+                yield TextDeltaEvent(delta=delta.content)
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    index = tc_delta.index
+                    is_new_index = index not in tool_call_accumulator
+
+                    if is_new_index and len(tool_call_accumulator) >= _MAX_TOOL_CALL_INDICES:
+                        yield StreamErrorEvent(
+                            error_code="tool_call_accumulator_overflow",
+                            error_message=(
+                                "Exceeded max distinct tool-call indices "
+                                f"({_MAX_TOOL_CALL_INDICES}) in a single stream; "
+                                "stopping accumulation."
+                            ),
+                        )
+                        return
+
+                    fragment = ""
+                    if tc_delta.function is not None and tc_delta.function.arguments:
+                        fragment = tc_delta.function.arguments
+
+                    if (
+                        accumulated_arguments_length + len(fragment)
+                        > _MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH
+                    ):
+                        yield StreamErrorEvent(
+                            error_code="tool_call_accumulator_overflow",
+                            error_message=(
+                                "Exceeded max accumulated tool-call arguments length "
+                                f"({_MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH} chars) "
+                                "in a single stream; stopping accumulation."
+                            ),
+                        )
+                        return
+
+                    if is_new_index:
+                        tool_call_accumulator[index] = {
+                            "id": None,
+                            "name": None,
+                            "arguments": "",
+                        }
+                        tool_call_order.append(index)
+                    acc = tool_call_accumulator[index]
+
+                    # Idempotent set-if-present merge, not "only first chunk":
+                    # real third-party servers have shipped id/name on later
+                    # fragments for the same index instead of the first one.
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+                    if tc_delta.function is not None and tc_delta.function.name:
+                        acc["name"] = tc_delta.function.name
+                    if fragment:
+                        acc["arguments"] += fragment
+                        accumulated_arguments_length += len(fragment)
+
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+        parts: list[ResponsePart] = []
+        if accumulated_text:
+            parts.append(TextPart(text=accumulated_text))
+
+        # A tool call's arguments are only safe to treat as "fully assembled"
+        # once the whole stream has ended — Chat Completions has no per-index
+        # completion signal, and third-party servers may still add id/name to
+        # an index on a later chunk (see the idempotent merge above).
+        for index in tool_call_order:
+            acc = tool_call_accumulator[index]
+            tool_event = ToolUseEvent(
+                id=acc["id"] or "",
+                name=acc["name"] or "",
+                inputs=json.loads(acc["arguments"]) if acc["arguments"] else {},
+            )
+            yield tool_event
+            parts.append(
+                ToolUsePart(id=tool_event.id, name=tool_event.name, inputs=tool_event.inputs)
+            )
+
+        stop_reason: StopReason = (
+            "tool_use" if tool_call_order else _map_finish_reason(finish_reason)
+        )
+
+        yield StreamEndEvent(
+            model=model_name,
+            parts=parts,
+            stop_reason=stop_reason,
+            usage=usage,
+        )

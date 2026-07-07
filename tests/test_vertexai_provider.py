@@ -1,10 +1,11 @@
 """Tests for VertexAIProvider: constructor, auth resolution, and token refresh."""
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import logging
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
@@ -18,6 +19,7 @@ from dobby.providers.base import (
     ProviderError,
     RateLimitError,
 )
+from dobby.providers.vertexai import adapter as vertexai_adapter_module
 from dobby.providers.vertexai.adapter import VertexAIProvider
 from dobby.providers.vertexai.converters import to_vertexai_messages, to_vertexai_tool
 from dobby.tools import Tool
@@ -26,8 +28,13 @@ from dobby.types import (
     Base64ImageSource,
     ImagePart,
     ReasoningPart,
+    StreamEndEvent,
+    StreamErrorEvent,
+    StreamStartEvent,
+    TextDeltaEvent,
     TextPart,
     ToolResultPart,
+    ToolUseEvent,
     ToolUsePart,
     Usage,
     UserMessagePart,
@@ -779,22 +786,401 @@ class TestVertexAIErrorTranslation:
 
 
 # ---------------------------------------------------------------------------
-# chat(stream=True) dispatch tests
+# chat(stream=True) tests
 # ---------------------------------------------------------------------------
 
 
-class TestStreamChatCompletionDispatch:
-    """Test chat()'s dispatch to the not-yet-implemented streaming path."""
+def _make_tool_call_delta(
+    index: int,
+    call_id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
 
-    def test_stream_true_raises_not_implemented(self) -> None:
+
+def _make_delta(
+    content: str | None = None, tool_calls: list[SimpleNamespace] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+
+def _make_stream_choice(
+    delta: SimpleNamespace, finish_reason: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(delta=delta, finish_reason=finish_reason)
+
+
+def _make_stream_chunk(
+    choices: list[SimpleNamespace] | None = None,
+    usage: SimpleNamespace | None = None,
+    chunk_id: str = "chatcmpl-test",
+    model: str = "meta/llama-3.1-405b-instruct-maas",
+) -> SimpleNamespace:
+    return SimpleNamespace(choices=choices or [], usage=usage, id=chunk_id, model=model)
+
+
+async def _chunk_stream(chunks: list[SimpleNamespace]) -> AsyncIterator[SimpleNamespace]:
+    for chunk in chunks:
+        yield chunk
+
+
+class _FailingChunkStream:
+    """Async iterator that yields a prefix of chunks then raises mid-stream."""
+
+    def __init__(self, chunks: list[SimpleNamespace], fail_after: int, exc: Exception) -> None:
+        self._chunks = chunks
+        self._fail_after = fail_after
+        self._exc = exc
+        self._index = 0
+
+    def __aiter__(self) -> "_FailingChunkStream":
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        if self._index == self._fail_after:
+            raise self._exc
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+
+async def _collect_stream_events(provider: VertexAIProvider, **kwargs: Any) -> list[Any]:
+    stream = await provider.chat(
+        messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=True, **kwargs
+    )
+    return [event async for event in stream]
+
+
+class TestStreamChatCompletion:
+    """Test VertexAIProvider.chat(stream=True)."""
+
+    def test_text_stream_accumulates_into_single_text_part(self) -> None:
         provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(content="Hel"))]),
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(content="lo"))]),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="!"), finish_reason="stop")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
 
-        async def _run() -> None:
-            stream = await provider.chat(
-                messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=True
-            )
-            async for _ in stream:
-                pass
+        events = asyncio.run(_collect_stream_events(provider))
 
-        with pytest.raises(NotImplementedError):
-            asyncio.run(_run())
+        text_deltas = [e for e in events if isinstance(e, TextDeltaEvent)]
+        assert [e.delta for e in text_deltas] == ["Hel", "lo", "!"]
+
+        end_event = events[-1]
+        assert isinstance(end_event, StreamEndEvent)
+        assert end_event.parts == [TextPart(text="Hello!")]
+        assert end_event.stop_reason == "end_turn"
+
+    def test_stream_start_event_yielded_exactly_once_on_first_chunk(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(content="a"))]),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="b"), finish_reason="stop")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        start_events = [e for e in events if isinstance(e, StreamStartEvent)]
+        assert len(start_events) == 1
+        assert events[0] is start_events[0]
+
+    def test_fragmented_tool_call_accumulates_by_index(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(
+                                    0, call_id="call_1", name="get_weather", arguments='{"ci'
+                                )
+                            ]
+                        )
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(tool_calls=[_make_tool_call_delta(0, arguments='ty": "SF"}')])
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(), finish_reason="tool_calls")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        end_event = events[-1]
+        assert isinstance(end_event, StreamEndEvent)
+        assert end_event.parts == [
+            ToolUsePart(id="call_1", name="get_weather", inputs={"city": "SF"})
+        ]
+        assert end_event.stop_reason == "tool_use"
+
+        tool_use_events = [e for e in events if isinstance(e, ToolUseEvent)]
+        assert len(tool_use_events) == 1
+        assert tool_use_events[0].id == "call_1"
+        assert tool_use_events[0].inputs == {"city": "SF"}
+
+    def test_two_parallel_tool_calls_accumulate_independently(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(
+                                    0, call_id="call_1", name="get_weather", arguments='{"city":'
+                                ),
+                                _make_tool_call_delta(
+                                    1, call_id="call_2", name="get_time", arguments='{"tz":'
+                                ),
+                            ]
+                        )
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(0, arguments=' "SF"}'),
+                                _make_tool_call_delta(1, arguments=' "UTC"}'),
+                            ]
+                        )
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(), finish_reason="tool_calls")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        end_event = events[-1]
+        assert end_event.parts == [
+            ToolUsePart(id="call_1", name="get_weather", inputs={"city": "SF"}),
+            ToolUsePart(id="call_2", name="get_time", inputs={"tz": "UTC"}),
+        ]
+
+    def test_finish_reason_tool_calls_maps_to_stop_reason_tool_use(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(
+                                    0, call_id="call_1", name="noop", arguments="{}"
+                                )
+                            ]
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        assert events[-1].stop_reason == "tool_use"
+
+    def test_usage_in_dedicated_final_empty_choices_chunk(self) -> None:
+        provider = _make_chat_provider()
+        usage = _make_usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        chunks = [
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="hi"), finish_reason="stop")]
+            ),
+            _make_stream_chunk(choices=[], usage=usage),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        assert events[-1].usage == Usage(input_tokens=10, output_tokens=5, total_tokens=15)
+
+    def test_usage_on_chunk_with_non_empty_choices_still_captured(self) -> None:
+        """Regression test for the idempotent `usage is not None` check.
+
+        Third-party (vLLM-backed) servers may attach usage to a chunk that
+        also carries non-empty choices, deviating from native OpenAI's
+        dedicated-empty-choices-chunk convention.
+        """
+        provider = _make_chat_provider()
+        usage = _make_usage(prompt_tokens=20, completion_tokens=8, total_tokens=28)
+        chunks = [
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="hi"), finish_reason="stop")],
+                usage=usage,
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        assert events[-1].usage == Usage(input_tokens=20, output_tokens=8, total_tokens=28)
+
+    def test_tool_call_id_and_name_on_later_chunk_still_accumulates(self) -> None:
+        """Regression test for the idempotent set-if-present merge.
+
+        Third-party servers may send id/name on a later fragment for an
+        index instead of the first one; the merge must be idempotent
+        (set-if-present), not "only check the first chunk".
+        """
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(tool_calls=[_make_tool_call_delta(0, arguments='{"city"')])
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(
+                                    0, call_id="call_1", name="get_weather", arguments=': "SF"}'
+                                )
+                            ]
+                        )
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(), finish_reason="tool_calls")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        end_event = events[-1]
+        assert end_event.parts == [
+            ToolUsePart(id="call_1", name="get_weather", inputs={"city": "SF"})
+        ]
+
+    def test_exceeding_distinct_index_bound_yields_stream_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(vertexai_adapter_module, "_MAX_TOOL_CALL_INDICES", 2)
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(0, call_id="c0", name="t0", arguments="{}"),
+                                _make_tool_call_delta(1, call_id="c1", name="t1", arguments="{}"),
+                                _make_tool_call_delta(2, call_id="c2", name="t2", arguments="{}"),
+                            ]
+                        )
+                    )
+                ]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        error_events = [e for e in events if isinstance(e, StreamErrorEvent)]
+        assert len(error_events) == 1
+        # Stops accumulating instead of growing unboundedly: no StreamEndEvent
+        # is ever produced once the bound is exceeded.
+        assert not any(isinstance(e, StreamEndEvent) for e in events)
+
+    def test_exceeding_arguments_length_bound_yields_stream_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            vertexai_adapter_module, "_MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH", 5
+        )
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[
+                    _make_stream_choice(
+                        _make_delta(
+                            tool_calls=[
+                                _make_tool_call_delta(
+                                    0,
+                                    call_id="call_1",
+                                    name="get_weather",
+                                    arguments="0123456789",
+                                )
+                            ]
+                        )
+                    )
+                ]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        error_events = [e for e in events if isinstance(e, StreamErrorEvent)]
+        assert len(error_events) == 1
+        assert not any(isinstance(e, StreamEndEvent) for e in events)
+
+    def test_mid_stream_exception_translates_through_translate_error(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(content="hi"))]),
+        ]
+        native_err = _make_openai_error(openai.APIConnectionError)
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_FailingChunkStream(chunks, fail_after=1, exc=native_err)
+        )
+
+        with pytest.raises(APIConnectionError) as exc_info:
+            asyncio.run(_collect_stream_events(provider))
+
+        assert exc_info.value.provider == "vertexai"
+        assert exc_info.value.__cause__ is native_err
+
+    def test_stream_create_kwargs_include_stream_options_no_manual_auth(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="hi"), finish_reason="stop")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        asyncio.run(_collect_stream_events(provider))
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["stream"] is True
+        assert kwargs["stream_options"] == {"include_usage": True}
+        assert "extra_headers" not in kwargs
+        assert "api_key" not in kwargs
+        assert "headers" not in kwargs
