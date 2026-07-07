@@ -2,12 +2,22 @@
 
 import asyncio
 from dataclasses import dataclass
+import logging
+from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import openai
 from pydantic import BaseModel
 import pytest
 
+from dobby.providers.base import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    ProviderError,
+    RateLimitError,
+)
 from dobby.providers.vertexai.adapter import VertexAIProvider
 from dobby.providers.vertexai.converters import to_vertexai_messages, to_vertexai_tool
 from dobby.tools import Tool
@@ -19,6 +29,7 @@ from dobby.types import (
     TextPart,
     ToolResultPart,
     ToolUsePart,
+    Usage,
     UserMessagePart,
 )
 
@@ -464,3 +475,326 @@ class TestToVertexAITool:
             },
         }
         assert set(result["function"]["parameters"]["properties"]) == {"city", "units"}
+
+
+# ---------------------------------------------------------------------------
+# chat(stream=False) tests
+# ---------------------------------------------------------------------------
+
+
+def _make_chat_provider() -> VertexAIProvider:
+    """Provider with a mocked underlying AsyncOpenAI client for chat() tests."""
+    provider = VertexAIProvider(
+        model="meta/llama-3.1-405b-instruct-maas",
+        project="my-project",
+        credentials=_mock_credentials(),
+    )
+    provider._client = MagicMock()
+    return provider
+
+
+def _make_message(
+    content: str | None = None, tool_calls: list[SimpleNamespace] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+
+def _make_tool_call(call_id: str, name: str, arguments: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _make_usage(
+    prompt_tokens: int = 10, completion_tokens: int = 5, total_tokens: int = 15
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _make_response(
+    content: str | None = None,
+    tool_calls: list[SimpleNamespace] | None = None,
+    finish_reason: str | None = "stop",
+    usage: SimpleNamespace | None = None,
+    model: str = "meta/llama-3.1-405b-instruct-maas",
+) -> SimpleNamespace:
+    choice = SimpleNamespace(
+        message=_make_message(content=content, tool_calls=tool_calls),
+        finish_reason=finish_reason,
+    )
+    return SimpleNamespace(choices=[choice], usage=usage, model=model)
+
+
+class TestNonStreamChatCompletion:
+    """Test VertexAIProvider.chat(stream=False)."""
+
+    def test_plain_text_response(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="Hello!", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.parts == [TextPart(text="Hello!")]
+        assert result.stop_reason == "end_turn"
+
+    def test_tool_calls_response(self) -> None:
+        provider = _make_chat_provider()
+        tool_calls = [
+            _make_tool_call("call_1", "get_weather", '{"city": "SF"}'),
+            _make_tool_call("call_2", "get_time", '{"tz": "UTC"}'),
+        ]
+        response = _make_response(content=None, tool_calls=tool_calls, finish_reason="tool_calls")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.stop_reason == "tool_use"
+        assert result.parts == [
+            ToolUsePart(id="call_1", name="get_weather", inputs={"city": "SF"}),
+            ToolUsePart(id="call_2", name="get_time", inputs={"tz": "UTC"}),
+        ]
+
+    def test_tool_calls_present_wins_over_mismatched_finish_reason(self) -> None:
+        """Nonconformant finish_reason="stop" alongside tool_calls still yields "tool_use".
+
+        Guards against a server reporting finish_reason="stop" while still
+        including tool_calls on the message.
+        """
+        provider = _make_chat_provider()
+        tool_calls = [_make_tool_call("call_1", "get_weather", '{"city": "SF"}')]
+        response = _make_response(content=None, tool_calls=tool_calls, finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.stop_reason == "tool_use"
+
+    def test_finish_reason_length_maps_to_max_tokens(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="cut off", finish_reason="length")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.stop_reason == "max_tokens"
+
+    def test_finish_reason_content_filter_maps_through(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="", finish_reason="content_filter")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.stop_reason == "content_filter"
+
+    def test_unknown_finish_reason_falls_back_and_logs_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="hmm", finish_reason="some_future_value")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        with caplog.at_level(logging.DEBUG, logger="dobby"):
+            result = asyncio.run(
+                provider.chat(
+                    messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False
+                )
+            )
+
+        assert result.stop_reason == "end_turn"
+        assert any("some_future_value" in record.message for record in caplog.records)
+
+    def test_usage_populates_dobby_usage(self) -> None:
+        provider = _make_chat_provider()
+        usage = _make_usage(prompt_tokens=100, completion_tokens=42, total_tokens=142)
+        response = _make_response(content="hi", finish_reason="stop", usage=usage)
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.usage == Usage(input_tokens=100, output_tokens=42, total_tokens=142)
+
+    def test_no_extra_headers_or_manual_auth_kwargs(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="hi", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert "extra_headers" not in kwargs
+        assert "api_key" not in kwargs
+        assert "headers" not in kwargs
+
+    def test_instance_model_used_by_default(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="hi", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == "meta/llama-3.1-405b-instruct-maas"
+
+    def test_per_call_model_overrides_instance_model(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="hi", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                model="meta/llama-3.1-70b-instruct-maas",
+            )
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == "meta/llama-3.1-70b-instruct-maas"
+
+    def test_system_prompt_prepended_as_system_message(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(content="hi", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                system_prompt="You are a helpful assistant.",
+            )
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["messages"][0] == {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        }
+        assert kwargs["messages"][1] == {"role": "user", "content": "hi"}
+
+
+# ---------------------------------------------------------------------------
+# chat() error translation tests
+# ---------------------------------------------------------------------------
+
+
+def _make_openai_error(
+    error_cls: type[Exception], status_code: int = 500, headers: dict | None = None
+) -> Exception:
+    """Create a mock OpenAI SDK error (mirrors tests/test_provider_errors.py)."""
+    response = MagicMock()
+    response.status_code = status_code
+    response.headers = headers or {}
+
+    if error_cls is openai.RateLimitError:
+        err = openai.RateLimitError.__new__(openai.RateLimitError)
+        err.response = response
+        err.status_code = 429
+        err.message = "Rate limited"
+        err.body = None
+        return err
+    if error_cls is openai.APITimeoutError:
+        err = openai.APITimeoutError.__new__(openai.APITimeoutError)
+        err.message = "Timed out"
+        err.request = MagicMock()
+        return err
+    if error_cls is openai.APIConnectionError:
+        err = openai.APIConnectionError.__new__(openai.APIConnectionError)
+        err.message = "Connection failed"
+        err.request = MagicMock()
+        return err
+    if error_cls is openai.InternalServerError:
+        err = openai.InternalServerError.__new__(openai.InternalServerError)
+        err.response = response
+        err.status_code = status_code
+        err.message = "Server error"
+        err.body = None
+        return err
+    if error_cls is openai.APIStatusError:
+        err = openai.APIStatusError.__new__(openai.APIStatusError)
+        err.response = response
+        err.status_code = status_code
+        err.message = "API error"
+        err.body = None
+        return err
+    return error_cls()
+
+
+class TestVertexAIErrorTranslation:
+    """Test VertexAIProvider chat() error translation via _translate_error."""
+
+    @pytest.mark.parametrize(
+        ("openai_error_cls", "dobby_error_cls", "status_code"),
+        [
+            (openai.RateLimitError, RateLimitError, 429),
+            (openai.APITimeoutError, APITimeoutError, 500),
+            (openai.APIConnectionError, APIConnectionError, 500),
+            (openai.InternalServerError, InternalServerError, 502),
+            (openai.APIStatusError, ProviderError, 403),
+        ],
+    )
+    def test_chat_translates_openai_errors(
+        self,
+        openai_error_cls: type[Exception],
+        dobby_error_cls: type[ProviderError],
+        status_code: int,
+    ) -> None:
+        provider = _make_chat_provider()
+        native_err = _make_openai_error(openai_error_cls, status_code)
+        provider._client.chat.completions.create = AsyncMock(side_effect=native_err)
+
+        async def _run() -> None:
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False
+            )
+
+        with pytest.raises(dobby_error_cls) as exc_info:
+            asyncio.run(_run())
+
+        assert exc_info.value.provider == "vertexai"
+        assert exc_info.value.__cause__ is native_err
+
+
+# ---------------------------------------------------------------------------
+# chat(stream=True) dispatch tests
+# ---------------------------------------------------------------------------
+
+
+class TestStreamChatCompletionDispatch:
+    """Test chat()'s dispatch to the not-yet-implemented streaming path."""
+
+    def test_stream_true_raises_not_implemented(self) -> None:
+        provider = _make_chat_provider()
+
+        async def _run() -> None:
+            stream = await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=True
+            )
+            async for _ in stream:
+                pass
+
+        with pytest.raises(NotImplementedError):
+            asyncio.run(_run())
