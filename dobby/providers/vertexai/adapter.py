@@ -11,11 +11,13 @@ bearer token transparently on every request via the OpenAI SDK's native async-ca
 import asyncio
 from collections.abc import AsyncIterator, Iterable, Sequence
 import json
+import os
 from typing import Any, Literal, NoReturn, overload
 
 import google.auth
 import google.auth.credentials
 import google.auth.transport.requests
+from google.oauth2 import service_account
 import openai
 from openai import AsyncOpenAI
 
@@ -46,6 +48,11 @@ from ..base import (
 from .converters import to_vertexai_messages
 
 __all__ = ["VertexAIProvider"]
+
+# Env var carrying a full service-account key as a stringified JSON blob — lets
+# credentials be injected as a single secret (e.g. from a secret manager) rather
+# than a key file on disk. Only consulted when `credentials` isn't passed explicitly.
+_CREDENTIALS_JSON_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
 
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
 # onto Dobby's StopReason. "tool_calls" is included for completeness, but
@@ -98,11 +105,13 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     `POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/
     {location}/endpoints/openapi/chat/completions`.
 
-    Auth is via Application Default Credentials (ADC) by default, or an explicitly
-    supplied `google.auth.credentials.Credentials` object. The bearer token is kept
-    fresh across calls by passing a bound async method as the OpenAI SDK's `api_key`
-    parameter — the SDK invokes it before every request (including retries, streaming
-    and non-streaming), so no manual header injection or eager refresh is needed.
+    Auth resolves, in order: an explicitly supplied `google.auth.credentials.Credentials`
+    object; a stringified service-account key in the `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+    env var (no key file needed — suits secret-manager-style injection in prod); or
+    Application Default Credentials (ADC) via `google.auth.default()`. The bearer token
+    is kept fresh across calls by passing a bound async method as the OpenAI SDK's
+    `api_key` parameter — the SDK invokes it before every request (including retries,
+    streaming and non-streaming), so no manual header injection or eager refresh is needed.
 
     Attributes:
         project: GCP project ID.
@@ -131,7 +140,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     def __init__(
         self,
         model: str,
-        project: str,
+        project: str | None = None,
         location: str = "us-central1",
         credentials: google.auth.credentials.Credentials | None = None,
         scopes: Sequence[str] | None = None,
@@ -142,32 +151,63 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         Args:
             model: Publisher-qualified model id (e.g. "meta/llama-3.1-405b-instruct-maas"),
                 forwarded verbatim — no hardcoded allow-list.
-            project: GCP project ID.
+            project: GCP project ID. When omitted, derived from the resolved credentials'
+                `project_id` (service-account credentials only — from `GOOGLE_APPLICATION_CREDENTIALS_JSON`,
+                a key file, or a directly-supplied service-account `credentials` object) or
+                from ADC's own project resolution. Required explicitly for credential types
+                that carry no project (e.g. user ADC without a set quota project).
             location: GCP location (default: "us-central1").
-            credentials: Pre-built credentials object. When omitted, resolved via
-                `google.auth.default(scopes=scopes)` at construction time.
-            scopes: OAuth scopes forwarded to `google.auth.default()`. Only used when
+            credentials: Pre-built credentials object. When omitted, resolution falls
+                back to the `GOOGLE_APPLICATION_CREDENTIALS_JSON` env var (a stringified
+                service-account key, for secret-manager-style injection with no key file
+                on disk) and finally to `google.auth.default(scopes=scopes)` (ADC).
+            scopes: OAuth scopes forwarded to credential construction. Only used when
                 `credentials` is not supplied. Defaults to google-auth's own default
                 resolution (typically the broad `cloud-platform` scope) — pass a
                 narrower list for least-privilege where the ADC source supports it.
+                Required (non-None) when falling back to `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+                or a service-account key file — those credential types have no
+                implicit scope and requests fail with `invalid_scope` otherwise.
             max_retries: Maximum retry attempts for transient errors (default: 3).
+
+        Raises:
+            ValueError: `project` is omitted and can't be derived from the resolved
+                credentials.
         """
         self._model = model
-        self.project = project
         self.location = location
         self.scopes = scopes
         self.max_retries = max_retries
 
+        resolved_project = project
         if credentials is not None:
             self._credentials = credentials
+            if resolved_project is None:
+                resolved_project = getattr(credentials, "project_id", None)
+        elif credentials_json := os.environ.get(_CREDENTIALS_JSON_ENV_VAR):
+            info = json.loads(credentials_json)
+            self._credentials = service_account.Credentials.from_service_account_info(
+                info, scopes=scopes
+            )
+            if resolved_project is None:
+                resolved_project = info.get("project_id")
         else:
-            self._credentials, _ = google.auth.default(scopes=scopes)
+            self._credentials, adc_project = google.auth.default(scopes=scopes)
+            if resolved_project is None:
+                resolved_project = adc_project
+
+        if resolved_project is None:
+            raise ValueError(
+                "project could not be determined automatically for the resolved "
+                "credentials — pass `project=` explicitly."
+            )
+        self.project = resolved_project
 
         self._refresh_lock = asyncio.Lock()
 
         self._client = AsyncOpenAI(
             base_url=(
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}"
+                f"https://{location}-aiplatform.googleapis.com/v1/projects/{self.project}"
                 f"/locations/{location}/endpoints/openapi"
             ),
             api_key=self._bearer_token,
