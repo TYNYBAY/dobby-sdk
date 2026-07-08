@@ -473,7 +473,6 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
         # index -> {"id": str | None, "name": str | None, "arguments": str}
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
-        tool_call_order: list[int] = []
         accumulated_arguments_length = 0
 
         # Iterate manually so mid-stream transport errors route through the same
@@ -557,7 +556,6 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                             "name": None,
                             "arguments": "",
                         }
-                        tool_call_order.append(index)
                     acc = tool_call_accumulator[index]
 
                     # Idempotent set-if-present merge, not "only first chunk":
@@ -582,8 +580,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         # once the whole stream has ended — Chat Completions has no per-index
         # completion signal, and third-party servers may still add id/name to
         # an index on a later chunk (see the idempotent merge above).
-        for index in tool_call_order:
-            acc = tool_call_accumulator[index]
+        for acc in tool_call_accumulator.values():
             tool_event = ToolUseEvent(
                 id=acc["id"] or "",
                 name=acc["name"] or "",
@@ -595,7 +592,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             )
 
         stop_reason: StopReason = (
-            "tool_use" if tool_call_order else _map_finish_reason(finish_reason)
+            "tool_use" if tool_call_accumulator else _map_finish_reason(finish_reason)
         )
 
         yield StreamEndEvent(
