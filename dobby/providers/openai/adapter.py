@@ -327,7 +327,13 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
 
         if stream:
             return self._stream_chat_completion(
-                openai_messages, temperature, target_model, tools, reasoning_effort, max_tokens, kwargs
+                openai_messages,
+                temperature,
+                target_model,
+                tools,
+                reasoning_effort,
+                max_tokens,
+                kwargs,
             )
 
         return await self._non_stream_chat_completion(
@@ -601,9 +607,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                         else None
                     )
                     stop_reason = (
-                        "max_tokens"
-                        if incomplete_reason == "max_output_tokens"
-                        else "end_turn"
+                        "max_tokens" if incomplete_reason == "max_output_tokens" else "end_turn"
                     )
 
                     usage_data = None

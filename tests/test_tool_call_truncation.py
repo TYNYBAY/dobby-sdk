@@ -16,14 +16,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from dobby.providers.openai.adapter import OpenAIProvider
-from dobby.providers.gemini.adapter import GeminiProvider
 
 from dobby.providers.base import (
     RETRYABLE_ERRORS,
     ProviderError,
     ToolCallTruncatedError,
 )
+from dobby.providers.gemini.adapter import GeminiProvider
+from dobby.providers.openai.adapter import OpenAIProvider
 from dobby.types import (
     StreamEndEvent,
     ToolUseErrorEvent,
@@ -65,9 +65,7 @@ class TestTruncationContract:
         assert ToolCallTruncatedError not in RETRYABLE_ERRORS
 
     def test_event_is_discriminated(self) -> None:
-        event = ToolUseErrorEvent(
-            id="call_1", name="get_weather", raw_arguments="{", error="boom"
-        )
+        event = ToolUseErrorEvent(id="call_1", name="get_weather", raw_arguments="{", error="boom")
         assert event.type == "tool_use_error"
 
 
@@ -77,8 +75,6 @@ class TestTruncationContract:
 
 
 def _make_openai_provider() -> "object":
-    
-
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider.api_key = "test"
     provider.base_url = None
@@ -134,6 +130,7 @@ def _openai_stream_events(tool_items, terminal="completed"):
             )
         )
     return events
+
 
 class TestOpenAIStreamingTruncation:
     """Streaming truncation yields ToolUseErrorEvent, stream still completes."""
@@ -249,9 +246,7 @@ class TestOpenAINonStreamingTruncation:
         provider._client.responses.create = AsyncMock(return_value=response)
 
         async def run():
-            return await provider._non_stream_chat_completion(
-                [], "gpt-4", None, None, None
-            )
+            return await provider._non_stream_chat_completion([], "gpt-4", None, None, None)
 
         with pytest.raises(ToolCallTruncatedError) as exc_info:
             asyncio.run(run())
@@ -267,7 +262,6 @@ class TestOpenAINonStreamingTruncation:
 
 
 def _make_gemini_provider() -> "object":
-
     provider = GeminiProvider.__new__(GeminiProvider)
     provider.api_key = "test"
     provider.vertexai = False
@@ -309,7 +303,7 @@ class TestGeminiNonStreamingTruncation:
         response = _gemini_response("MAX_TOKENS", [_gemini_function_call_part()])
 
         with pytest.raises(ToolCallTruncatedError) as exc_info:
-            provider._parse_response(response)
+            provider._parse_response(response, "gemini-2.5-flash")
 
         assert exc_info.value.tool_name == "get_weather"
         assert exc_info.value.provider == "gemini"
@@ -319,7 +313,7 @@ class TestGeminiNonStreamingTruncation:
         provider = _make_gemini_provider()
         response = _gemini_response("STOP", [_gemini_function_call_part()])
 
-        result = provider._parse_response(response)
+        result = provider._parse_response(response, "gemini-2.5-flash")
         assert result.stop_reason == "tool_use"
         assert any(isinstance(p, ToolUsePart) for p in result.parts)
 
@@ -347,7 +341,7 @@ class TestGeminiStreamingTruncation:
 
         async def run():
             collected = []
-            async for event in provider._stream_chat_completion(None, None):
+            async for event in provider._stream_chat_completion(None, None, "gemini-2.5-flash"):
                 collected.append(event)
             return collected
 

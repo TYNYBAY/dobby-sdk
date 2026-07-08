@@ -30,9 +30,9 @@ from dotenv import load_dotenv
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+from dobby.providers.base import ToolCallTruncatedError
 from dobby.providers.gemini import GeminiProvider
 from dobby.providers.openai import OpenAIProvider
-from dobby.providers.base import ToolCallTruncatedError
 from dobby.types import (
     StreamEndEvent,
     TextPart,
@@ -85,28 +85,38 @@ async def _run_streaming(provider, tools) -> None:
         ):
             if isinstance(event, ToolUseErrorEvent):
                 saw_error_event = True
-                print(f"    ✓ ToolUseErrorEvent: name={event.name!r} "
-                      f"error={event.error!r} raw={event.raw_arguments!r:.60}")
+                print(
+                    f"    ✓ ToolUseErrorEvent: name={event.name!r} "
+                    f"error={event.error!r} raw={event.raw_arguments!r:.60}"
+                )
             elif isinstance(event, StreamEndEvent):
                 saw_stream_end = True
-                print(f"    · StreamEndEvent stop_reason={event.stop_reason} "
-                      f"(broken tool absent from parts: "
-                      f"{not any(getattr(p, 'name', None) == TOOL_NAME for p in event.parts)})")
+                print(
+                    f"    · StreamEndEvent stop_reason={event.stop_reason} "
+                    f"(broken tool absent from parts: "
+                    f"{not any(getattr(p, 'name', None) == TOOL_NAME for p in event.parts)})"
+                )
     except json.JSONDecodeError as e:
         # This is the regression R1 prevents: truncated JSON escaped the generator.
-        print(f"    ✗ FAIL: stream leaked JSONDecodeError: {e} "
-              f"(should have yielded ToolUseErrorEvent instead)")
+        print(
+            f"    ✗ FAIL: stream leaked JSONDecodeError: {e} "
+            f"(should have yielded ToolUseErrorEvent instead)"
+        )
         return
     except Exception as e:  # noqa: BLE001 — setup/connection error, not a truncation bug
-        print(f"    ⚠ stream errored ({type(e).__name__}: {e}) — likely a key/network/"
-              f"model issue, not a truncation regression")
+        print(
+            f"    ⚠ stream errored ({type(e).__name__}: {e}) — likely a key/network/"
+            f"model issue, not a truncation regression"
+        )
         return
 
     if saw_error_event and saw_stream_end:
         print("    PASS: error surfaced as event, stream still completed.")
     elif saw_stream_end:
-        print("    NOTE: stream completed but no truncation event — model may not "
-              "have truncated mid-arguments. Try lowering TINY_MAX_TOKENS.")
+        print(
+            "    NOTE: stream completed but no truncation event — model may not "
+            "have truncated mid-arguments. Try lowering TINY_MAX_TOKENS."
+        )
     else:
         print("    ✗ FAIL: stream did not complete cleanly.")
 
@@ -117,16 +127,22 @@ async def _run_non_streaming(provider, tools) -> None:
             _messages(), stream=False, tools=tools, max_tokens=TINY_MAX_TOKENS
         )
     except ToolCallTruncatedError as e:
-        print(f"    ✓ PASS: raised ToolCallTruncatedError "
-              f"(tool={e.tool_name!r}, id={e.tool_id!r}, provider={e.provider!r})")
+        print(
+            f"    ✓ PASS: raised ToolCallTruncatedError "
+            f"(tool={e.tool_name!r}, id={e.tool_id!r}, provider={e.provider!r})"
+        )
         return
     except Exception as e:  # noqa: BLE001 — setup/connection error, not a truncation bug
-        print(f"    ⚠ call errored ({type(e).__name__}: {e}) — likely a key/network/"
-              f"model issue, not a truncation regression")
+        print(
+            f"    ⚠ call errored ({type(e).__name__}: {e}) — likely a key/network/"
+            f"model issue, not a truncation regression"
+        )
         return
 
-    print(f"    NOTE: returned normally (stop_reason={result.stop_reason}) — model "
-          "may not have truncated mid-arguments. Try lowering TINY_MAX_TOKENS.")
+    print(
+        f"    NOTE: returned normally (stop_reason={result.stop_reason}) — model "
+        "may not have truncated mid-arguments. Try lowering TINY_MAX_TOKENS."
+    )
 
 
 async def demo_openai() -> None:
@@ -134,15 +150,16 @@ async def demo_openai() -> None:
         print("OpenAI: skipped (set OPENAI_API_KEY to run)\n")
         return
 
-
     provider = OpenAIProvider(model="gpt-4.1-nano")
     # OpenAI Responses-API native function-tool shape.
-    tools = [{
-        "type": "function",
-        "name": TOOL_NAME,
-        "description": TOOL_DESCRIPTION,
-        "parameters": TOOL_PARAMETERS,
-    }]
+    tools = [
+        {
+            "type": "function",
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "parameters": TOOL_PARAMETERS,
+        }
+    ]
 
     print("=== OpenAI (Responses API) ===")
     print("  streaming:")
@@ -157,16 +174,19 @@ async def demo_gemini() -> None:
         print("Gemini: skipped (set GEMINI_API_KEY to run)\n")
         return
 
-
     provider = GeminiProvider(model="gemini-2.5-flash-lite")
     # Gemini native function-declaration shape.
-    tools = [{
-        "function_declarations": [{
-            "name": TOOL_NAME,
-            "description": TOOL_DESCRIPTION,
-            "parameters": TOOL_PARAMETERS,
-        }]
-    }]
+    tools = [
+        {
+            "function_declarations": [
+                {
+                    "name": TOOL_NAME,
+                    "description": TOOL_DESCRIPTION,
+                    "parameters": TOOL_PARAMETERS,
+                }
+            ]
+        }
+    ]
 
     print("=== Gemini ===")
     print("  streaming:")

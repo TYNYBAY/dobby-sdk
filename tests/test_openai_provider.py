@@ -84,7 +84,7 @@ class TestOpenAIChatModelOverride:
             return resp
 
         provider._client.responses.create = fake_create
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             provider.chat(
                 messages=[UserMessagePart(parts=[TextPart(text="hi")])],
                 **chat_kwargs,

@@ -127,9 +127,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                     "Pass either api_key or azure_ad_token_provider for Azure, not both."
                 )
             if resource and base_url:
-                raise ValueError(
-                    "Pass either resource or base_url for Azure, not both."
-                )
+                raise ValueError("Pass either resource or base_url for Azure, not both.")
 
             # resource and base_url are mutually exclusive in AsyncAnthropicFoundry.
             # Pass only whichever is set; the SDK constructs the URL from resource
@@ -411,17 +409,13 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                 case "text":
                     parts.append(TextPart(text=block.text))
                 case "thinking":
-                    parts.append(
-                        ReasoningPart(text=block.thinking, signature=block.signature)
-                    )
+                    parts.append(ReasoningPart(text=block.thinking, signature=block.signature))
                 case "redacted_thinking":
                     # Opaque encrypted reasoning; preserve verbatim so multi-turn
                     # thinking continuity survives the round-trip.
                     parts.append(ReasoningPart(text=block.data, redacted=True))
                 case "tool_use":
-                    parts.append(
-                        ToolUsePart(id=block.id, name=block.name, inputs=block.input)
-                    )
+                    parts.append(ToolUsePart(id=block.id, name=block.name, inputs=block.input))
                 case _:
                     logger.debug(f"Unhandled content block type: {block.type}")
 
@@ -438,9 +432,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                 cache_creation_input_tokens=getattr(
                     response.usage, "cache_creation_input_tokens", None
                 ),
-                cache_read_input_tokens=getattr(
-                    response.usage, "cache_read_input_tokens", None
-                ),
+                cache_read_input_tokens=getattr(response.usage, "cache_read_input_tokens", None),
             )
 
         return StreamEndEvent(
@@ -579,7 +571,9 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
                     if current_block_type == "thinking":
                         yield ReasoningEndEvent(type="reasoning_end")
                     elif current_block_type == "tool_use":
-                        tool_inputs = json.loads(current_tool_input_json) if current_tool_input_json else {}
+                        tool_inputs = (
+                            json.loads(current_tool_input_json) if current_tool_input_json else {}
+                        )
                         tool_event = ToolUseEvent(
                             id=current_tool_id or "",
                             name=current_tool_name or "",
@@ -678,13 +672,9 @@ def to_anthropic_messages(messages: Iterable[MessagePart]) -> list[dict[str, Any
                                     "input": inputs,
                                 }
                             )
-                        case ReasoningPart(
-                            text=text, signature=signature, redacted=redacted
-                        ):
+                        case ReasoningPart(text=text, signature=signature, redacted=redacted):
                             if redacted:
-                                content.append(
-                                    {"type": "redacted_thinking", "data": text}
-                                )
+                                content.append({"type": "redacted_thinking", "data": text})
                             else:
                                 block: dict[str, Any] = {
                                     "type": "thinking",

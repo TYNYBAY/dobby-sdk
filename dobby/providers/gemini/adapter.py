@@ -5,8 +5,8 @@ Google's Gemini API via the google-genai SDK.
 """
 
 import base64
-import json
 from collections.abc import AsyncIterator, Iterable
+import json
 from typing import Any, Literal, NoReturn, overload
 
 from google import genai
@@ -159,9 +159,7 @@ class GeminiProvider(Provider[genai.Client]):
                 ) from e
             case gemini_errors.ClientError():
                 status = getattr(e, "status", None)
-                raise DobbyProviderError(
-                    str(e), provider=self.name, status_code=status
-                ) from e
+                raise DobbyProviderError(str(e), provider=self.name, status_code=status) from e
             case _:
                 raise DobbyProviderError(str(e), provider=self.name) from e
 
@@ -238,7 +236,7 @@ class GeminiProvider(Provider[genai.Client]):
             config.system_instruction = system_prompt
 
         if tools:
-            config.tools = tools # type: ignore[assignment]
+            config.tools = tools  # type: ignore[assignment]
 
         if max_tokens is not None:
             config.max_output_tokens = max_tokens
@@ -327,7 +325,7 @@ class GeminiProvider(Provider[genai.Client]):
                         parts.append(
                             ToolUsePart(
                                 id=part.function_call.id or f"call_{part.function_call.name}",
-                                name=part.function_call.name, # type: ignore[assignment]
+                                name=part.function_call.name,  # type: ignore[assignment]
                                 inputs=dict(func_args) if func_args else {},
                                 metadata={"signature": signature},
                             )
@@ -338,9 +336,7 @@ class GeminiProvider(Provider[genai.Client]):
         # error. Conservatively treat any tool call under MAX_TOKENS as truncated
         # and surface a typed error instead of executing the tool on partial input.
         if truncated:
-            truncated_tool = next(
-                (p for p in parts if isinstance(p, ToolUsePart)), None
-            )
+            truncated_tool = next((p for p in parts if isinstance(p, ToolUsePart)), None)
             if truncated_tool is not None:
                 raise ToolCallTruncatedError(
                     f"Tool call '{truncated_tool.name}' was truncated by max_tokens",
@@ -470,12 +466,14 @@ class GeminiProvider(Provider[genai.Client]):
                                 # Per https://cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures#using-rest-or-manual-handling:
                                 # > You can set thought_signature to skip_thought_signature_validator
                                 # We use "skip_thought_signature_validator" as it works for both Gemini API and Vertex AI.
-                                sig_bytes = part.thought_signature or b"skip_thought_signature_validator"
+                                sig_bytes = (
+                                    part.thought_signature or b"skip_thought_signature_validator"
+                                )
                                 signature = base64.b64encode(sig_bytes).decode("utf-8")
 
                                 tool_event = ToolUseEvent(
                                     id=part.function_call.id or f"call_{part.function_call.name}",
-                                    name=part.function_call.name, # type: ignore[assignment]
+                                    name=part.function_call.name,  # type: ignore[assignment]
                                     inputs=dict(func_args) if func_args else {},
                                     metadata={"signature": signature},
                                 )
@@ -495,8 +493,6 @@ class GeminiProvider(Provider[genai.Client]):
                     metadata=tool_event.metadata,
                 )
             )
-
-
 
         # If tools were called, override the stop reason
         if function_calls:

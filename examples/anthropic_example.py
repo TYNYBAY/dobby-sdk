@@ -11,7 +11,6 @@ from dobby.types import (
     StreamStartEvent,
     TextDeltaEvent,
     TextPart,
-    ToolUseEvent,
     UserMessagePart,
 )
 

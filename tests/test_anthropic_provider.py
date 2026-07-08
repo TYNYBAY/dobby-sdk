@@ -33,7 +33,9 @@ class TestAnthropicErrorTranslation:
         provider._client = MagicMock()
         return provider
 
-    def _make_anthropic_error(self, error_cls, status_code: int = 500, headers: dict | None = None):
+    def _make_anthropic_error(
+        self, error_cls, status_code: int = 500, headers: dict | None = None
+    ):
         """Create a mock Anthropic SDK error."""
         import anthropic
 
@@ -215,9 +217,7 @@ class TestToAnthropicMessages:
         from dobby.types import AssistantMessagePart, ReasoningPart
 
         messages = [
-            AssistantMessagePart(
-                parts=[ReasoningPart(text="Let me think...", signature="sig123")]
-            )
+            AssistantMessagePart(parts=[ReasoningPart(text="Let me think...", signature="sig123")])
         ]
         result = to_anthropic_messages(messages)
 
@@ -325,7 +325,10 @@ class TestAnthropicConverters:
         from dobby.types import Base64PDFSource, DocumentPart
 
         result = content_part_to_anthropic(
-            DocumentPart(source=Base64PDFSource(data="pdfdata", media_type="application/pdf"), filename="doc.pdf")
+            DocumentPart(
+                source=Base64PDFSource(data="pdfdata", media_type="application/pdf"),
+                filename="doc.pdf",
+            )
         )
         assert result == {
             "type": "document",
@@ -422,9 +425,7 @@ class TestAnthropicErrorChaining:
         import anthropic
 
         provider = TestAnthropicErrorTranslation()._make_provider()
-        native = TestAnthropicErrorTranslation()._make_anthropic_error(
-            anthropic.RateLimitError
-        )
+        native = TestAnthropicErrorTranslation()._make_anthropic_error(anthropic.RateLimitError)
 
         with pytest.raises(RateLimitError) as exc_info:
             provider._translate_error(native)
@@ -467,7 +468,7 @@ class TestAnthropicReasoningEffort:
         provider = self._make_provider()
 
         with pytest.raises(TypeError, match="requires reasoning_effort as int"):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 provider.chat(
                     messages=[],
                     reasoning_effort="low",
@@ -557,23 +558,17 @@ class TestRedactedThinking:
         from dobby.types import AssistantMessagePart, ReasoningPart
 
         messages = [
-            AssistantMessagePart(
-                parts=[ReasoningPart(text="ENCRYPTED_BLOB", redacted=True)]
-            )
+            AssistantMessagePart(parts=[ReasoningPart(text="ENCRYPTED_BLOB", redacted=True)])
         ]
         result = to_anthropic_messages(messages)
 
-        assert result[0]["content"] == [
-            {"type": "redacted_thinking", "data": "ENCRYPTED_BLOB"}
-        ]
+        assert result[0]["content"] == [{"type": "redacted_thinking", "data": "ENCRYPTED_BLOB"}]
 
     def test_normal_reasoning_still_emits_thinking_block(self) -> None:
         from dobby.providers.anthropic.adapter import to_anthropic_messages
         from dobby.types import AssistantMessagePart, ReasoningPart
 
-        messages = [
-            AssistantMessagePart(parts=[ReasoningPart(text="thinking", signature="s")])
-        ]
+        messages = [AssistantMessagePart(parts=[ReasoningPart(text="thinking", signature="s")])]
         result = to_anthropic_messages(messages)
 
         assert result[0]["content"] == [
@@ -646,7 +641,7 @@ class TestChatModelOverride:
             return resp
 
         provider._client.messages.create = fake_create
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             provider.chat(
                 messages=[UserMessagePart(parts=[TextPart(text="hi")])],
                 **chat_kwargs,
@@ -688,11 +683,9 @@ class TestChatModelOverride:
             return resp
 
         provider._client.messages.create = fake_create
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])])
         )
-        redacted = [
-            p for p in result.parts if isinstance(p, ReasoningPart) and p.redacted
-        ]
+        redacted = [p for p in result.parts if isinstance(p, ReasoningPart) and p.redacted]
         assert len(redacted) == 1
         assert redacted[0].text == "ENC"

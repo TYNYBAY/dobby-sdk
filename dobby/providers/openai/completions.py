@@ -374,7 +374,9 @@ def _msg_role(message: MessagePart) -> str | None:
 
 def _msg_parts(message: MessagePart):
     """Get parts from MessagePart (dataclass or dict)."""
-    return getattr(message, "parts", None) if hasattr(message, "parts") else message.get("parts", [])
+    return (
+        getattr(message, "parts", None) if hasattr(message, "parts") else message.get("parts", [])
+    )
 
 
 def _part_type(part: Any) -> str | None:
@@ -428,9 +430,15 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
                 if part_type == "text":
                     content_parts.append({"type": "text", "text": _part_text(part)})
                 elif part_type == "tool_use":
-                    pid = getattr(part, "id", None) or (part.get("id") if isinstance(part, dict) else None)
-                    pname = getattr(part, "name", None) or (part.get("name") if isinstance(part, dict) else None)
-                    pinputs = getattr(part, "inputs", None) or (part.get("inputs", {}) if isinstance(part, dict) else {})
+                    pid = getattr(part, "id", None) or (
+                        part.get("id") if isinstance(part, dict) else None
+                    )
+                    pname = getattr(part, "name", None) or (
+                        part.get("name") if isinstance(part, dict) else None
+                    )
+                    pinputs = getattr(part, "inputs", None) or (
+                        part.get("inputs", {}) if isinstance(part, dict) else {}
+                    )
                     tool_calls.append(
                         {
                             "type": "function",
@@ -456,17 +464,33 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
                 if part_type == "text":
                     content_parts_user.append({"type": "text", "text": _part_text(part)})
                 elif part_type == "image":
-                    source = getattr(part, "source", None) or (part.get("source") if isinstance(part, dict) else None)
+                    source = getattr(part, "source", None) or (
+                        part.get("source") if isinstance(part, dict) else None
+                    )
                     if source:
-                        url = getattr(source, "url", None) or (source.get("url") if isinstance(source, dict) else None)
-                        stype = getattr(source, "type", None) or (source.get("type") if isinstance(source, dict) else None)
+                        url = getattr(source, "url", None) or (
+                            source.get("url") if isinstance(source, dict) else None
+                        )
+                        stype = getattr(source, "type", None) or (
+                            source.get("type") if isinstance(source, dict) else None
+                        )
                         if stype == "url" and url:
                             image_url = url
                         else:
-                            media_type = source.get("media_type", "") if isinstance(source, dict) else getattr(source, "media_type", "")
-                            data = source.get("data", "") if isinstance(source, dict) else getattr(source, "data", "")
+                            media_type = (
+                                source.get("media_type", "")
+                                if isinstance(source, dict)
+                                else getattr(source, "media_type", "")
+                            )
+                            data = (
+                                source.get("data", "")
+                                if isinstance(source, dict)
+                                else getattr(source, "data", "")
+                            )
                             image_url = f"data:{media_type};base64,{data}"
-                        content_parts_user.append({"type": "image_url", "image_url": {"url": image_url}})
+                        content_parts_user.append(
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        )
                 elif part_type == "document":
                     raise NotImplementedError("Documents not supported by Chat Completions API")
 
@@ -476,12 +500,16 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
         elif role == "tool_result":
             text_parts = [_part_text(p) for p in parts if _part_type(p) == "text"]
             content_text = "\n".join(text_parts)
-            is_error = getattr(message, "is_error", False) if hasattr(message, "is_error") else message.get("is_error", False)
-            tool_use_id = getattr(message, "tool_use_id", None) or (message.get("tool_use_id") if isinstance(message, dict) else None)
+            is_error = (
+                getattr(message, "is_error", False)
+                if hasattr(message, "is_error")
+                else message.get("is_error", False)
+            )
+            tool_use_id = getattr(message, "tool_use_id", None) or (
+                message.get("tool_use_id") if isinstance(message, dict) else None
+            )
             tool_content = (
-                content_text
-                if not is_error
-                else f"Failed to execute tool: \n{content_text}"
+                content_text if not is_error else f"Failed to execute tool: \n{content_text}"
             )
             openai_messages.append(
                 {

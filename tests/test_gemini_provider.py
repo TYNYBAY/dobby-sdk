@@ -30,7 +30,7 @@ class TestGeminiChatModelOverride:
             return resp
 
         provider._client.aio.models.generate_content = fake_generate
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             provider.chat(
                 messages=[UserMessagePart(parts=[TextPart(text="hi")])],
                 **chat_kwargs,
