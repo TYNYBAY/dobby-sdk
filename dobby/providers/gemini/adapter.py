@@ -5,6 +5,7 @@ Google's Gemini API via the google-genai SDK.
 """
 
 import base64
+import json
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, Literal, NoReturn, overload
 
@@ -24,6 +25,7 @@ from ...types import (
     StreamStartEvent,
     TextDeltaEvent,
     TextPart,
+    ToolUseErrorEvent,
     ToolUseEvent,
     ToolUsePart,
     Usage,
@@ -35,6 +37,7 @@ from ..base import (
     Provider,
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
+    ToolCallTruncatedError,
 )
 from .converters import to_gemini_messages
 
@@ -274,6 +277,7 @@ class GeminiProvider(Provider[genai.Client]):
         """
         parts: list[ResponsePart] = []
         stop_reason: StopReason = "end_turn"
+        truncated = False
 
         # Extract parts from the response
         if response.candidates:
@@ -286,6 +290,7 @@ class GeminiProvider(Provider[genai.Client]):
                         stop_reason = "end_turn"
                     case "MAX_TOKENS":
                         stop_reason = "max_tokens"
+                        truncated = True
                     case "SAFETY":
                         stop_reason = "content_filter"
                     case _:
@@ -314,6 +319,23 @@ class GeminiProvider(Provider[genai.Client]):
                                 metadata={"signature": signature},
                             )
                         )
+
+        # Gemini parses tool args server-side (no client-side json.loads), so a
+        # max_tokens cutoff yields a partial/empty `args` dict rather than a parse
+        # error. Conservatively treat any tool call under MAX_TOKENS as truncated
+        # and surface a typed error instead of executing the tool on partial input.
+        if truncated:
+            truncated_tool = next(
+                (p for p in parts if isinstance(p, ToolUsePart)), None
+            )
+            if truncated_tool is not None:
+                raise ToolCallTruncatedError(
+                    f"Tool call '{truncated_tool.name}' was truncated by max_tokens",
+                    provider=self.name,
+                    tool_name=truncated_tool.name,
+                    tool_id=truncated_tool.id,
+                    partial_inputs=truncated_tool.inputs,
+                )
 
         # Extract usage
         usage: Usage | None = None
@@ -394,6 +416,7 @@ class GeminiProvider(Provider[genai.Client]):
             # Process candidates
             if chunk.candidates:
                 for candidate in chunk.candidates:
+                    candidate_truncated = False
                     # Capture finish reason from the final candidate chunk
                     if candidate.finish_reason:
                         match candidate.finish_reason:
@@ -401,6 +424,7 @@ class GeminiProvider(Provider[genai.Client]):
                                 stop_reason = "end_turn"
                             case "MAX_TOKENS":
                                 stop_reason = "max_tokens"
+                                candidate_truncated = True
                             case "SAFETY":
                                 stop_reason = "content_filter"
 
@@ -411,6 +435,20 @@ class GeminiProvider(Provider[genai.Client]):
                                 yield TextDeltaEvent(delta=part.text)
                             elif part.function_call:
                                 func_args = part.function_call.args
+                                # A max_tokens cutoff leaves partial/empty args.
+                                # Surface a typed event and keep the stream alive
+                                # rather than emitting a tool call on partial input.
+                                if candidate_truncated:
+                                    yield ToolUseErrorEvent(
+                                        id=part.function_call.id
+                                        or f"call_{part.function_call.name}",
+                                        name=part.function_call.name or "",
+                                        raw_arguments=(
+                                            json.dumps(dict(func_args)) if func_args else ""
+                                        ),
+                                        error="Tool call truncated by max_tokens",
+                                    )
+                                    continue
                                 # Per https://ai.google.dev/gemini-api/docs/thought-signatures#faqs:
                                 # > You can set the following dummy signatures of either "context_engineering_is_the_way_to_go"
                                 # > or "skip_thought_signature_validator"

@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.16] - 2026-06-08
+
+### Added
+- Defensive handling of `max_tokens`-truncated tool calls on the OpenAI (Responses API) and Gemini providers. When a tool call's arguments are cut off by the token limit, the SDK now surfaces a clear, catchable signal instead of crashing the stream or silently executing a tool on partial input:
+  - `ToolUseErrorEvent` (new `StreamEvent`) is yielded during streaming; the stream still completes with a `StreamEndEvent`, and any valid tool call in the same stream is still delivered.
+  - `ToolCallTruncatedError` (new `ProviderError` subclass) is raised on the non-streaming path. It is intentionally **not** retryable — truncation is deterministic, so retrying with the same `max_tokens` reproduces it.
+- `examples/tool_call_truncation_demo.py` — live end-to-end demo that forces a real `max_tokens` truncation against OpenAI and Gemini and verifies the streaming/non-streaming behavior.
+- Regression tests (`tests/test_tool_call_truncation.py`) covering streaming truncation, mixed valid/invalid tool calls in one stream, the non-streaming raise, and an `response.incomplete`-terminated stream.
+
+### Fixed
+- OpenAI Responses streaming now handles the `response.incomplete` terminal event (e.g. a `max_output_tokens` cutoff). Previously only `response.completed` emitted a terminal `StreamEndEvent`, so a truncated stream ended without one. The cutoff is now mapped to `stop_reason="max_tokens"`.
+
+### Note for consumers
+- Downstream consumers matching on `event.type` should add a branch for `"tool_use_error"`, or it will fall through their dispatch silently.
+
 ## [0.2.15] - 2026-05-20
 
 ### Changed
