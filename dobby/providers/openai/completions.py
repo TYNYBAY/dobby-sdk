@@ -367,6 +367,30 @@ class OpenAICompletionsProvider:
                 return "end_turn"
 
 
+def _msg_role(message: MessagePart) -> str | None:
+    """Get role from MessagePart (dataclass or dict)."""
+    return getattr(message, "role", None) if hasattr(message, "role") else message.get("role")
+
+
+def _msg_parts(message: MessagePart):
+    """Get parts from MessagePart (dataclass or dict)."""
+    return getattr(message, "parts", None) if hasattr(message, "parts") else message.get("parts", [])
+
+
+def _part_type(part: Any) -> str | None:
+    """Get type/kind from a part (dataclass uses .kind, dict uses ['type'])."""
+    if hasattr(part, "kind"):
+        return getattr(part, "kind", None)
+    return part.get("type") if isinstance(part, dict) else None
+
+
+def _part_text(part: Any) -> str:
+    """Get text from a part."""
+    if hasattr(part, "text"):
+        return getattr(part, "text", "") or ""
+    return part.get("text", "") if isinstance(part, dict) else ""
+
+
 def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMessageParam]:
     """Convert provider-agnostic messages to OpenAI Chat Completions format.
 
@@ -377,8 +401,11 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
     - Tool results -> Tool role messages with tool_call_id
     - Images -> image_url content parts (base64 or URL)
 
+    Accepts both Dobby dataclass MessagePart (UserMessagePart, AssistantMessagePart)
+    and dict-style messages with "role" and "parts".
+
     Args:
-        messages: Iterable of MessagePart dictionaries with role and parts
+        messages: Iterable of MessagePart (dataclasses or dicts with role and parts)
 
     Returns:
         List of OpenAI-formatted message parameters
@@ -390,23 +417,27 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
     """
     openai_messages: list[ChatCompletionMessageParam] = []
     for message in messages:
-        if message["role"] == "assistant":
-            parts = message["parts"]
+        role = _msg_role(message)
+        parts = _msg_parts(message) or []
+        if role == "assistant":
             content_parts: list[ContentArrayOfContentPart] = []
             tool_calls: list[ChatCompletionMessageToolCallParam] = []
 
             for part in parts:
-                part_type = part["type"]
+                part_type = _part_type(part)
                 if part_type == "text":
-                    content_parts.append({"type": "text", "text": part["text"]})
+                    content_parts.append({"type": "text", "text": _part_text(part)})
                 elif part_type == "tool_use":
+                    pid = getattr(part, "id", None) or (part.get("id") if isinstance(part, dict) else None)
+                    pname = getattr(part, "name", None) or (part.get("name") if isinstance(part, dict) else None)
+                    pinputs = getattr(part, "inputs", None) or (part.get("inputs", {}) if isinstance(part, dict) else {})
                     tool_calls.append(
                         {
                             "type": "function",
-                            "id": part["id"],
+                            "id": pid,
                             "function": {
-                                "name": part["name"],
-                                "arguments": json.dumps(part["inputs"]),
+                                "name": pname,
+                                "arguments": json.dumps(pinputs),
                             },
                         }
                     )
@@ -417,42 +448,46 @@ def to_openai_messages(messages: Iterable[MessagePart]) -> list[ChatCompletionMe
             assistant_msg["tool_calls"] = tool_calls if tool_calls else None
             openai_messages.append(assistant_msg)
 
-        elif message["role"] == "user":
-            parts = message["parts"]
-            content_parts: list[ChatCompletionContentPartParam] = []
+        elif role == "user":
+            content_parts_user: list[ChatCompletionContentPartParam] = []
 
             for part in parts:
-                part_type = part["type"]
+                part_type = _part_type(part)
                 if part_type == "text":
-                    content_parts.append({"type": "text", "text": part["text"]})
+                    content_parts_user.append({"type": "text", "text": _part_text(part)})
                 elif part_type == "image":
-                    image_url = (
-                        part["source"]["url"]
-                        if part["source"]["type"] == "url"
-                        else f"data:{part['source']['media_type']};base64,{part['source']['data']}"
-                    )
-                    content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                    source = getattr(part, "source", None) or (part.get("source") if isinstance(part, dict) else None)
+                    if source:
+                        url = getattr(source, "url", None) or (source.get("url") if isinstance(source, dict) else None)
+                        stype = getattr(source, "type", None) or (source.get("type") if isinstance(source, dict) else None)
+                        if stype == "url" and url:
+                            image_url = url
+                        else:
+                            media_type = source.get("media_type", "") if isinstance(source, dict) else getattr(source, "media_type", "")
+                            data = source.get("data", "") if isinstance(source, dict) else getattr(source, "data", "")
+                            image_url = f"data:{media_type};base64,{data}"
+                        content_parts_user.append({"type": "image_url", "image_url": {"url": image_url}})
                 elif part_type == "document":
                     raise NotImplementedError("Documents not supported by Chat Completions API")
 
-            if content_parts:
-                openai_messages.append({"role": "user", "content": content_parts})
+            if content_parts_user:
+                openai_messages.append({"role": "user", "content": content_parts_user})
 
-        elif message["role"] == "tool_result":
-            # Extract text from TextPart content blocks
-            text_parts = [part["text"] for part in message["parts"] if part.get("type") == "text"]
+        elif role == "tool_result":
+            text_parts = [_part_text(p) for p in parts if _part_type(p) == "text"]
             content_text = "\n".join(text_parts)
+            is_error = getattr(message, "is_error", False) if hasattr(message, "is_error") else message.get("is_error", False)
+            tool_use_id = getattr(message, "tool_use_id", None) or (message.get("tool_use_id") if isinstance(message, dict) else None)
             tool_content = (
                 content_text
-                if not message["is_error"]
+                if not is_error
                 else f"Failed to execute tool: \n{content_text}"
             )
-
             openai_messages.append(
                 {
                     "role": "tool",
                     "content": tool_content,
-                    "tool_call_id": message["tool_use_id"],
+                    "tool_call_id": tool_use_id,
                 }
             )
 
