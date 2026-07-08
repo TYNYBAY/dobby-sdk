@@ -75,6 +75,12 @@ class Tool:
     """If True, executing this tool exits the agent loop and returns control to caller."""
     sequential: ClassVar[bool] = False
     """If True, forces sequential execution when this tool is in a parallel batch."""
+    edits_context: ClassVar[bool] = False
+    """If True, this tool compacts the conversation context when invoked.
+
+    The executor routes it through the summarize machinery instead of treating
+    its return value as an ordinary result (requires a ``context_policy``).
+    """
 
     # Auto-generated class variables (set by __init_subclass__)
     _parameters: ClassVar[list[ToolParameter]]
@@ -101,6 +107,13 @@ class Tool:
                         f"Tool '{cls.__name__}' has stream_output=True but __call__ "
                         "is not an async generator. Use 'async def' with 'yield'."
                     )
+
+            # Validate the edits_context flag is a bool
+            if not isinstance(getattr(cls, "edits_context", False), bool):
+                raise TypeError(
+                    f"Tool '{cls.__name__}' edits_context must be a bool, got "
+                    f"{type(cls.edits_context).__name__}."
+                )
 
             parameters, takes_ctx = cls._generate_schema()
             cls._parameters = parameters

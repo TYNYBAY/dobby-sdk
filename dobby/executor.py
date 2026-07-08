@@ -14,12 +14,16 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel
 
 from ._logging import logger
+from .context import ContextPolicy, edit_context, summarize_context
+from .context._tokens import estimate_input_tokens
 from .exceptions import ApprovalRequired
 from .providers.base import Provider
 from .providers.vertexai.converters import to_vertexai_tool
 from .tools.tool import Tool
 from .types import (
+    AppliedEdit,
     AssistantMessagePart,
+    ContextEditEvent,
     MessagePart,
     StreamEndEvent,
     StreamEvent,
@@ -33,6 +37,23 @@ from .types import (
 )
 
 OUTPUT_TOOL_NAME = "final_result"
+
+
+def _compaction_triggered(
+    last_input_tokens: int | None,
+    policy: ContextPolicy,
+    last_compacted_at_tokens: int | None,
+) -> bool:
+    """Whether compaction should fire before the next model call.
+
+    Fires once the previous turn's input tokens cross ``policy.trigger_tokens``.
+    The watermark suppresses re-firing write-back modes at the same token count.
+    """
+    if last_input_tokens is None or last_input_tokens < policy.trigger_tokens:
+        return False
+    if last_compacted_at_tokens is not None and last_input_tokens == last_compacted_at_tokens:
+        return False
+    return True
 
 
 class ToolCallResult(NamedTuple):
@@ -67,6 +88,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         tools: list[Tool] | None = None,
         output_type: type[OutputT] | None = None,
         output_mode: Literal["tool", "native"] = "tool",
+        *,
+        context_policy: ContextPolicy | None = None,
     ):
         """Initialize the AgentExecutor.
 
@@ -76,12 +99,16 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             tools: List of Tool instances to register
             output_type: Pydantic BaseModel for structured output
             output_mode: 'tool' (default) or 'native' (NotImplementedError)
+            context_policy: Optional compaction policy. ``None`` (default) keeps
+                behavior identical to today; passing one enables automatic
+                between-turns context compaction (trim/summarize).
         """
         self.provider = provider
         self.llm = llm
         self.output_type = output_type
         self.output_mode = output_mode
         self.last_output: OutputT | None = None
+        self._context_policy = context_policy
 
         self._tools: dict[str, Tool] = {}
         self._formatted_tools: list | None = None
@@ -95,7 +122,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 output_type.model_json_schema().get("description")
                 or f"Return the final structured result as {output_type.__name__}"
             )
-            output_tool = Tool.from_model(output_type, name=OUTPUT_TOOL_NAME, description=description)
+            output_tool = Tool.from_model(
+                output_type, name=OUTPUT_TOOL_NAME, description=description
+            )
             self._tools[output_tool.name] = output_tool
 
         if tools:
@@ -237,6 +266,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             context: Context to inject into tools (e.g., RunToolContext)
             max_iterations: Maximum tool calling iterations
             reasoning_effort: Optional reasoning effort override
+            max_tokens: Optional cap on tokens generated per model call
             approved_tool_calls: Set of tool_call_ids that have been approved
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
@@ -256,11 +286,42 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         working_messages = list(messages)
         approved = approved_tool_calls or set()
 
+        # Loop-local compaction state (KTD-4): kept off `self` so reused
+        # executors never collide and compactions never overlap within a run.
+        policy = self._context_policy
+        last_input_tokens: int | None = None
+        last_compacted_at_tokens: int | None = None
+
         for _ in range(max_iterations):
             tool_calls: list[ToolUsePart] = []
+            send_messages = working_messages
+            # Single-flight latch (KTD-4): reset each turn, set once a compaction
+            # runs so the auto-trigger and the CompactContextTool branch can never
+            # both compact within the same iteration.
+            compaction_in_progress = False
+
+            # --- compaction hook (between turns, single-flight) ---
+            if policy is not None and _compaction_triggered(
+                last_input_tokens, policy, last_compacted_at_tokens
+            ):
+                applied: AppliedEdit | None = None
+                if policy.mode == "trim":
+                    # Recompute: transient trimmed view; working_messages untouched.
+                    send_messages, applied = edit_context(working_messages, policy)
+                else:  # summarize: write-back into working_messages, computed once
+                    applied = await summarize_context(working_messages, policy, self.llm)
+                    send_messages = working_messages
+                    if applied is not None:
+                        last_compacted_at_tokens = last_input_tokens
+                if applied is not None:
+                    # Latch only on a real compaction, so a no-op auto-trigger does
+                    # not suppress an explicit CompactContextTool call this turn.
+                    compaction_in_progress = True
+                    yield ContextEditEvent(applied_edits=[applied])
+            # --- end hook ---
 
             async for event in await self.llm.chat(
-                working_messages,
+                send_messages,
                 system_prompt=system_prompt,
                 tools=tools,
                 stream=True,
@@ -273,6 +334,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     for part in event.parts:
                         if isinstance(part, ToolUsePart):
                             tool_calls.append(part)
+                    if event.usage is not None:
+                        last_input_tokens = event.usage.input_tokens
+                    elif last_input_tokens is None:
+                        # usage=None and nothing carried forward: estimate so the
+                        # trigger can still engage (KTD-1 fallback).
+                        last_input_tokens = estimate_input_tokens(send_messages)
 
             if not tool_calls:
                 break
@@ -304,6 +371,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             streaming_calls: list[ToolUsePart] = []
             parallel_calls: list[ToolUsePart] = []
             terminal_calls: list[ToolUsePart] = []
+            compact_calls: list[ToolUsePart] = []
             for tc in tool_calls:
                 if tc.name == OUTPUT_TOOL_NAME:
                     continue
@@ -311,7 +379,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 if not tool:
                     logger.warning(f"Tool not found: {tc.name}")
                     continue
-                if tool.terminal:
+                if tool.edits_context:
+                    compact_calls.append(tc)
+                elif tool.terminal:
                     terminal_calls.append(tc)
                 elif tool.stream_output:
                     streaming_calls.append(tc)
@@ -320,9 +390,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
             # Any sequential tool in the batch forces the entire batch to run
             # sequentially to preserve execution-order guarantees
-            force_sequential = any(
-                self._tools[tc.name].sequential for tc in parallel_calls
-            )
+            force_sequential = any(self._tools[tc.name].sequential for tc in parallel_calls)
 
             # Execute non-streaming tools (parallel or sequential)
             results: list[ToolCallResult | BaseException] = []
@@ -336,9 +404,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 else:
                     results = await asyncio.gather(
                         *[
-                            self._execute_tool_call(
-                                tc.name, tc.id, tc.inputs, context, approved
-                            )
+                            self._execute_tool_call(tc.name, tc.id, tc.inputs, context, approved)
                             for tc in parallel_calls
                         ],
                         return_exceptions=True,
@@ -349,11 +415,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     raise call_result
                 if isinstance(call_result, BaseException):
                     call_result = ToolCallResult(
-                        tc.name, tc.id, {"error": str(call_result)}, True,
+                        tc.name,
+                        tc.id,
+                        {"error": str(call_result)},
+                        True,
                     )
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, call_result.result, call_result.is_error, working_messages,
+                    tc,
+                    call_result.result,
+                    call_result.is_error,
+                    working_messages,
                 )
                 yield result_event
                 yield end_event
@@ -376,10 +448,45 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     is_error = True
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, result, is_error, working_messages,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
                 )
                 yield result_event
                 yield end_event
+
+            # Context-editing tool: agent-invoked compaction, then continue.
+            for tc in compact_calls:
+                # Emit the tool's round-trip so provider tool-call pairing holds.
+                # ApprovalRequired propagates out, matching the other tool paths.
+                call_result = await self._execute_tool_call(
+                    tc.name, tc.id, tc.inputs, context, approved
+                )
+                result_event, end_event = self._emit_tool_result(
+                    tc, call_result.result, call_result.is_error, working_messages
+                )
+                yield result_event
+                yield end_event
+
+                # Route through summarize (single-flight: skip if the auto-trigger
+                # already compacted this turn). Requires a configured policy.
+                if policy is None or compaction_in_progress:
+                    continue
+                compaction_in_progress = True
+                effective_policy = policy
+                keep_override = tc.inputs.get("keep_last_n")
+                if keep_override is not None:
+                    effective_policy = policy.model_copy(update={"keep_last_n": keep_override})
+                applied = await summarize_context(
+                    working_messages,
+                    effective_policy,
+                    self.llm,
+                    extra_instructions=tc.inputs.get("instructions"),
+                )
+                if applied is not None:
+                    last_compacted_at_tokens = last_input_tokens
+                    yield ContextEditEvent(applied_edits=[applied])
 
             # Terminal tool exits the loop
             if terminal_calls:
@@ -399,7 +506,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     result = {"error": str(e)}
                     is_error = True
                 result_event, _ = self._emit_tool_result(
-                    tc, result, is_error, working_messages, is_terminal=True,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
+                    is_terminal=True,
                 )
                 yield result_event
                 return
