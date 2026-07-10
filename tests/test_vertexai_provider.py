@@ -111,6 +111,70 @@ class TestVertexAIConstructor:
         )
         assert provider.model == "meta/llama-3.1-405b-instruct-maas"
 
+    def test_native_gemini_model_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
+            VertexAIProvider(
+                model="google/gemini-2.5-flash",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_unprefixed_gemini_model_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
+            VertexAIProvider(
+                model="gemini-2.5-flash",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_native_claude_model_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
+            VertexAIProvider(
+                model="claude-sonnet-4-5",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_publisher_qualified_claude_model_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
+            VertexAIProvider(
+                model="anthropic/claude-sonnet-4-5",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_gemini_model_id_with_surrounding_whitespace_still_rejected(self) -> None:
+        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
+            VertexAIProvider(
+                model=" google/gemini-2.5-flash\n",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_empty_model_id_rejected_with_clear_error(self) -> None:
+        with pytest.raises(ValueError, match="non-empty model id"):
+            VertexAIProvider(
+                model="",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_none_model_id_rejected_with_clear_error_not_attributeerror(self) -> None:
+        with pytest.raises(ValueError, match="non-empty model id"):
+            VertexAIProvider(
+                model=None,  # type: ignore[arg-type]
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_model_garden_model_id_not_rejected(self) -> None:
+        provider = VertexAIProvider(
+            model="meta/llama-3.1-405b-instruct-maas",
+            project="my-project",
+            credentials=_mock_credentials(),
+        )
+        assert provider.model == "meta/llama-3.1-405b-instruct-maas"
+
     def test_max_retries_stored_on_instance(self) -> None:
         provider = VertexAIProvider(
             model="meta/llama-3.1-405b-instruct-maas",
@@ -681,6 +745,20 @@ class TestNonStreamChatCompletion:
 
         _, kwargs = provider._client.chat.completions.create.call_args
         assert kwargs["model"] == "meta/llama-3.1-70b-instruct-maas"
+
+    def test_per_call_model_override_to_native_gemini_id_rejected(self) -> None:
+        provider = _make_chat_provider()
+
+        async def _run() -> None:
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                model="google/gemini-2.5-flash",
+            )
+
+        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
+            asyncio.run(_run())
+        provider._client.chat.completions.create.assert_not_called()
 
     def test_system_prompt_prepended_as_system_message(self) -> None:
         provider = _make_chat_provider()

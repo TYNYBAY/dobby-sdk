@@ -1,7 +1,7 @@
 """Tests for Anthropic provider: error translation, message conversion, and converters."""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -165,6 +165,14 @@ class TestAnthropicErrorTranslation:
         provider = AnthropicProvider.__new__(AnthropicProvider)
         provider.base_url = None
         assert provider.name == "anthropic"
+
+    def test_vertex_provider_name(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider.base_url = None
+        provider._is_vertex = True
+        assert provider.name == "anthropic-vertex"
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +613,126 @@ class TestAzureValidation:
                 resource="my-resource",
                 base_url="https://my-resource.services.ai.azure.com/anthropic/",
             )
+
+
+class TestVertexValidation:
+    """Test Claude-on-Vertex construction and its mutual exclusivity with Azure."""
+
+    def test_vertex_and_azure_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, resource="my-resource")
+
+    def test_vertex_constructs_async_anthropic_vertex_with_region_and_project(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
+            provider = AnthropicProvider(
+                model="claude-sonnet-4-5",
+                vertex=True,
+                region="us-east5",
+                project_id="my-project",
+            )
+
+        mock_vertex_cls.assert_called_once_with(region="us-east5", project_id="my-project")
+        assert provider._client is mock_vertex_cls.return_value
+
+    def test_vertex_omits_region_and_project_when_not_given(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True)
+
+        mock_vertex_cls.assert_called_once_with()
+
+    def test_vertex_name_property_after_construction(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"):
+            provider = AnthropicProvider(model="claude-sonnet-4-5", vertex=True, region="us-east5")
+
+        assert provider.name == "anthropic-vertex"
+
+    def test_vertex_and_api_key_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, api_key="sk-ant-test")
+
+    def test_vertex_and_non_azure_base_url_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AnthropicProvider(
+                model="claude-sonnet-4-5", vertex=True, base_url="https://proxy.example.com"
+            )
+
+    def test_vertex_credentials_and_access_token_conflict(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with (
+            patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"),
+            pytest.raises(ValueError, match="credentials or access_token"),
+        ):
+            AnthropicProvider(
+                model="claude-sonnet-4-5",
+                vertex=True,
+                credentials=MagicMock(),
+                access_token="token",
+            )
+
+    def test_vertex_forwards_explicit_credentials(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        creds = MagicMock()
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, credentials=creds)
+
+        mock_vertex_cls.assert_called_once_with(credentials=creds)
+
+    def test_vertex_forwards_explicit_access_token(self) -> None:
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, access_token="token-123")
+
+        mock_vertex_cls.assert_called_once_with(access_token="token-123")
+
+    def test_vertex_backed_instance_dispatches_same_tool_schema_via_executor(self) -> None:
+        """Confirm the "anthropic" dispatch case pairs correctly with Vertex mode too.
+
+        AgentExecutor(provider="anthropic", ...) should produce identical tool
+        schemas whether the llm instance is direct Anthropic or Claude-on-Vertex,
+        since dispatch keys purely on the `provider` string, not on which backend
+        the llm instance uses internally.
+        """
+        from dataclasses import dataclass
+
+        from dobby import AgentExecutor
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+        from dobby.tools import Tool
+
+        @dataclass
+        class GetWeatherTool(Tool):
+            description = "Get the weather for a city"
+
+            def __call__(self, city: str) -> dict[str, str]:
+                return {"city": city}
+
+        direct_provider = AnthropicProvider.__new__(AnthropicProvider)
+        direct_provider.base_url = None
+        direct_schema = AgentExecutor(
+            provider="anthropic", llm=direct_provider, tools=[GetWeatherTool()]
+        ).get_tools_schema()
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"):
+            vertex_provider = AnthropicProvider(model="claude-sonnet-4-5", vertex=True)
+        vertex_schema = AgentExecutor(
+            provider="anthropic", llm=vertex_provider, tools=[GetWeatherTool()]
+        ).get_tools_schema()
+
+        assert vertex_schema == direct_schema
 
 
 # ---------------------------------------------------------------------------

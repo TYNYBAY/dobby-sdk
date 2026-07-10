@@ -54,6 +54,43 @@ __all__ = ["VertexAIProvider"]
 # than a key file on disk. Only consulted when `credentials` isn't passed explicitly.
 _CREDENTIALS_JSON_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
 
+# Publisher-qualified id prefixes for model families that Vertex's OpenAI-compatible
+# endpoint will also silently serve, but through a strictly worse path than their
+# dedicated native provider (no thought-signature handling, cruder finish-reason
+# mapping here vs. GeminiProvider/AnthropicProvider). Rejected client-side so the
+# failure is loud instead of a quietly-degraded success.
+_NATIVE_GEMINI_PREFIXES = ("google/gemini-", "gemini-")
+_NATIVE_CLAUDE_PREFIXES = ("claude-", "anthropic/")
+
+
+def _reject_native_model_family(model: str) -> None:
+    """Raise if `model` belongs to a native-Gemini or native-Claude family.
+
+    Both are servable through this provider's OpenAI-compatible endpoint, but
+    only via a degraded path -- the correct native provider should be used
+    instead. See docs/brainstorms/anthropic-vertex-and-vertexai-guard-requirements.md.
+
+    Raises:
+        ValueError: `model` is empty/`None`, or belongs to a rejected family.
+    """
+    if not model:
+        raise ValueError("VertexAIProvider requires a non-empty model id.")
+
+    lowered = model.strip().lower()
+    if lowered.startswith(_NATIVE_GEMINI_PREFIXES):
+        raise ValueError(
+            f"VertexAIProvider does not support native Gemini model {model!r}. "
+            "It silently succeeds through a degraded path (no thought-signature "
+            "handling, cruder finish-reason mapping) instead of erroring — use "
+            "GeminiProvider(vertexai=True) instead."
+        )
+    if lowered.startswith(_NATIVE_CLAUDE_PREFIXES):
+        raise ValueError(
+            f"VertexAIProvider does not support Claude model {model!r}. "
+            "Use AnthropicProvider(vertex=True) instead."
+        )
+
+
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
 # onto Dobby's StopReason. "tool_calls" is included for completeness, but
 # `_non_stream_chat_completion` always prefers the presence of `tool_calls` on
@@ -104,6 +141,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     other serving container that speaks OpenAI's Chat Completions wire format) through
     `POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/
     {location}/endpoints/openapi/chat/completions`.
+
+    Native-Gemini (`google/gemini-*`) and native-Claude (`claude-*`/`anthropic/*`) model
+    ids are rejected at construction and per-call — this endpoint also serves them, but
+    only through a degraded path. Use `GeminiProvider(vertexai=True)` or
+    `AnthropicProvider(vertex=True)` instead.
 
     Auth resolves, in order: an explicitly supplied `google.auth.credentials.Credentials`
     object; a stringified service-account key in the `GOOGLE_APPLICATION_CREDENTIALS_JSON`
@@ -171,9 +213,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             max_retries: Maximum retry attempts for transient errors (default: 3).
 
         Raises:
-            ValueError: `project` is omitted and can't be derived from the resolved
-                credentials.
+            ValueError: `model` belongs to a native-Gemini or native-Claude family, or
+                `project` is omitted and can't be derived from the resolved credentials.
         """
+        _reject_native_model_family(model)
+
         self._model = model
         self.location = location
         self.scopes = scopes
@@ -304,11 +348,13 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
         """
+        target_model = model or self._model
+        if model is not None:
+            _reject_native_model_family(target_model)
+
         vertexai_messages = to_vertexai_messages(messages)
         if system_prompt is not None:
             vertexai_messages.insert(0, {"role": "system", "content": system_prompt})
-
-        target_model = model or self._model
 
         if stream:
             return self._stream_chat_completion(

@@ -2,7 +2,9 @@
 
 The `VertexAIProvider` targets Google Cloud Vertex AI's **Model Garden** catalog (Llama, self-deployed containers, and any other serving container that speaks OpenAI's Chat Completions wire format) through Vertex's OpenAI-compatible Model-as-a-Service (MaaS) endpoint.
 
-Claude-on-Vertex, Mistral-on-Vertex, and raw non-OpenAI-compatible custom endpoints (`rawPredict`/`streamRawPredict`) are out of scope for this provider — it only speaks Chat Completions.
+Native-Gemini and native-Claude model ids are also technically servable through this same endpoint, but only via a degraded path (no thought-signature handling, cruder finish-reason mapping) — `VertexAIProvider` rejects `google/gemini-*`/`gemini-*` and `claude-*`/`anthropic/*` model ids at construction and on any per-call override, rather than silently routing them through that worse path. Use `GeminiProvider(vertexai=True)` for Gemini and `AnthropicProvider(vertex=True)` for Claude-on-Vertex instead.
+
+Mistral-on-Vertex and raw non-OpenAI-compatible custom endpoints (`rawPredict`/`streamRawPredict`) remain out of scope for this provider — it only speaks Chat Completions.
 
 ## Initialization
 
@@ -47,6 +49,18 @@ provider = VertexAIProvider(
 ```
 
 Left unset, `scopes` defaults to `None`, which means google-auth's own default resolution — typically the broad `cloud-platform` scope for most ADC sources. A leaked broad-scope token has a larger blast radius than a Vertex-only one, so operators whose ADC source supports narrower scopes (e.g. a dedicated service account) should pass a tighter `scopes` list here for least-privilege.
+
+### Model-Family Guard
+
+Passing a native-Gemini or native-Claude model id raises `ValueError` immediately, before any network call:
+
+```python
+VertexAIProvider(model="google/gemini-2.5-flash", project="my-gcp-project")
+# ValueError: VertexAIProvider does not support native Gemini model
+# 'google/gemini-2.5-flash'. ... use GeminiProvider(vertexai=True) instead.
+```
+
+The same check runs on a per-call `model=` override in `chat()`, not just at construction.
 
 ## Chat Methods
 
@@ -134,4 +148,4 @@ tool_schema = to_vertexai_tool(my_tool)
 ## Known Limitations
 
 - Region/model availability for MaaS models is limited by Google (e.g. Llama is currently `us-central1`-only). This provider does not validate region/model combinations — check current availability in Google's Model Garden documentation.
-- Claude-on-Vertex and Mistral-on-Vertex are not supported by this provider (each requires a different SDK/wire format).
+- Claude-on-Vertex and Mistral-on-Vertex are not supported by this provider (each requires a different SDK/wire format). Claude-on-Vertex is supported via `AnthropicProvider(vertex=True)` instead.

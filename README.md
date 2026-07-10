@@ -71,7 +71,7 @@ async for event in executor.run_stream(messages):
    ```
 
    ```bash
-   uv run --env-file .env python testVertex.py
+   uv run --env-file .env python examples/vertexai_example.py
    ```
 
    > Note: `scopes` is required here — a service-account credential (whether from `GOOGLE_APPLICATION_CREDENTIALS_JSON` or a key file) has no implicit scope; omitting it fails with `invalid_scope: Invalid OAuth scope or ID token audience provided.`
@@ -82,7 +82,7 @@ See [docs/providers/vertexai.md](./docs/providers/vertexai.md) for full provider
 
 ## Features
 
-- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic
+- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry, Vertex AI), Gemini (Developer API, Vertex AI), Vertex AI Model Garden
 - **Streaming**: Real-time token streaming with typed events
 - **Tools**: Dataclass-based tools with auto-generated schemas
 - **Context injection**: Pass runtime context to tools via `Injected[T]`
