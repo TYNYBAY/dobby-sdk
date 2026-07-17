@@ -167,6 +167,14 @@ class TestVertexAIConstructor:
                 credentials=_mock_credentials(),
             )
 
+    def test_whitespace_only_model_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-empty model id"):
+            VertexAIProvider(
+                model="   ",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
     def test_model_garden_model_id_not_rejected(self) -> None:
         provider = VertexAIProvider(
             model="meta/llama-3.1-405b-instruct-maas",
@@ -760,6 +768,42 @@ class TestNonStreamChatCompletion:
             asyncio.run(_run())
         provider._client.chat.completions.create.assert_not_called()
 
+    def test_per_call_model_override_to_native_claude_id_rejected(self) -> None:
+        provider = _make_chat_provider()
+
+        async def _run() -> None:
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                model="claude-sonnet-4-5",
+            )
+
+        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
+            asyncio.run(_run())
+        provider._client.chat.completions.create.assert_not_called()
+
+    def test_per_call_model_override_empty_string_falls_back_to_instance_model(self) -> None:
+        """An empty-string override is treated as no override.
+
+        This matches `model or self._model` semantics rather than being evaluated
+        by the guard itself -- the instance model was already validated at
+        construction.
+        """
+        provider = _make_chat_provider()
+        response = _make_response(content="hi", finish_reason="stop")
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                model="",
+            )
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == "meta/llama-3.1-405b-instruct-maas"
+
     def test_system_prompt_prepended_as_system_message(self) -> None:
         provider = _make_chat_provider()
         response = _make_response(content="hi", finish_reason="stop")
@@ -938,6 +982,24 @@ async def _collect_stream_events(provider: VertexAIProvider, **kwargs: Any) -> l
 
 class TestStreamChatCompletion:
     """Test VertexAIProvider.chat(stream=True)."""
+
+    def test_per_call_model_override_to_native_gemini_id_rejected_before_streaming(self) -> None:
+        """The guard must reject before entering the streaming generator.
+
+        Not partway through consuming it.
+        """
+        provider = _make_chat_provider()
+
+        async def _run() -> None:
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=True,
+                model="google/gemini-2.5-flash",
+            )
+
+        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
+            asyncio.run(_run())
+        provider._client.chat.completions.create.assert_not_called()
 
     def test_text_stream_accumulates_into_single_text_part(self) -> None:
         provider = _make_chat_provider()

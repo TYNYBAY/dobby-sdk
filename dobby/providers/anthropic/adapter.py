@@ -68,7 +68,7 @@ def _map_stop_reason(reason: str | None) -> StopReason:
     return "end_turn"
 
 
-class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicVertex]):
+class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex]):
     """Provider for Anthropic Claude, Azure-hosted Claude, and Claude-on-Vertex.
 
     Supports direct Anthropic API, Azure AI Foundry, and Vertex AI deployments.
@@ -91,7 +91,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicVertex]):
     api_key: str | None
     base_url: str | None
     _model: str
-    _client: AsyncAnthropic | AsyncAnthropicVertex
+    _client: AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex
     _is_azure: bool
     _is_vertex: bool
     max_retries: int
@@ -103,6 +103,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicVertex]):
         base_url: str | None = None,
         resource: str | None = None,
         azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
+        *,
         vertex: bool = False,
         project_id: str | None = None,
         region: str | None = None,
@@ -165,13 +166,13 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicVertex]):
             if credentials is not None and access_token is not None:
                 raise ValueError("Pass either credentials or access_token for Vertex, not both.")
             vertex_kwargs: dict[str, Any] = {}
-            if region is not None:
+            if region:
                 vertex_kwargs["region"] = region
-            if project_id is not None:
+            if project_id:
                 vertex_kwargs["project_id"] = project_id
             if credentials is not None:
                 vertex_kwargs["credentials"] = credentials
-            if access_token is not None:
+            if access_token:
                 vertex_kwargs["access_token"] = access_token
             self._client = AsyncAnthropicVertex(**vertex_kwargs)
         elif self._is_azure:
@@ -219,7 +220,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicVertex]):
         return self._model
 
     @property
-    def client(self) -> AsyncAnthropic | AsyncAnthropicVertex:
+    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex:
         """Authenticated client instance."""
         return self._client
 

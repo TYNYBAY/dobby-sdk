@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-07-17
+
+### Added
+- `AnthropicProvider` gains a `vertex=True` mode for Claude-on-Vertex, constructing `anthropic.lib.vertex.AsyncAnthropicVertex` under Google ADC (or explicit `credentials`/`access_token` for least-privilege scoping). Mutually exclusive with Azure/direct params (`resource`, `base_url`, `azure_ad_token_provider`, `api_key`). `provider.name` reports `"anthropic-vertex"`.
+- `examples/vertexai_example.py` — runnable Vertex AI Model Garden example with tool-calling.
+
+### Fixed
+- `VertexAIProvider` now rejects `google/gemini-*`, `gemini-*`, `claude-*`, and `anthropic/*` model ids client-side (at construction and on any per-call `model=` override), instead of silently routing them through its degraded Model Garden path. Input is normalized (whitespace-stripped, case-insensitive) before matching, and an empty/`None`/whitespace-only model id raises a clear error instead of crashing.
+
+### Breaking
+- Any existing caller passing a native-Gemini or native-Claude model id to `VertexAIProvider` will now get a `ValueError` at construction (or on a per-call `model=` override) instead of the previous degraded-but-working behavior. Affected callers should switch to `GeminiProvider(vertexai=True)` or `AnthropicProvider(vertex=True)` respectively.
+- `AnthropicProvider.__init__`'s parameters from `vertex` onward (`vertex`, `project_id`, `region`, `credentials`, `access_token`, `max_retries`) are now keyword-only. A caller passing `max_retries` positionally (6th positional argument) will now get a `TypeError` instead of silently binding that value to `vertex`.
+
 ## [0.2.16] - 2026-06-08
 
 ### Added

@@ -668,6 +668,43 @@ class TestVertexValidation:
                 model="claude-sonnet-4-5", vertex=True, base_url="https://proxy.example.com"
             )
 
+    def test_vertex_and_azure_ad_token_provider_alone_conflict(self) -> None:
+        """azure_ad_token_provider alone (no resource/base_url) must also conflict.
+
+        It sets _is_azure=True transitively, so this exercises that path
+        specifically rather than just the resource=... case.
+        """
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AnthropicProvider(
+                model="claude-sonnet-4-5", vertex=True, azure_ad_token_provider=lambda: "token"
+            )
+
+    def test_vertex_empty_string_region_project_id_not_forwarded(self) -> None:
+        """Empty-string region/project_id must not be forwarded as literal values.
+
+        They must fall back to the SDK's own env-var/ADC resolution instead --
+        forwarding an empty string would produce a malformed base_url/project path.
+        """
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
+            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, region="", project_id="")
+
+        mock_vertex_cls.assert_called_once_with()
+
+    def test_max_retries_is_keyword_only(self) -> None:
+        """Vertex params were inserted ahead of max_retries in the constructor.
+
+        Keyword-only enforcement prevents a positional max_retries caller from
+        silently binding their value to the new `vertex` param instead.
+        """
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("claude-sonnet-4-5", None, None, None, None, 5)  # type: ignore[misc]
+
     def test_vertex_credentials_and_access_token_conflict(self) -> None:
         from dobby.providers.anthropic.adapter import AnthropicProvider
 

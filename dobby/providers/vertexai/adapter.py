@@ -77,6 +77,8 @@ def _reject_native_model_family(model: str) -> None:
         raise ValueError("VertexAIProvider requires a non-empty model id.")
 
     lowered = model.strip().lower()
+    if not lowered:
+        raise ValueError("VertexAIProvider requires a non-empty model id.")
     if lowered.startswith(_NATIVE_GEMINI_PREFIXES):
         raise ValueError(
             f"VertexAIProvider does not support native Gemini model {model!r}. "
@@ -349,7 +351,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
         """
         target_model = model or self._model
-        if model is not None:
+        if model:
             _reject_native_model_family(target_model)
 
         vertexai_messages = to_vertexai_messages(messages)
