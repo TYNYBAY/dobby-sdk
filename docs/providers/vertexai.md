@@ -18,16 +18,84 @@ provider = VertexAIProvider(
 )
 ```
 
+### Constructor parameters
+
+| Parameter     | Type                    | Default         | Description                                                                                                                     |
+| ------------- | ----------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `model`       | `str`                   | required        | Publisher-qualified model id, forwarded verbatim. Rejects `None`, empty, and whitespace-only ids at construction.               |
+| `project`     | `str \| None`           | `None`          | GCP project ID. Derived from the resolved credentials or from ADC when omitted. Raises `ValueError` if it cannot be determined. |
+| `location`    | `str`                   | `"us-central1"` | GCP location. Forms the endpoint host and path.                                                                                 |
+| `credentials` | `Credentials \| None`   | `None`          | Pre-built `google.auth.credentials.Credentials`. Takes precedence over every other auth source.                                 |
+| `scopes`      | `Sequence[str] \| None` | `None`          | OAuth scopes. **Ignored when `credentials` is passed.** Required for both service-account paths — see [Scopes](#scopes).        |
+| `max_retries` | `int`                   | `3`             | Retry attempts for transient errors.                                                                                            |
+
 ### Authentication
 
-Auth uses Application Default Credentials (ADC) by default — no API key is needed. The bearer token is refreshed transparently on every request via the OpenAI SDK's native async-callable `api_key` hook, so both `provider.chat(...)` and direct use of `provider.client.chat.completions.create(...)` always get a fresh token.
+No API key. Auth resolves in this order, first match wins:
 
-You can also supply a pre-built credentials object instead of relying on ADC resolution:
+| #   | Source                                | Trigger                                                          |
+| --- | ------------------------------------- | ---------------------------------------------------------------- |
+| 1   | `credentials=`                        | A `google.auth.credentials.Credentials` object passed explicitly |
+| 2   | `GOOGLE_APPLICATION_CREDENTIALS_JSON` | Env var holding a service-account key's **contents**             |
+| 3   | `google.auth.default()`               | Application Default Credentials (ADC)                            |
+
+The bearer token refreshes transparently on every request via the OpenAI SDK's native async-callable `api_key` hook, so both `provider.chat(...)` and direct use of `provider.client.chat.completions.create(...)` always get a fresh token. A long-lived provider keeps working past the ~1 hour token lifetime with no manual refresh.
+
+`examples/vertexai_example.py` has all of the below as runnable code in one `build_provider()` function.
+
+**Application Default Credentials.** Least setup, and the right default locally and on GCE / GKE / Cloud Run:
+
+```python
+provider = VertexAIProvider(model="meta/llama-3.1-405b-instruct-maas")
+```
+
+`project` is derived from ADC when ADC knows it. Pass it explicitly when it doesn't — typically user ADC where `gcloud auth application-default set-quota-project` was never run. Construction raises `ValueError` in that case rather than failing later at request time:
+
+```python
+provider = VertexAIProvider(
+    model="meta/llama-3.1-405b-instruct-maas",
+    project="my-gcp-project",
+)
+```
+
+**Service-account key file.** Note the scopes go on the credentials object, not on the provider — `scopes=` is ignored once `credentials=` is passed:
+
+```python
+from google.oauth2 import service_account
+
+credentials = service_account.Credentials.from_service_account_file(
+    "/secure/path/to/key.json",
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+
+provider = VertexAIProvider(
+    model="meta/llama-3.1-405b-instruct-maas",
+    credentials=credentials,  # project is read from the key
+)
+```
+
+**Service-account key as a single env var.** Set `GOOGLE_APPLICATION_CREDENTIALS_JSON` to the key file's contents, not a path to one — this suits secret-manager injection with no key file on disk. Read automatically when `credentials=` is not passed. See the README's "Vertex AI Credentials Setup" for the full walkthrough:
+
+```python
+provider = VertexAIProvider(
+    model="meta/llama-3.1-405b-instruct-maas",
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+```
+
+**Impersonating another service account.** No key material on disk. Your ADC identity needs `roles/iam.serviceAccountTokenCreator` on the target. Impersonated credentials carry no project, so pass `project` explicitly:
 
 ```python
 import google.auth
+from google.auth import impersonated_credentials
 
-credentials, _ = google.auth.default()
+source_credentials, _ = google.auth.default()
+
+credentials = impersonated_credentials.Credentials(
+    source_credentials=source_credentials,
+    target_principal="vertex-caller@my-gcp-project.iam.gserviceaccount.com",
+    target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
 
 provider = VertexAIProvider(
     model="meta/llama-3.1-405b-instruct-maas",
@@ -36,9 +104,17 @@ provider = VertexAIProvider(
 )
 ```
 
-### Least-privilege scopes
+### Scopes
 
-When `credentials` is not supplied, the optional `scopes` parameter is forwarded to `google.auth.default(scopes=scopes)`:
+`scopes` is consulted **only when `credentials` is not supplied**. Once you pass a pre-built credentials object, scope it at construction instead — the provider's `scopes=` argument is ignored on that path.
+
+**`scopes` is required for both service-account paths** — a key loaded from `GOOGLE_APPLICATION_CREDENTIALS_JSON` or from `from_service_account_file` carries no implicit scope, and omitting it fails every request with:
+
+```
+invalid_scope: Invalid OAuth scope or ID token audience provided.
+```
+
+Left as `None`, google-auth resolves its own default, which for most ADC sources is the broad `cloud-platform` scope. A leaked broad-scope token reaches every Google Cloud API the identity can touch, so set it explicitly to make the blast radius visible:
 
 ```python
 provider = VertexAIProvider(
@@ -48,7 +124,7 @@ provider = VertexAIProvider(
 )
 ```
 
-Left unset, `scopes` defaults to `None`, which means google-auth's own default resolution — typically the broad `cloud-platform` scope for most ADC sources. A leaked broad-scope token has a larger blast radius than a Vertex-only one, so operators whose ADC source supports narrower scopes (e.g. a dedicated service account) should pass a tighter `scopes` list here for least-privilege.
+`cloud-platform` is currently the only scope Vertex AI accepts, so this cannot be narrowed further today. Stating it explicitly is still worth it: it documents the blast radius at the call site and gives you one obvious place to tighten if that changes.
 
 ## Chat Methods
 
@@ -87,25 +163,25 @@ async for event in await provider.chat(messages, stream=True):
 
 ## Parameters
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `messages` | `Iterable[MessagePart]` | Conversation history |
-| `stream` | `bool` | Enable streaming (default: False) |
-| `system_prompt` | `str \| None` | System instructions |
-| `temperature` | `float` | Randomness 0.0-2.0 (default: 0.0) |
-| `tools` | `list[Any] \| None` | Tool definitions, already formatted via `to_vertexai_tool()` |
-| `model` | `str \| None` | Per-call model override (falls back to the instance model) |
+| Parameter       | Type                    | Description                                                  |
+| --------------- | ----------------------- | ------------------------------------------------------------ |
+| `messages`      | `Iterable[MessagePart]` | Conversation history                                         |
+| `stream`        | `bool`                  | Enable streaming (default: False)                            |
+| `system_prompt` | `str \| None`           | System instructions                                          |
+| `temperature`   | `float`                 | Randomness 0.0-2.0 (default: 0.0)                            |
+| `tools`         | `list[Any] \| None`     | Tool definitions, already formatted via `to_vertexai_tool()` |
+| `model`         | `str \| None`           | Per-call model override (falls back to the instance model)   |
 
 ---
 
 ## Stream Events
 
-| Event | Description |
-|-------|-------------|
-| `StreamStartEvent` | Stream started, includes model ID |
-| `TextDeltaEvent` | Text chunk with `delta` field |
-| `ToolUseEvent` | Tool call with `id`, `name`, `inputs` |
-| `StreamEndEvent` | Stream finished, includes `parts`, `usage` |
+| Event              | Description                                                                                                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `StreamStartEvent` | Stream started, includes model ID                                                                                                                                                           |
+| `TextDeltaEvent`   | Text chunk with `delta` field                                                                                                                                                               |
+| `ToolUseEvent`     | Tool call with `id`, `name`, `inputs`                                                                                                                                                       |
+| `StreamEndEvent`   | Stream finished, includes `parts`, `usage`                                                                                                                                                  |
 | `StreamErrorEvent` | Error occurred, including when the streaming tool-call accumulator's bounds are exceeded (a self-deployed/third-party Model Garden container is a less-trusted boundary than native OpenAI) |
 
 Reasoning events are not emitted — Model Garden MaaS models targeted by this provider (Llama and OpenAI-compatible self-deployed containers) have no reasoning/thinking channel analogous to Claude's or OpenAI's o-series.

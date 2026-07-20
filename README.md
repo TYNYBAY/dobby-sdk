@@ -78,7 +78,7 @@ async for event in executor.run_stream(messages):
 
 **On GCP itself** (Cloud Run, GKE, Compute Engine): skip all of the above — attach a service account to the runtime and let ADC resolve it automatically via the metadata server. No key material to manage at all. The env-var approach above is only needed off-GCP (other clouds, local dev without `gcloud auth application-default login`).
 
-See [docs/providers/vertexai.md](./docs/providers/vertexai.md) for full provider docs.
+**Other auth styles** — a service-account key file, service-account impersonation, or plain ADC — are shown as runnable variants in `build_provider()` in [examples/vertexai_example.py](./examples/vertexai_example.py), with the full reference in [docs/providers/vertexai.md](./docs/providers/vertexai.md#authentication).
 
 ## Features
 
