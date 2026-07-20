@@ -64,6 +64,7 @@ def _require_non_empty_model(model: str) -> None:
     if not model or not model.strip():
         raise ValueError("VertexAIProvider requires a non-empty model id.")
 
+
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
 # onto Dobby's StopReason. "tool_calls" is included for completeness, but
 # `_non_stream_chat_completion` always prefers the presence of `tool_calls` on
