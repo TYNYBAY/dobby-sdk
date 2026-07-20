@@ -111,77 +111,61 @@ class TestVertexAIConstructor:
         )
         assert provider.model == "meta/llama-3.1-405b-instruct-maas"
 
-    def test_native_gemini_model_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
-            VertexAIProvider(
-                model="google/gemini-2.5-flash",
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
+    @pytest.mark.parametrize("bad_model", ["", "   ", None])
+    def test_empty_or_none_model_id_rejected_at_construction(self, bad_model) -> None:
+        """Plain input validation, kept separate from the removed family guard.
 
-    def test_unprefixed_gemini_model_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
-            VertexAIProvider(
-                model="gemini-2.5-flash",
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
-
-    def test_native_claude_model_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
-            VertexAIProvider(
-                model="claude-sonnet-4-5",
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
-
-    def test_publisher_qualified_claude_model_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
-            VertexAIProvider(
-                model="anthropic/claude-sonnet-4-5",
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
-
-    def test_gemini_model_id_with_surrounding_whitespace_still_rejected(self) -> None:
-        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
-            VertexAIProvider(
-                model=" google/gemini-2.5-flash\n",
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
-
-    def test_empty_model_id_rejected_with_clear_error(self) -> None:
+        Without it, `model=None` constructs fine and reaches the wire as a null
+        model field, turning a config typo into an opaque server-side error.
+        """
         with pytest.raises(ValueError, match="non-empty model id"):
             VertexAIProvider(
-                model="",
+                model=bad_model,
                 project="my-project",
                 credentials=_mock_credentials(),
             )
 
-    def test_none_model_id_rejected_with_clear_error_not_attributeerror(self) -> None:
-        with pytest.raises(ValueError, match="non-empty model id"):
-            VertexAIProvider(
-                model=None,  # type: ignore[arg-type]
-                project="my-project",
-                credentials=_mock_credentials(),
-            )
+    def test_whitespace_only_per_call_override_rejected(self) -> None:
+        """A whitespace-only override is a typo, not a fallback signal."""
+        provider = _make_chat_provider()
 
-    def test_whitespace_only_model_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="non-empty model id"):
-            VertexAIProvider(
+        async def _run() -> None:
+            await provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
                 model="   ",
-                project="my-project",
-                credentials=_mock_credentials(),
             )
 
-    def test_model_garden_model_id_not_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-empty model id"):
+            asyncio.run(_run())
+        provider._client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "meta/llama-3.1-405b-instruct-maas",
+            "openai/gpt-oss-120b",
+            "google/gemini-2.5-flash",
+            "gemini-2.5-flash",
+            "claude-sonnet-4-5",
+            "anthropic/claude-sonnet-4-5",
+            "publishers/anthropic/models/claude-sonnet-4-5",
+        ],
+    )
+    def test_model_ids_forwarded_verbatim_without_family_validation(self, model_id: str) -> None:
+        """No model id is rejected on family grounds -- the endpoint decides.
+
+        The previous native-Gemini/native-Claude guard was removed: it rejected
+        legitimately-named self-deployed containers (e.g. `gemini-finetune-v2`),
+        matched only unqualified prefixes so fully-qualified ids slipped through
+        anyway, and diverged from how comparable SDKs treat model names.
+        """
         provider = VertexAIProvider(
-            model="meta/llama-3.1-405b-instruct-maas",
+            model=model_id,
             project="my-project",
             credentials=_mock_credentials(),
         )
-        assert provider.model == "meta/llama-3.1-405b-instruct-maas"
+        assert provider.model == model_id
 
     def test_max_retries_stored_on_instance(self) -> None:
         provider = VertexAIProvider(
@@ -754,33 +738,27 @@ class TestNonStreamChatCompletion:
         _, kwargs = provider._client.chat.completions.create.call_args
         assert kwargs["model"] == "meta/llama-3.1-70b-instruct-maas"
 
-    def test_per_call_model_override_to_native_gemini_id_rejected(self) -> None:
+    @pytest.mark.parametrize("model_id", ["google/gemini-2.5-flash", "claude-sonnet-4-5"])
+    def test_per_call_override_to_previously_rejected_id_is_forwarded(self, model_id: str) -> None:
+        """The removed guard fired at two sites: construction AND per-call override.
+
+        A constructor-only test would still pass if a per-call-only guard were
+        reintroduced, so the permissive contract is pinned at both sites.
+        """
         provider = _make_chat_provider()
+        provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
 
         async def _run() -> None:
             await provider.chat(
                 messages=[UserMessagePart(parts=[TextPart(text="hi")])],
                 stream=False,
-                model="google/gemini-2.5-flash",
+                model=model_id,
             )
 
-        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
-            asyncio.run(_run())
-        provider._client.chat.completions.create.assert_not_called()
+        asyncio.run(_run())
 
-    def test_per_call_model_override_to_native_claude_id_rejected(self) -> None:
-        provider = _make_chat_provider()
-
-        async def _run() -> None:
-            await provider.chat(
-                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
-                stream=False,
-                model="claude-sonnet-4-5",
-            )
-
-        with pytest.raises(ValueError, match="AnthropicProvider\\(vertex=True\\)"):
-            asyncio.run(_run())
-        provider._client.chat.completions.create.assert_not_called()
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == model_id
 
     def test_per_call_model_override_empty_string_falls_back_to_instance_model(self) -> None:
         """An empty-string override is treated as no override.
@@ -982,24 +960,6 @@ async def _collect_stream_events(provider: VertexAIProvider, **kwargs: Any) -> l
 
 class TestStreamChatCompletion:
     """Test VertexAIProvider.chat(stream=True)."""
-
-    def test_per_call_model_override_to_native_gemini_id_rejected_before_streaming(self) -> None:
-        """The guard must reject before entering the streaming generator.
-
-        Not partway through consuming it.
-        """
-        provider = _make_chat_provider()
-
-        async def _run() -> None:
-            await provider.chat(
-                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
-                stream=True,
-                model="google/gemini-2.5-flash",
-            )
-
-        with pytest.raises(ValueError, match="GeminiProvider\\(vertexai=True\\)"):
-            asyncio.run(_run())
-        provider._client.chat.completions.create.assert_not_called()
 
     def test_text_stream_accumulates_into_single_text_part(self) -> None:
         provider = _make_chat_provider()

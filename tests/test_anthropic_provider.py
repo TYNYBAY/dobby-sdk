@@ -1,7 +1,7 @@
 """Tests for Anthropic provider: error translation, message conversion, and converters."""
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -165,14 +165,6 @@ class TestAnthropicErrorTranslation:
         provider = AnthropicProvider.__new__(AnthropicProvider)
         provider.base_url = None
         assert provider.name == "anthropic"
-
-    def test_vertex_provider_name(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        provider = AnthropicProvider.__new__(AnthropicProvider)
-        provider.base_url = None
-        provider._is_vertex = True
-        assert provider.name == "anthropic-vertex"
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +581,87 @@ class TestRedactedThinking:
 # ---------------------------------------------------------------------------
 
 
+class TestConstructorSignature:
+    """Pin the public constructor surface of every provider.
+
+    These strings and argument positions are published API. Nothing else in the
+    suite asserts them, so a future edit could narrow or reorder them silently.
+    """
+
+    def test_anthropic_max_retries_is_keyword_only(self) -> None:
+        """max_retries must not be bindable positionally.
+
+        Keyword-only enforcement stops a positional caller from binding their
+        retry count to whatever parameter happens to sit in that slot.
+        """
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("claude-sonnet-4-5", None, None, None, None, 5)  # type: ignore[misc]
+
+    def test_gemini_max_retries_is_keyword_only(self) -> None:
+        """Regression: `vertexai` used to be the 3rd positional parameter.
+
+        `GeminiProvider("m", None, True)` was valid in published 0.2.15 and meant
+        "use Vertex". With `vertexai` removed, the keyword-only boundary stops True
+        from binding to the retry count and silently routing traffic to the
+        Developer API. It must raise instead.
+        """
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with pytest.raises(TypeError):
+            GeminiProvider("gemini-2.5-flash", None, True)  # type: ignore[misc]
+
+    def test_removed_vertex_params_raise_type_error(self) -> None:
+        """The removals must fail loud, never fall back to another backend."""
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        for anthropic_kwargs in (
+            {"vertex": True},
+            {"project_id": "p"},
+            {"region": "us-east5"},
+            {"access_token": "t"},
+        ):
+            with pytest.raises(TypeError):
+                AnthropicProvider(model="claude-sonnet-4-5", **anthropic_kwargs)  # type: ignore[arg-type]
+
+        for gemini_kwargs in ({"vertexai": True}, {"project": "p"}, {"location": "us-central1"}):
+            with pytest.raises(TypeError):
+                GeminiProvider(model="gemini-2.5-flash", **gemini_kwargs)  # type: ignore[arg-type]
+
+    def test_removed_gemini_attributes_are_gone(self) -> None:
+        """`vertexai`/`project`/`location` were public attributes, not just params.
+
+        Reading them is a distinct failure mode from the constructor TypeError,
+        so it gets its own assertion.
+        """
+        from unittest.mock import patch as _patch
+
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with _patch("dobby.providers.gemini.adapter.genai.Client"):
+            provider = GeminiProvider(model="gemini-2.5-flash", api_key="k")
+
+        for attr in ("vertexai", "project", "location"):
+            assert not hasattr(provider, attr)
+
+    def test_provider_name_values(self) -> None:
+        """`name` values are published API — consumers match on these strings."""
+        from unittest.mock import patch as _patch
+
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with _patch("dobby.providers.anthropic.adapter.AsyncAnthropic"):
+            assert AnthropicProvider(model="claude-sonnet-4-5", api_key="k").name == "anthropic"
+        with _patch("dobby.providers.anthropic.adapter.AsyncAnthropicFoundry"):
+            azure = AnthropicProvider(model="claude-sonnet-4-5", api_key="k", resource="r")
+        assert azure.name == "azure-anthropic"
+        with _patch("dobby.providers.gemini.adapter.genai.Client"):
+            assert GeminiProvider(model="gemini-2.5-flash", api_key="k").name == "gemini"
+
+
 class TestAzureValidation:
     """Test fail-fast validation of mutually exclusive Azure params."""
 
@@ -613,168 +686,6 @@ class TestAzureValidation:
                 resource="my-resource",
                 base_url="https://my-resource.services.ai.azure.com/anthropic/",
             )
-
-
-class TestVertexValidation:
-    """Test Claude-on-Vertex construction and its mutual exclusivity with Azure."""
-
-    def test_vertex_and_azure_conflict(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, resource="my-resource")
-
-    def test_vertex_constructs_async_anthropic_vertex_with_region_and_project(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
-            provider = AnthropicProvider(
-                model="claude-sonnet-4-5",
-                vertex=True,
-                region="us-east5",
-                project_id="my-project",
-            )
-
-        mock_vertex_cls.assert_called_once_with(region="us-east5", project_id="my-project")
-        assert provider._client is mock_vertex_cls.return_value
-
-    def test_vertex_omits_region_and_project_when_not_given(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True)
-
-        mock_vertex_cls.assert_called_once_with()
-
-    def test_vertex_name_property_after_construction(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"):
-            provider = AnthropicProvider(model="claude-sonnet-4-5", vertex=True, region="us-east5")
-
-        assert provider.name == "anthropic-vertex"
-
-    def test_vertex_and_api_key_conflict(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, api_key="sk-ant-test")
-
-    def test_vertex_and_non_azure_base_url_conflict(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            AnthropicProvider(
-                model="claude-sonnet-4-5", vertex=True, base_url="https://proxy.example.com"
-            )
-
-    def test_vertex_and_azure_ad_token_provider_alone_conflict(self) -> None:
-        """azure_ad_token_provider alone (no resource/base_url) must also conflict.
-
-        It sets _is_azure=True transitively, so this exercises that path
-        specifically rather than just the resource=... case.
-        """
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            AnthropicProvider(
-                model="claude-sonnet-4-5", vertex=True, azure_ad_token_provider=lambda: "token"
-            )
-
-    def test_vertex_empty_string_region_project_id_not_forwarded(self) -> None:
-        """Empty-string region/project_id must not be forwarded as literal values.
-
-        They must fall back to the SDK's own env-var/ADC resolution instead --
-        forwarding an empty string would produce a malformed base_url/project path.
-        """
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, region="", project_id="")
-
-        mock_vertex_cls.assert_called_once_with()
-
-    def test_max_retries_is_keyword_only(self) -> None:
-        """Vertex params were inserted ahead of max_retries in the constructor.
-
-        Keyword-only enforcement prevents a positional max_retries caller from
-        silently binding their value to the new `vertex` param instead.
-        """
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with pytest.raises(TypeError):
-            AnthropicProvider("claude-sonnet-4-5", None, None, None, None, 5)  # type: ignore[misc]
-
-    def test_vertex_credentials_and_access_token_conflict(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with (
-            patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"),
-            pytest.raises(ValueError, match="credentials or access_token"),
-        ):
-            AnthropicProvider(
-                model="claude-sonnet-4-5",
-                vertex=True,
-                credentials=MagicMock(),
-                access_token="token",
-            )
-
-    def test_vertex_forwards_explicit_credentials(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        creds = MagicMock()
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, credentials=creds)
-
-        mock_vertex_cls.assert_called_once_with(credentials=creds)
-
-    def test_vertex_forwards_explicit_access_token(self) -> None:
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex") as mock_vertex_cls:
-            AnthropicProvider(model="claude-sonnet-4-5", vertex=True, access_token="token-123")
-
-        mock_vertex_cls.assert_called_once_with(access_token="token-123")
-
-    def test_vertex_backed_instance_dispatches_same_tool_schema_via_executor(self) -> None:
-        """Confirm the "anthropic" dispatch case pairs correctly with Vertex mode too.
-
-        AgentExecutor(provider="anthropic", ...) should produce identical tool
-        schemas whether the llm instance is direct Anthropic or Claude-on-Vertex,
-        since dispatch keys purely on the `provider` string, not on which backend
-        the llm instance uses internally.
-        """
-        from dataclasses import dataclass
-
-        from dobby import AgentExecutor
-        from dobby.providers.anthropic.adapter import AnthropicProvider
-        from dobby.tools import Tool
-
-        @dataclass
-        class GetWeatherTool(Tool):
-            description = "Get the weather for a city"
-
-            def __call__(self, city: str) -> dict[str, str]:
-                return {"city": city}
-
-        direct_provider = AnthropicProvider.__new__(AnthropicProvider)
-        direct_provider.base_url = None
-        direct_schema = AgentExecutor(
-            provider="anthropic", llm=direct_provider, tools=[GetWeatherTool()]
-        ).get_tools_schema()
-
-        with patch("dobby.providers.anthropic.adapter.AsyncAnthropicVertex"):
-            vertex_provider = AnthropicProvider(model="claude-sonnet-4-5", vertex=True)
-        vertex_schema = AgentExecutor(
-            provider="anthropic", llm=vertex_provider, tools=[GetWeatherTool()]
-        ).get_tools_schema()
-
-        assert vertex_schema == direct_schema
-
-
-# ---------------------------------------------------------------------------
-# Per-call model override + passthrough (end-to-end via mocked client)
-# ---------------------------------------------------------------------------
 
 
 class TestChatModelOverride:
