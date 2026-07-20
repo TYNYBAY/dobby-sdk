@@ -1043,6 +1043,73 @@ def _make_openai_error(
     return error_cls()
 
 
+class TestDedicatedEndpointHint:
+    """A dedicated endpoint stops being served by the shared regional DNS.
+
+    That surfaces as a bare 404 or connection failure. Nothing client-side can
+    detect `dedicatedEndpointEnabled` without an admin API call this provider
+    deliberately does not make, so the error names the setting that fixes it --
+    but only when the failure shape actually matches.
+    """
+
+    def _provider(self, **kwargs) -> VertexAIProvider:
+        return VertexAIProvider(project="my-project", credentials=_mock_credentials(), **kwargs)
+
+    def test_404_on_deployed_endpoint_suggests_endpoint_host(self) -> None:
+        provider = self._provider(endpoint_id="546")
+
+        with pytest.raises(ProviderError, match="dedicatedEndpointDns") as exc:
+            provider._translate_error(_make_openai_error(openai.APIStatusError, 404))
+
+        assert exc.value.status_code == 404
+        assert "'546'" in str(exc.value)
+
+    def test_connection_error_on_deployed_endpoint_suggests_endpoint_host(self) -> None:
+        provider = self._provider(endpoint_id="546")
+
+        with pytest.raises(APIConnectionError, match="dedicatedEndpointDns"):
+            provider._translate_error(_make_openai_error(openai.APIConnectionError))
+
+    def test_no_hint_when_endpoint_host_already_supplied(self) -> None:
+        """The user already did the thing the hint would suggest."""
+        provider = self._provider(
+            endpoint_id="546", endpoint_host="546.us-central1-987.prediction.vertexai.goog"
+        )
+
+        with pytest.raises(ProviderError) as exc:
+            provider._translate_error(_make_openai_error(openai.APIStatusError, 404))
+
+        assert "dedicatedEndpointDns" not in str(exc.value)
+
+    def test_no_hint_for_model_garden(self) -> None:
+        """Model Garden has no dedicated DNS, so the hint would be noise."""
+        provider = self._provider(model="meta/llama-3.1-405b-instruct-maas")
+
+        with pytest.raises(ProviderError) as exc:
+            provider._translate_error(_make_openai_error(openai.APIStatusError, 404))
+
+        assert "dedicatedEndpointDns" not in str(exc.value)
+
+    def test_non_404_status_errors_are_unaffected(self) -> None:
+        """A 403 is an IAM problem, not a routing one -- don't misdirect."""
+        provider = self._provider(endpoint_id="546")
+
+        with pytest.raises(ProviderError) as exc:
+            provider._translate_error(_make_openai_error(openai.APIStatusError, 403))
+
+        assert exc.value.status_code == 403
+        assert "dedicatedEndpointDns" not in str(exc.value)
+
+    def test_500_still_maps_to_internal_server_error(self) -> None:
+        """The new 404 branch must not shadow the 5xx branch below it."""
+        provider = self._provider(endpoint_id="546")
+
+        with pytest.raises(InternalServerError) as exc:
+            provider._translate_error(_make_openai_error(openai.InternalServerError, 503))
+
+        assert exc.value.status_code == 503
+
+
 class TestVertexAIErrorTranslation:
     """Test VertexAIProvider chat() error translation via _translate_error."""
 

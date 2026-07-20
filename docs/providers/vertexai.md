@@ -254,13 +254,33 @@ tool_schema = to_vertexai_tool(my_tool)
 
 ---
 
+## Scope and design principles
+
+This provider forwards requests to Vertex faithfully and surfaces Vertex's own responses. Three rules follow from that, and they explain most of the boundaries below:
+
+1. **No stale client-side validation.** Model ids, region availability, and parameter support are Google's to police. A hardcoded allowlist goes out of date the week Google adds a model, and then rejects something the API would have served.
+2. **No duplicating server-side policy.** If Vertex would return an error, we let it — a clear server error beats a guessed client-side one.
+3. **Backend-dependent behavior is documented as best-effort, never normalized.** On a self-deployed endpoint the serving container decides what comes back. Inventing values to paper over that would be lying about what happened.
+
 ## Known Limitations
 
-- Region/model availability for MaaS models is limited by Google (e.g. Llama is currently `us-central1`-only). This provider does not validate region/model combinations — check current availability in Google's Model Garden documentation.
-- Only Chat Completions is supported. `:predict`, `:rawPredict`, and `:streamRawPredict` are not implemented, so Mistral-on-Vertex and custom containers that expose only those routes are out of reach.
-- Claude-on-Vertex and Gemini-on-Vertex have no first-class support in this SDK. Both are reachable through this provider's OpenAI-compatible endpoint by passing their model id, at the cost of the cruder path described above. `AnthropicProvider` and `GeminiProvider` target the direct Anthropic and Gemini Developer APIs only.
-- `endpoint_host` must be supplied by the caller. This provider does not call the Vertex admin API to look up an endpoint's `dedicatedEndpointDns`.
-- `stream_options` / `include_usage` is not in Google's documented parameter list. Streaming `usage` is emitted when the backend supplies it and omitted otherwise — treat it as best-effort, especially on self-deployed containers.
+These are intentional scope boundaries, not missing features.
+
+**Not implemented**
+
+- **Only Chat Completions.** `:predict`, `:rawPredict`, and `:streamRawPredict` are separate wire formats and are out of scope. Mistral-on-Vertex uses `:rawPredict` and is therefore unreachable, as are custom containers exposing only those routes. Chat Completions on a self-deployed endpoint requires a container that implements it — Google's prebuilt vLLM and HF TGI containers do.
+- **`endpoint_host` is not looked up for you.** Reading an endpoint's `dedicatedEndpointDns` would mean depending on the Vertex admin API, making a network call at construction, and requiring `aiplatform.endpoints.get` — permission that inference alone does not need. Every comparable SDK also makes the caller supply it. When a deployed endpoint 404s or fails to connect over the shared host, the raised error names `endpoint_host` and `dedicatedEndpointDns` explicitly.
+- **Claude-on-Vertex and Gemini-on-Vertex are not first-class.** Both are reachable here by passing their model id, at the cost of the cruder path described above. `AnthropicProvider` and `GeminiProvider` target the direct Anthropic and Gemini Developer APIs.
+
+**Deliberately not validated**
+
+- **Region and model availability.** MaaS availability is region-gated and changes as Google's catalog changes (Llama has been `us-central1`-only, for example). This provider does not check the combination — Vertex's own error is authoritative and always current. Check availability in Google's Model Garden documentation.
+- **Parameter support.** Google's documented rule is that unsupported parameters are ignored rather than rejected, and support varies per model for third-party models. We forward what you pass.
+
+**Backend-dependent, best-effort**
+
+- **Streaming `usage`.** `stream_options` / `include_usage` is absent from Google's documented parameter list. Usage is emitted when the backend supplies it and omitted otherwise. On self-deployed endpoints this is entirely the container's behavior (vLLM and TGI differ). Never assume `StreamEndEvent.usage` is populated.
+- **Error shapes.** Because the route is typed `GoogleApiHttpBody`, a failure may arrive as a Google API envelope or as an OpenAI-style error depending on where it occurred. Both are mapped to the same dobby error types; the original is preserved on `__cause__`.
 
 ### Global location
 

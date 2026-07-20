@@ -350,6 +350,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         self.max_retries = max_retries
         self.endpoint_id = endpoint_id
         self.api_version = api_version
+        self._endpoint_host = endpoint_host
 
         resolved_project = project
         if credentials is not None:
@@ -535,6 +536,27 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             kwargs["tools"] = tools
         return kwargs
 
+    def _dedicated_endpoint_hint(self) -> str:
+        """Return a remediation hint for the dedicated-endpoint misconfiguration, if it fits.
+
+        Enabling `dedicatedEndpointEnabled` on an endpoint stops the shared regional
+        DNS from serving it, which surfaces as a 404 or a connection failure rather
+        than anything self-describing. Nothing client-side can detect the flag without
+        an admin API call this provider deliberately does not make, so instead of
+        guessing we name the one setting that fixes it — and only when the shape of
+        the failure actually matches (a deployed endpoint reached over the shared host).
+
+        Returns:
+            A hint to append to the error message, or `""` when not applicable.
+        """
+        if self.endpoint_id is None or self._endpoint_host is not None:
+            return ""
+        return (
+            f" — if endpoint {self.endpoint_id!r} has a dedicated DNS "
+            "(`dedicatedEndpointEnabled`), the shared regional host no longer serves it. "
+            "Pass the endpoint's `dedicatedEndpointDns` as `endpoint_host=`."
+        )
+
     def _translate_error(self, e: Exception) -> NoReturn:
         """Map OpenAI SDK exceptions to unified dobby errors.
 
@@ -555,6 +577,12 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             DobbyProviderError: For all other API errors.
         """
         match e:
+            case openai.APIStatusError() if e.status_code == 404:
+                raise DobbyProviderError(
+                    f"{e}{self._dedicated_endpoint_hint()}",
+                    provider=self.name,
+                    status_code=404,
+                ) from e
             case openai.RateLimitError():
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
@@ -570,7 +598,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             case openai.APITimeoutError():
                 raise DobbyAPITimeoutError(str(e), provider=self.name) from e
             case openai.APIConnectionError():
-                raise DobbyAPIConnectionError(str(e), provider=self.name) from e
+                raise DobbyAPIConnectionError(
+                    f"{e}{self._dedicated_endpoint_hint()}", provider=self.name
+                ) from e
             case openai.InternalServerError():
                 raise DobbyInternalServerError(
                     str(e), provider=self.name, status_code=e.status_code
