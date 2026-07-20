@@ -215,6 +215,199 @@ class TestVertexAIConstructor:
 # ---------------------------------------------------------------------------
 
 
+def _base_url(**kwargs) -> str:
+    """Construct a provider with a patched client and return the base_url it built."""
+    with patch("dobby.providers.vertexai.adapter.AsyncOpenAI") as mock_openai_cls:
+        VertexAIProvider(project="my-project", credentials=_mock_credentials(), **kwargs)
+    return mock_openai_cls.call_args.kwargs["base_url"]
+
+
+class TestEndpointRouting:
+    """Model Garden vs self-deployed endpoints: URL shape, body, and validation.
+
+    Reference: Google's OpenAI-compat docs (migrate/openai/auth-and-credentials,
+    migrate/openai/examples, maas/call-open-model-apis) and the Endpoint
+    `dedicatedEndpointDns` schema.
+    """
+
+    # --- URL construction ---------------------------------------------------
+
+    def test_model_garden_url_unchanged(self) -> None:
+        """Backwards compatibility: the default path is byte-identical to before."""
+        assert _base_url(model="meta/llama-3.1-405b-instruct-maas") == (
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project"
+            "/locations/us-central1/endpoints/openapi"
+        )
+
+    def test_global_location_drops_the_region_prefix(self) -> None:
+        """`global` uses the bare host, not `global-aiplatform.googleapis.com`."""
+        url = _base_url(model="meta/llama-3.1-405b-instruct-maas", location="global")
+        assert url.startswith("https://aiplatform.googleapis.com/")
+        assert "global-aiplatform" not in url
+        assert "/locations/global/" in url
+
+    def test_deployed_endpoint_url_uses_endpoint_id_segment(self) -> None:
+        assert _base_url(endpoint_id="5464397967697903616") == (
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project"
+            "/locations/us-central1/endpoints/5464397967697903616"
+        )
+
+    def test_dedicated_endpoint_host_replaces_the_regional_host(self) -> None:
+        """A dedicated endpoint stops being served by the shared regional DNS."""
+        url = _base_url(
+            endpoint_id="546",
+            endpoint_host="546.us-central1-987.prediction.vertexai.goog",
+            api_version="v1beta1",
+        )
+        assert url == (
+            "https://546.us-central1-987.prediction.vertexai.goog/v1beta1"
+            "/projects/my-project/locations/us-central1/endpoints/546"
+        )
+
+    @pytest.mark.parametrize(
+        "supplied_host",
+        [
+            "546.us-central1-987.prediction.vertexai.goog",
+            "https://546.us-central1-987.prediction.vertexai.goog",
+            "https://546.us-central1-987.prediction.vertexai.goog/",
+        ],
+    )
+    def test_endpoint_host_scheme_is_stripped_if_present(self, supplied_host: str) -> None:
+        """The API returns `dedicatedEndpointDns` bare; its schema documents a scheme."""
+        url = _base_url(endpoint_id="546", endpoint_host=supplied_host)
+        assert url.startswith("https://546.us-central1-987.prediction.vertexai.goog/v1/")
+        assert "https://https://" not in url
+
+    def test_api_version_is_configurable(self) -> None:
+        url = _base_url(model="meta/llama", api_version="v1beta1")
+        assert "/v1beta1/projects/" in url
+
+    # --- request body -------------------------------------------------------
+
+    def test_model_garden_sends_the_model_id_in_the_body(self) -> None:
+        provider = _make_chat_provider()
+        provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
+
+        asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == "meta/llama-3.1-405b-instruct-maas"
+
+    def test_deployed_endpoint_sends_empty_model_in_the_body(self) -> None:
+        """The endpoint selects the model; Vertex ignores this field.
+
+        Google's REST samples omit it and their OpenAI-SDK samples pass `""`.
+        We send `""` because the OpenAI SDK requires the argument.
+        """
+        provider = VertexAIProvider(
+            endpoint_id="5464397967697903616",
+            project="my-project",
+            credentials=_mock_credentials(),
+        )
+        provider._client = MagicMock()
+        provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
+
+        asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == ""
+
+    def test_deployed_endpoint_per_call_override_still_sends_empty_model(self) -> None:
+        """An override relabels the response; it cannot change what the endpoint serves."""
+        provider = VertexAIProvider(
+            endpoint_id="546", project="my-project", credentials=_mock_credentials()
+        )
+        provider._client = MagicMock()
+        provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
+
+        asyncio.run(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                model="whatever",
+            )
+        )
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["model"] == ""
+
+    # --- configuration validation ------------------------------------------
+
+    def test_model_defaults_to_a_label_for_deployed_endpoints(self) -> None:
+        provider = VertexAIProvider(
+            endpoint_id="546", project="my-project", credentials=_mock_credentials()
+        )
+        assert provider.model == "endpoint-546"
+        assert provider.endpoint_id == "546"
+
+    def test_explicit_model_is_kept_as_a_label_for_deployed_endpoints(self) -> None:
+        provider = VertexAIProvider(
+            model="gemma-2-9b-it",
+            endpoint_id="546",
+            project="my-project",
+            credentials=_mock_credentials(),
+        )
+        assert provider.model == "gemma-2-9b-it"
+
+    def test_model_still_required_for_model_garden(self) -> None:
+        with pytest.raises(ValueError, match="non-empty model id"):
+            VertexAIProvider(project="my-project", credentials=_mock_credentials())
+
+    def test_endpoint_host_without_endpoint_id_rejected(self) -> None:
+        with pytest.raises(ValueError, match="endpoint_host is only valid together"):
+            VertexAIProvider(
+                model="meta/llama",
+                endpoint_host="546.us-central1-987.prediction.vertexai.goog",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    @pytest.mark.parametrize("bad_endpoint_id", ["", "   "])
+    def test_empty_endpoint_id_rejected(self, bad_endpoint_id: str) -> None:
+        with pytest.raises(ValueError, match="non-empty endpoint_id"):
+            VertexAIProvider(
+                endpoint_id=bad_endpoint_id,
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_empty_api_version_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-empty api_version"):
+            VertexAIProvider(
+                model="meta/llama",
+                api_version="  ",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+
+    def test_new_params_are_keyword_only(self) -> None:
+        """Positional callers must not be able to bind into the new params."""
+        with pytest.raises(TypeError):
+            VertexAIProvider(
+                "meta/llama", "my-project", "us-central1", _mock_credentials(), None, 3, "546"
+            )  # type: ignore[misc]
+
+    def test_existing_positional_call_still_works(self) -> None:
+        """Backwards compatibility for the pre-existing positional signature."""
+        with patch("dobby.providers.vertexai.adapter.AsyncOpenAI"):
+            provider = VertexAIProvider(
+                "meta/llama-3.1-405b-instruct-maas",
+                "my-project",
+                "us-central1",
+                _mock_credentials(),
+                None,
+                7,
+            )
+        assert provider.model == "meta/llama-3.1-405b-instruct-maas"
+        assert provider.project == "my-project"
+        assert provider.max_retries == 7
+        assert provider.endpoint_id is None
+
+
 class TestBearerToken:
     """Test VertexAIProvider._bearer_token refresh/lock behavior."""
 

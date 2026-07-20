@@ -105,6 +105,31 @@ def build_provider() -> VertexAIProvider:
     #
     # return VertexAIProvider(model=MODEL, scopes=SCOPES, location="us-central1")
 
+    # --- Self-deployed endpoints -----------------------------------------------
+    # A model you deployed yourself, addressed by endpoint id rather than by a
+    # publisher model id. The endpoint selects the model, so Vertex ignores the
+    # body's `model` field and the provider stops sending it. `model=` becomes an
+    # optional display label, defaulting to `endpoint-{endpoint_id}`.
+    #
+    # return VertexAIProvider(
+    #     endpoint_id="5464397967697903616",
+    #     project="my-gcp-project",
+    #     location="us-central1",
+    # )
+    #
+    # Once an endpoint has `dedicatedEndpointEnabled`, the shared regional DNS stops
+    # serving it and you must pass its own host. Read this from the Endpoint
+    # resource's `dedicatedEndpointDns` -- do not build it, the uid segment is not
+    # always the project number.
+    #
+    # return VertexAIProvider(
+    #     model="gemma-2-9b-it",  # label only, never sent on the wire
+    #     endpoint_id="5464397967697903616",
+    #     endpoint_host="5464397967697903616.us-central1-987654321.prediction.vertexai.goog",
+    #     project="my-gcp-project",
+    #     api_version="v1beta1",
+    # )
+
     # --- Option 4: impersonate another service account -------------------------
     # No key material on disk. Your ADC identity needs
     # roles/iam.serviceAccountTokenCreator on the target. Impersonated credentials

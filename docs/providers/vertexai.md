@@ -1,10 +1,15 @@
 # Vertex AI Provider
 
-The `VertexAIProvider` targets Google Cloud Vertex AI's **Model Garden** catalog (Llama, self-deployed containers, and any other serving container that speaks OpenAI's Chat Completions wire format) through Vertex's OpenAI-compatible Model-as-a-Service (MaaS) endpoint.
+The `VertexAIProvider` speaks Vertex AI's OpenAI-compatible Chat Completions API. It serves **both** of the surfaces Google exposes there:
+
+| Endpoint type | When | Configuration |
+|---|---|---|
+| **Model Garden / MaaS** | Publisher models: Llama, DeepSeek, Qwen, gpt-oss, … | `model="meta/llama-3.3-70b-instruct-maas"` (default) |
+| **Self-deployed endpoint** | A model you deployed yourself, addressed by endpoint id | `endpoint_id="5464397967697903616"` |
 
 Model ids are forwarded verbatim — there is no allow-list and no family validation. Native Gemini and Claude ids are servable through this same endpoint, though through a cruder path than a dedicated native client would take (no thought-signature handling, coarser finish-reason mapping).
 
-Mistral-on-Vertex and raw non-OpenAI-compatible custom endpoints (`rawPredict`/`streamRawPredict`) remain out of scope for this provider — it only speaks Chat Completions.
+Raw non-OpenAI-compatible prediction routes (`:predict`, `:rawPredict`, `:streamRawPredict`) remain out of scope — this provider only speaks Chat Completions. Mistral-on-Vertex uses `:rawPredict` and is therefore not supported.
 
 ## Initialization
 
@@ -18,11 +23,51 @@ provider = VertexAIProvider(
 )
 ```
 
+## Self-deployed endpoints
+
+Deploy a model from Model Garden (or your own container) and address it by endpoint id:
+
+```python
+provider = VertexAIProvider(
+    endpoint_id="5464397967697903616",
+    project="my-gcp-project",
+    location="us-central1",
+)
+```
+
+Three things change versus Model Garden, all handled for you:
+
+1. **Routing** — `endpoints/{endpoint_id}` instead of the shared `endpoints/openapi`.
+2. **The body's `model` field is dropped.** The endpoint selects the model, so Vertex ignores it. The provider sends `""`, matching Google's own OpenAI-SDK samples. A per-call `model=` override therefore changes only the reported `StreamEndEvent.model`, not what is served.
+3. **`model` becomes optional.** It is a display label for `provider.model` and `StreamEndEvent.model`. Omit it and it defaults to `endpoint-{endpoint_id}`; pass one for nicer logs.
+
+### Dedicated endpoints
+
+Once an endpoint has `dedicatedEndpointEnabled`, **the shared regional DNS stops serving it**, so you must pass its host:
+
+```python
+provider = VertexAIProvider(
+    endpoint_id="5464397967697903616",
+    endpoint_host="5464397967697903616.us-central1-987654321.prediction.vertexai.goog",
+    project="my-gcp-project",
+    api_version="v1beta1",
+)
+```
+
+Read `endpoint_host` from the Endpoint resource's `dedicatedEndpointDns` field — **do not construct it.** The uid segment is usually the project number but is documented as possibly "a random number or a string" (for example `fasttryout`). A leading `https://` is stripped if present, since the API returns the value bare while its schema documents a scheme.
+
+> **Container support.** Chat Completions on a self-deployed endpoint requires a serving container that implements it. Google's prebuilt vLLM and HF TGI containers do; an arbitrary custom container may only support `:rawPredict`, which this provider does not speak.
+
+## Initialization reference
+
 ### Constructor parameters
 
 | Parameter     | Type                    | Default         | Description                                                                                                                     |
 | ------------- | ----------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `model`       | `str`                   | required        | Publisher-qualified model id, forwarded verbatim. Rejects `None`, empty, and whitespace-only ids at construction.               |
+| `model`       | `str \| None`           | `None`          | Publisher-qualified model id, forwarded verbatim. **Required for Model Garden.** With `endpoint_id` it is an optional display label, never sent on the wire. |
+| `endpoint_id` | `str \| None`           | `None`          | Keyword-only. Self-deployed endpoint id. Switches routing and stops sending `model`.                                            |
+| `endpoint_host` | `str \| None`         | `None`          | Keyword-only. Dedicated endpoint DNS. Only valid with `endpoint_id`.                                                            |
+| `api_version` | `str`                   | `"v1"`          | Keyword-only. Path version segment. Google registers both `v1` and `v1beta1`; use `v1beta1` for dedicated endpoints and Gemini preview fields. |
 | `project`     | `str \| None`           | `None`          | GCP project ID. Derived from the resolved credentials or from ADC when omitted. Raises `ValueError` if it cannot be determined. |
 | `location`    | `str`                   | `"us-central1"` | GCP location. Forms the endpoint host and path.                                                                                 |
 | `credentials` | `Credentials \| None`   | `None`          | Pre-built `google.auth.credentials.Credentials`. Takes precedence over every other auth source.                                 |
@@ -212,5 +257,11 @@ tool_schema = to_vertexai_tool(my_tool)
 ## Known Limitations
 
 - Region/model availability for MaaS models is limited by Google (e.g. Llama is currently `us-central1`-only). This provider does not validate region/model combinations — check current availability in Google's Model Garden documentation.
-- Mistral-on-Vertex is not supported (it requires a different wire format).
+- Only Chat Completions is supported. `:predict`, `:rawPredict`, and `:streamRawPredict` are not implemented, so Mistral-on-Vertex and custom containers that expose only those routes are out of reach.
 - Claude-on-Vertex and Gemini-on-Vertex have no first-class support in this SDK. Both are reachable through this provider's OpenAI-compatible endpoint by passing their model id, at the cost of the cruder path described above. `AnthropicProvider` and `GeminiProvider` target the direct Anthropic and Gemini Developer APIs only.
+- `endpoint_host` must be supplied by the caller. This provider does not call the Vertex admin API to look up an endpoint's `dedicatedEndpointDns`.
+- `stream_options` / `include_usage` is not in Google's documented parameter list. Streaming `usage` is emitted when the backend supplies it and omitted otherwise — treat it as best-effort, especially on self-deployed containers.
+
+### Global location
+
+Setting `location="global"` targets the bare `aiplatform.googleapis.com` host (no region prefix), per Google's documentation. Global quotas and model capabilities differ from regional endpoints, and the `constraints/gcp.restrictEndpointUsage` org policy can block it entirely.

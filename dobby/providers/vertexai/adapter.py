@@ -8,6 +8,7 @@ bearer token transparently on every request via the OpenAI SDK's native async-ca
 `api_key` hook.
 """
 
+from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import AsyncIterator, Iterable, Sequence
 import json
@@ -50,19 +51,101 @@ from .converters import to_vertexai_messages
 __all__ = ["VertexAIProvider"]
 
 
-def _require_non_empty_model(model: str) -> None:
-    """Reject an absent model id.
+def _require_non_empty_model(model: str | None) -> str:
+    """Validate and return a model id.
 
     Plain input validation, deliberately with no model-family matching: this
     provider forwards every well-formed id verbatim. Without this check a `None`
     or empty id constructs successfully and reaches the wire as a null model
     field, turning a config typo into an opaque server-side error.
 
+    Returns:
+        The validated model id, so callers get a narrowed `str`.
+
     Raises:
         ValueError: `model` is `None`, empty, or whitespace-only.
     """
     if not model or not model.strip():
         raise ValueError("VertexAIProvider requires a non-empty model id.")
+    return model
+
+
+class _EndpointTarget(ABC):
+    """Where a request is routed, and what the body's `model` field carries.
+
+    Vertex exposes the same OpenAI-compatible Chat Completions surface at two
+    different paths whose contracts differ in exactly two ways: the endpoints
+    path segment, and whether the body's `model` field means anything. Both are
+    answered here so neither `chat()` nor `_build_kwargs()` has to branch.
+    """
+
+    @property
+    @abstractmethod
+    def path_segment(self) -> str:
+        """Value for the `endpoints/{...}` segment of the base URL."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def body_model(self, model: str) -> str:
+        """Value to send as the request body's `model` field."""
+        raise NotImplementedError()
+
+
+class _ModelGardenTarget(_EndpointTarget):
+    """Model Garden / MaaS publisher models, e.g. `meta/llama-3.3-70b-instruct-maas`.
+
+    Routed through the literal `openapi` path segment. The model id is required
+    and is what selects the model, so it is forwarded verbatim.
+    """
+
+    @property
+    def path_segment(self) -> str:
+        return "openapi"
+
+    def body_model(self, model: str) -> str:
+        return model
+
+
+class _DeployedEndpointTarget(_EndpointTarget):
+    """A self-deployed / custom-deployed endpoint, addressed by its numeric id.
+
+    The endpoint id alone selects the model, so Vertex ignores the body's
+    `model` field entirely -- Google's REST samples omit it and their
+    OpenAI-SDK samples send `""`. We send `""` because the OpenAI SDK requires
+    the argument. Sending anything else is harmless but misleading.
+    """
+
+    def __init__(self, endpoint_id: str) -> None:
+        self._endpoint_id = endpoint_id
+
+    @property
+    def path_segment(self) -> str:
+        return self._endpoint_id
+
+    def body_model(self, model: str) -> str:
+        return ""
+
+
+def _resolve_host(location: str, endpoint_host: str | None) -> str:
+    """Resolve the API host for a location, honouring an explicit override.
+
+    Three cases, in order:
+
+    1. `endpoint_host` given -- a dedicated endpoint's DNS. Used verbatim. Once
+       an endpoint has `dedicatedEndpointEnabled`, the shared regional DNS stops
+       serving it, so this cannot be derived and must be supplied.
+    2. `location == "global"` -- the host carries **no** region prefix. Building
+       `global-aiplatform.googleapis.com` is the classic URL bug here.
+    3. Otherwise the regional host.
+    """
+    if endpoint_host:
+        # The Endpoint resource's `dedicatedEndpointDns` is documented with a
+        # scheme but returned by the API without one, and the official Python
+        # client prepends `https://` unconditionally. Accept either.
+        return endpoint_host.removeprefix("https://").removeprefix("http://").rstrip("/")
+    if location == "global":
+        return "aiplatform.googleapis.com"
+    return f"{location}-aiplatform.googleapis.com"
 
 
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
@@ -111,10 +194,24 @@ def _map_finish_reason(reason: str | None) -> StopReason:
 class VertexAIProvider(Provider[AsyncOpenAI]):
     """Provider for Vertex AI's OpenAI-compatible Model-as-a-Service (MaaS) endpoint.
 
-    Targets Vertex AI's Model Garden catalog (Llama, self-deployed containers, and any
-    other serving container that speaks OpenAI's Chat Completions wire format) through
-    `POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/
-    {location}/endpoints/openapi/chat/completions`.
+    Serves both of Vertex's OpenAI-compatible Chat Completions surfaces:
+
+    - **Model Garden / MaaS** (default) — publisher models such as
+      `meta/llama-3.3-70b-instruct-maas`, routed through the shared `endpoints/openapi`
+      path. The model id selects the model and is sent in the request body.
+    - **Self-deployed endpoints** (`endpoint_id=`) — a model you deployed yourself,
+      routed through `endpoints/{endpoint_id}`. The endpoint selects the model, so
+      Vertex ignores the body's `model` field and this provider sends `""`, matching
+      Google's own OpenAI-SDK samples.
+
+    ```
+    POST https://{host}/{api_version}/projects/{project}/locations/{location}
+         /endpoints/{openapi|endpoint_id}/chat/completions
+    ```
+
+    `host` is `{location}-aiplatform.googleapis.com`, or bare
+    `aiplatform.googleapis.com` when `location="global"`, or an explicit
+    `endpoint_host` for a dedicated endpoint's DNS.
 
     Model ids are forwarded verbatim — no allow-list, no family validation. This endpoint
     will also serve native Gemini and Claude ids, though through a cruder path than a
@@ -132,6 +229,8 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     Attributes:
         project: GCP project ID.
         location: GCP location (default: us-central1).
+        endpoint_id: Self-deployed endpoint id, or None for Model Garden.
+        api_version: API version path segment (default: "v1").
         scopes: OAuth scopes forwarded to `google.auth.default()` (only used when no
             explicit `credentials` is supplied).
         max_retries: Maximum retry attempts for transient errors.
@@ -148,6 +247,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     project: str
     location: str
     scopes: Sequence[str] | None
+    endpoint_id: str | None
+    api_version: str
+    _target: _EndpointTarget
     _model: str
     _credentials: google.auth.credentials.Credentials
     _client: AsyncOpenAI
@@ -155,18 +257,26 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
     def __init__(
         self,
-        model: str,
+        model: str | None = None,
         project: str | None = None,
         location: str = "us-central1",
         credentials: google.auth.credentials.Credentials | None = None,
         scopes: Sequence[str] | None = None,
         max_retries: int = 3,
+        *,
+        endpoint_id: str | None = None,
+        endpoint_host: str | None = None,
+        api_version: str = "v1",
     ):
         """Initialize Vertex AI provider.
 
         Args:
             model: Publisher-qualified model id (e.g. "meta/llama-3.1-405b-instruct-maas"),
-                forwarded verbatim — no hardcoded allow-list.
+                forwarded verbatim — no hardcoded allow-list. **Required for Model
+                Garden.** For a self-deployed endpoint (`endpoint_id` set) the endpoint
+                itself selects the model, so this is optional and used only as a display
+                label for `provider.model` and `StreamEndEvent.model`; it is never sent
+                on the wire. Defaults to `"endpoint-{endpoint_id}"` in that mode.
             project: GCP project ID. When omitted, derived from the resolved credentials'
                 `project_id` (service-account credentials only — from `GOOGLE_APPLICATION_CREDENTIALS_JSON`,
                 a key file, or a directly-supplied service-account `credentials` object) or
@@ -185,17 +295,61 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 or a service-account key file — those credential types have no
                 implicit scope and requests fail with `invalid_scope` otherwise.
             max_retries: Maximum retry attempts for transient errors (default: 3).
+            endpoint_id: Keyword-only. Numeric id of a self-deployed / custom-deployed
+                endpoint. Switches routing from the shared `endpoints/openapi` path to
+                `endpoints/{endpoint_id}`, and stops sending `model` on the wire because
+                the endpoint selects the model itself. Omit for Model Garden.
+            endpoint_host: Keyword-only. A dedicated endpoint's DNS, as returned in the
+                Endpoint resource's `dedicatedEndpointDns` (e.g.
+                "1234567890.us-central1-987654321.prediction.vertexai.goog"). Required
+                once an endpoint has `dedicatedEndpointEnabled`, because the shared
+                regional DNS stops serving it. Read this value from the API — the uid
+                segment is not always the project number. A leading scheme is stripped
+                if present. Only valid alongside `endpoint_id`.
+            api_version: Keyword-only. API version path segment (default: "v1").
+                Google registers both "v1" and "v1beta1" for this route and documents
+                neither as preferred; their dedicated-endpoint samples use "v1beta1",
+                and "v1beta1" is also required for Gemini preview fields.
 
         Raises:
-            ValueError: `model` is empty, `None`, or whitespace-only; or `project` is
-                omitted and can't be derived from the resolved credentials.
-        """
-        _require_non_empty_model(model)
+            ValueError: `model` is empty/`None`/whitespace-only without an `endpoint_id`;
+                `endpoint_host` is given without `endpoint_id`; `endpoint_id` is empty or
+                whitespace-only; `api_version` is empty; or `project` is omitted and can't
+                be derived from the resolved credentials.
 
-        self._model = model
+        Note:
+            Chat Completions on a self-deployed endpoint requires a serving container
+            that implements it — Google's prebuilt vLLM and HF TGI containers do, an
+            arbitrary custom container may only support `:rawPredict`, which this
+            provider does not speak.
+        """
+        self._target: _EndpointTarget
+        if endpoint_id is not None:
+            if not endpoint_id.strip():
+                raise ValueError(
+                    "VertexAIProvider requires a non-empty endpoint_id when one is given."
+                )
+            self._target = _DeployedEndpointTarget(endpoint_id)
+            # The endpoint selects the model, so `model` is a display label only.
+            resolved_model = model or f"endpoint-{endpoint_id}"
+        else:
+            if endpoint_host is not None:
+                raise ValueError(
+                    "endpoint_host is only valid together with endpoint_id — a dedicated "
+                    "DNS belongs to a deployed endpoint, not to the shared Model Garden path."
+                )
+            self._target = _ModelGardenTarget()
+            resolved_model = _require_non_empty_model(model)
+
+        if not api_version.strip():
+            raise ValueError("VertexAIProvider requires a non-empty api_version.")
+
+        self._model = resolved_model
         self.location = location
         self.scopes = scopes
         self.max_retries = max_retries
+        self.endpoint_id = endpoint_id
+        self.api_version = api_version
 
         resolved_project = project
         if credentials is not None:
@@ -223,10 +377,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
         self._refresh_lock = asyncio.Lock()
 
+        host = _resolve_host(location, endpoint_host)
         self._client = AsyncOpenAI(
             base_url=(
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/{self.project}"
-                f"/locations/{location}/endpoints/openapi"
+                f"https://{host}/{api_version}/projects/{self.project}"
+                f"/locations/{location}/endpoints/{self._target.path_segment}"
             ),
             api_key=self._bearer_token,
         )
@@ -322,7 +477,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 Completions endpoint (see `to_vertexai_tool()`), matching how
                 sibling providers (`OpenAIProvider`, `GeminiProvider`) expect
                 pre-formatted tools rather than converting them here.
-            model: Per-call model override. Falls back to the instance model.
+            model: Per-call model override. Falls back to the instance model. On a
+                self-deployed endpoint the endpoint selects the model, so an override
+                changes only the reported `StreamEndEvent.model`, not what is served.
             **kwargs: Reserved for future Vertex-specific parameters.
 
         Returns:
@@ -347,8 +504,8 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             vertexai_messages, target_model, temperature, tools
         )
 
-    @staticmethod
     def _build_kwargs(
+        self,
         model: str,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
@@ -356,8 +513,12 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     ) -> dict[str, Any]:
         """Build kwargs for chat.completions.create(), excluding unset optionals.
 
+        The `model` field is delegated to the endpoint target: Model Garden needs
+        it to select the model, a self-deployed endpoint ignores it entirely and
+        receives `""`.
+
         Args:
-            model: Model id.
+            model: Model id (per-call override or instance model).
             messages: Chat-Completions-formatted messages.
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
@@ -366,7 +527,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             Dictionary of kwargs to pass to chat.completions.create().
         """
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": self._target.body_model(model),
             "messages": messages,
             "temperature": temperature,
         }
