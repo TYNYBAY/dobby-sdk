@@ -52,8 +52,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
-        provider: The LLM provider type ('openai', 'azure-openai', 'gemini', 'anthropic',
-            'vertexai')
+        provider: The tool-schema wire format ('openai', 'azure-openai', 'gemini',
+            'anthropic', 'vertexai'). This selects a schema shape, not a provider
+            identity -- a provider's `.name` may differ (e.g. AnthropicProvider
+            reports "azure-anthropic" on Azure but pairs with 'anthropic' here).
         llm: The LLM provider instance
         output_type: Pydantic model for structured output (optional)
         output_mode: How to get structured output ('tool' or 'native')
@@ -71,7 +73,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         """Initialize the AgentExecutor.
 
         Args:
-            provider: LLM provider type for schema formatting
+            provider: Tool-schema wire format. Use 'openai' for OpenAIProvider
+                (Responses API), 'vertexai' for VertexAIProvider (Chat
+                Completions), 'anthropic' for AnthropicProvider in either mode
+                (direct or Azure), and 'gemini' for GeminiProvider.
             llm: LLM provider instance for chat completions
             tools: List of Tool instances to register
             output_type: Pydantic BaseModel for structured output
@@ -136,6 +141,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     self._formatted_tools = [
                         to_vertexai_tool(tool) for tool in self._tools.values()
                     ]
+                case _:
+                    # `provider` is a Literal, so this is unreachable for valid
+                    # callers. Present so every path assigns and the declared
+                    # `list` return type holds even if the Literal grows.
+                    self._formatted_tools = []
         return self._formatted_tools
 
     async def _invoke_tool(

@@ -1,7 +1,7 @@
 """Anthropic Claude provider for Dobby SDK.
 
 Implements the Provider interface for Anthropic's Messages API,
-supporting direct Anthropic API, Azure-hosted Claude, and Claude-on-Vertex.
+supporting the direct Anthropic API and Azure-hosted Claude.
 """
 
 from collections.abc import AsyncIterator, Iterable
@@ -11,8 +11,6 @@ from typing import Any, Literal, NoReturn, cast, overload
 import anthropic
 from anthropic import AsyncAnthropic, AsyncAnthropicFoundry
 from anthropic.lib.foundry import AsyncAzureADTokenProvider
-from anthropic.lib.vertex import AsyncAnthropicVertex
-import google.auth.credentials
 
 from ..._logging import logger
 from ...types import (
@@ -68,32 +66,24 @@ def _map_stop_reason(reason: str | None) -> StopReason:
     return "end_turn"
 
 
-class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex]):
-    """Provider for Anthropic Claude, Azure-hosted Claude, and Claude-on-Vertex.
+class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
+    """Provider for Anthropic Claude and Azure-hosted Claude.
 
-    Supports direct Anthropic API, Azure AI Foundry, and Vertex AI deployments.
-    For Azure, uses AsyncAnthropicFoundry which sends the correct "api-key"
-    auth header and sets the proper base URL. For Vertex, uses
-    AsyncAnthropicVertex, which shares the same Messages API request/response
-    shape as direct Anthropic — only auth and transport differ.
+    Supports the direct Anthropic API and Azure AI Foundry deployments. For
+    Azure, uses AsyncAnthropicFoundry which sends the correct "api-key" auth
+    header and sets the proper base URL.
 
     Azure env vars (read automatically by SDK if params not passed explicitly):
         ANTHROPIC_FOUNDRY_API_KEY: Azure API key.
         ANTHROPIC_FOUNDRY_RESOURCE: Azure resource name.
         ANTHROPIC_FOUNDRY_BASE_URL: Full Azure base URL (alternative to resource).
-
-    Vertex env vars (read automatically by SDK if params not passed explicitly):
-        CLOUD_ML_REGION: GCP region (e.g. "us-east5"). Required if `region` is omitted.
-        ANTHROPIC_VERTEX_PROJECT_ID: GCP project id, if `project_id` is omitted.
-        ANTHROPIC_VERTEX_BASE_URL: Full Vertex base URL override.
     """
 
     api_key: str | None
     base_url: str | None
     _model: str
-    _client: AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex
+    _client: AsyncAnthropic | AsyncAnthropicFoundry
     _is_azure: bool
-    _is_vertex: bool
     max_retries: int
 
     def __init__(
@@ -104,11 +94,6 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncA
         resource: str | None = None,
         azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
         *,
-        vertex: bool = False,
-        project_id: str | None = None,
-        region: str | None = None,
-        credentials: google.auth.credentials.Credentials | None = None,
-        access_token: str | None = None,
         max_retries: int = 3,
     ):
         """Initialize Anthropic provider.
@@ -123,27 +108,8 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncA
             azure_ad_token_provider: Callable returning Azure AD bearer token.
                                      Mutually exclusive with api_key.
 
-        For Claude-on-Vertex (uses AsyncAnthropicVertex):
-            vertex: Set True to target Vertex AI instead of direct Anthropic/Azure.
-            project_id: GCP project id. Falls back to the ANTHROPIC_VERTEX_PROJECT_ID
-                        env var, then the SDK's own resolution, if omitted.
-            region: GCP region (e.g. "us-east5"). Falls back to the CLOUD_ML_REGION
-                    env var if omitted; the SDK raises if neither is available.
-            credentials: Pre-built `google.auth.credentials.Credentials` object, for
-                         least-privilege scoping (mirrors `VertexAIProvider`'s
-                         `credentials` param). Mutually exclusive with access_token.
-            access_token: Pre-fetched bearer token, forwarded verbatim. Mutually
-                          exclusive with credentials.
-            When neither is given, auth resolves via Google Application Default
-            Credentials (google.auth.default()), matching how VertexAIProvider and
-            GeminiProvider(vertexai=True) already resolve GCP credentials.
-
         Azure is detected when any of resource, azure_ad_token_provider, or an
-        "azure"-containing base_url is provided. Vertex is selected explicitly
-        via `vertex=True` (mirroring GeminiProvider's `vertexai` flag) and is
-        mutually exclusive with every Azure/direct param above (resource,
-        base_url, azure_ad_token_provider, api_key) -- Vertex auth and routing
-        is governed entirely by its own params.
+        "azure"-containing base_url is provided.
         """
         self.api_key = api_key
         self.base_url = base_url
@@ -153,29 +119,8 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncA
         self._is_azure = bool(
             resource or azure_ad_token_provider or (base_url and "azure" in base_url)
         )
-        self._is_vertex = vertex
 
-        if self._is_vertex and (self._is_azure or api_key is not None or base_url is not None):
-            raise ValueError(
-                "vertex=True is mutually exclusive with Azure/direct params "
-                "(resource, base_url, azure_ad_token_provider, api_key) -- pass "
-                "credentials/access_token instead for Vertex auth."
-            )
-
-        if self._is_vertex:
-            if credentials is not None and access_token is not None:
-                raise ValueError("Pass either credentials or access_token for Vertex, not both.")
-            vertex_kwargs: dict[str, Any] = {}
-            if region:
-                vertex_kwargs["region"] = region
-            if project_id:
-                vertex_kwargs["project_id"] = project_id
-            if credentials is not None:
-                vertex_kwargs["credentials"] = credentials
-            if access_token:
-                vertex_kwargs["access_token"] = access_token
-            self._client = AsyncAnthropicVertex(**vertex_kwargs)
-        elif self._is_azure:
+        if self._is_azure:
             # These pairs are mutually exclusive; fail fast on conflicting config
             # rather than silently picking a winner.
             if api_key and azure_ad_token_provider:
@@ -209,8 +154,6 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncA
         """Provider name."""
         # getattr fallback keeps this robust when the instance is built via
         # __new__ (e.g. in tests) without running __init__.
-        if getattr(self, "_is_vertex", False):
-            return "anthropic-vertex"
         is_azure = getattr(self, "_is_azure", bool(self.base_url and "azure" in self.base_url))
         return "azure-anthropic" if is_azure else "anthropic"
 
@@ -220,7 +163,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry | AsyncA
         return self._model
 
     @property
-    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex:
+    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry:
         """Authenticated client instance."""
         return self._client
 

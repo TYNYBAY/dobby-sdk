@@ -49,49 +49,20 @@ from .converters import to_vertexai_messages
 
 __all__ = ["VertexAIProvider"]
 
-# Env var carrying a full service-account key as a stringified JSON blob — lets
-# credentials be injected as a single secret (e.g. from a secret manager) rather
-# than a key file on disk. Only consulted when `credentials` isn't passed explicitly.
-_CREDENTIALS_JSON_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
 
-# Publisher-qualified id prefixes for model families that Vertex's OpenAI-compatible
-# endpoint will also silently serve, but through a strictly worse path than their
-# dedicated native provider (no thought-signature handling, cruder finish-reason
-# mapping here vs. GeminiProvider/AnthropicProvider). Rejected client-side so the
-# failure is loud instead of a quietly-degraded success.
-_NATIVE_GEMINI_PREFIXES = ("google/gemini-", "gemini-")
-_NATIVE_CLAUDE_PREFIXES = ("claude-", "anthropic/")
+def _require_non_empty_model(model: str) -> None:
+    """Reject an absent model id.
 
-
-def _reject_native_model_family(model: str) -> None:
-    """Raise if `model` belongs to a native-Gemini or native-Claude family.
-
-    Both are servable through this provider's OpenAI-compatible endpoint, but
-    only via a degraded path -- the correct native provider should be used
-    instead. See docs/brainstorms/anthropic-vertex-and-vertexai-guard-requirements.md.
+    Plain input validation, deliberately with no model-family matching: this
+    provider forwards every well-formed id verbatim. Without this check a `None`
+    or empty id constructs successfully and reaches the wire as a null model
+    field, turning a config typo into an opaque server-side error.
 
     Raises:
-        ValueError: `model` is empty/`None`, or belongs to a rejected family.
+        ValueError: `model` is `None`, empty, or whitespace-only.
     """
-    if not model:
+    if not model or not model.strip():
         raise ValueError("VertexAIProvider requires a non-empty model id.")
-
-    lowered = model.strip().lower()
-    if not lowered:
-        raise ValueError("VertexAIProvider requires a non-empty model id.")
-    if lowered.startswith(_NATIVE_GEMINI_PREFIXES):
-        raise ValueError(
-            f"VertexAIProvider does not support native Gemini model {model!r}. "
-            "It silently succeeds through a degraded path (no thought-signature "
-            "handling, cruder finish-reason mapping) instead of erroring — use "
-            "GeminiProvider(vertexai=True) instead."
-        )
-    if lowered.startswith(_NATIVE_CLAUDE_PREFIXES):
-        raise ValueError(
-            f"VertexAIProvider does not support Claude model {model!r}. "
-            "Use AnthropicProvider(vertex=True) instead."
-        )
-
 
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
 # onto Dobby's StopReason. "tool_calls" is included for completeness, but
@@ -144,10 +115,10 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     `POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/
     {location}/endpoints/openapi/chat/completions`.
 
-    Native-Gemini (`google/gemini-*`) and native-Claude (`claude-*`/`anthropic/*`) model
-    ids are rejected at construction and per-call — this endpoint also serves them, but
-    only through a degraded path. Use `GeminiProvider(vertexai=True)` or
-    `AnthropicProvider(vertex=True)` instead.
+    Model ids are forwarded verbatim — no allow-list, no family validation. This endpoint
+    will also serve native Gemini and Claude ids, though through a cruder path than a
+    dedicated native client would (no thought-signature handling, coarser finish-reason
+    mapping).
 
     Auth resolves, in order: an explicitly supplied `google.auth.credentials.Credentials`
     object; a stringified service-account key in the `GOOGLE_APPLICATION_CREDENTIALS_JSON`
@@ -215,10 +186,10 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             max_retries: Maximum retry attempts for transient errors (default: 3).
 
         Raises:
-            ValueError: `model` belongs to a native-Gemini or native-Claude family, or
-                `project` is omitted and can't be derived from the resolved credentials.
+            ValueError: `model` is empty, `None`, or whitespace-only; or `project` is
+                omitted and can't be derived from the resolved credentials.
         """
-        _reject_native_model_family(model)
+        _require_non_empty_model(model)
 
         self._model = model
         self.location = location
@@ -230,7 +201,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             self._credentials = credentials
             if resolved_project is None:
                 resolved_project = getattr(credentials, "project_id", None)
-        elif credentials_json := os.environ.get(_CREDENTIALS_JSON_ENV_VAR):
+        elif credentials_json := os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
             info = json.loads(credentials_json)
             self._credentials = service_account.Credentials.from_service_account_info(
                 info, scopes=scopes
@@ -261,7 +232,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
     @property
     def name(self) -> str:
-        """Provider name (distinct from GeminiProvider's "gemini-vertexai")."""
+        """Provider name."""
         return "vertexai"
 
     @property
@@ -291,7 +262,13 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 await asyncio.to_thread(
                     self._credentials.refresh, google.auth.transport.requests.Request()
                 )
-            return self._credentials.token
+            token = self._credentials.token
+            if token is None:
+                raise DobbyProviderError(
+                    "Vertex AI credentials resolved to no access token after refresh.",
+                    provider="vertexai",
+                )
+            return token
 
     @overload
     async def chat(
@@ -350,9 +327,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
         """
-        target_model = model or self._model
+        # A whitespace-only override is a typo, not a fallback signal; an empty
+        # string still falls through to the instance model as before.
         if model:
-            _reject_native_model_family(target_model)
+            _require_non_empty_model(model)
+        target_model = model or self._model
 
         vertexai_messages = to_vertexai_messages(messages)
         if system_prompt is not None:
