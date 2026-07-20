@@ -37,8 +37,7 @@ class AddNumbersTool(Tool):
 
 
 async def main() -> None:
-    # Model Garden id — not a native Gemini/Claude id (VertexAIProvider rejects
-    # those; use GeminiProvider(vertexai=True) or AnthropicProvider(vertex=True)).
+    # Model Garden id, forwarded verbatim to the OpenAI-compatible endpoint.
     provider = VertexAIProvider(
         model="meta/llama-3.1-405b-instruct-maas",
         location="us-central1",

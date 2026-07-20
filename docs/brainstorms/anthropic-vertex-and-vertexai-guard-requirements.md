@@ -5,6 +5,9 @@ topic: anthropic-vertex-and-vertexai-guard
 
 # Anthropic-on-Vertex Support + VertexAIProvider Model-Family Guard
 
+> **Superseded in 0.3.0.** The Vertex modes and the model-family guard described here were
+> removed. Retained as a record of the original reasoning, not as current requirements.
+
 ## Summary
 
 Add Vertex AI backend support to `AnthropicProvider` (mirroring the multi-backend pattern it already uses for Azure AI Foundry, and the `vertexai` flag `GeminiProvider` already uses for Vertex-hosted Gemini), and add a client-side guard to `VertexAIProvider` that rejects `gemini-*`/`claude-*` model ids with an error pointing to the correct native provider.

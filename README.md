@@ -82,7 +82,7 @@ See [docs/providers/vertexai.md](./docs/providers/vertexai.md) for full provider
 
 ## Features
 
-- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry, Vertex AI), Gemini (Developer API, Vertex AI), Vertex AI Model Garden
+- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry), Gemini (Developer API), Vertex AI Model Garden
 - **Streaming**: Real-time token streaming with typed events
 - **Tools**: Dataclass-based tools with auto-generated schemas
 - **Context injection**: Pass runtime context to tools via `Injected[T]`

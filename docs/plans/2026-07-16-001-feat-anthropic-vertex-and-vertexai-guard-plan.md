@@ -1,12 +1,18 @@
 ---
 title: Anthropic-on-Vertex Support + VertexAIProvider Model-Family Guard
 type: feat
-status: active
+status: superseded
+superseded_by: CHANGELOG.md 0.3.0
 date: 2026-07-16
 origin: docs/brainstorms/anthropic-vertex-and-vertexai-guard-requirements.md
 ---
 
 # Anthropic-on-Vertex Support + VertexAIProvider Model-Family Guard
+
+> **Superseded in 0.3.0.** Every requirement below (R1–R7) shipped and was then removed.
+> `AnthropicProvider(vertex=True)` and the `VertexAIProvider` model-family guard no longer
+> exist, and `GeminiProvider`'s Vertex mode was removed alongside them. Kept as a record of
+> the original reasoning, not as guidance. See the `0.3.0` CHANGELOG entry.
 
 ## Summary
 
