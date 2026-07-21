@@ -7,6 +7,15 @@ The `VertexAIProvider` speaks Vertex AI's OpenAI-compatible Chat Completions API
 | **Model Garden / MaaS** | Publisher models: Llama, DeepSeek, Qwen, gpt-oss, … | `model="meta/llama-3.3-70b-instruct-maas"` (default) |
 | **Self-deployed endpoint** | A model you deployed yourself, addressed by endpoint id | `endpoint_id="5464397967697903616"` |
 
+> **Model ids must be publisher-qualified** on the Model Garden path — `anthropic/claude-sonnet-4-5`, not `claude-sonnet-4-5`. Vertex rejects a bare id before it ever looks at the model:
+>
+> ```
+> 400 INVALID_ARGUMENT — Malformed publisher model (`model`: 'claude-sonnet-4-5')
+> for the 'openapi' request endpoint ID; expected '<publisher>/<model>'
+> ```
+>
+> This applies to every publisher, including ones Google's own model cards list unqualified (gpt-oss is documented as `gpt-oss-20b-maas` but must be sent as `openai/gpt-oss-20b-maas`). Verified against the live API. Self-deployed endpoints are exempt — they ignore the field entirely.
+
 Model ids are forwarded verbatim — there is no allow-list and no family validation. Native Gemini and Claude ids are servable through this same endpoint, though through a cruder path than a dedicated native client would take (no thought-signature handling, coarser finish-reason mapping).
 
 Raw non-OpenAI-compatible prediction routes (`:predict`, `:rawPredict`, `:streamRawPredict`) remain out of scope — this provider only speaks Chat Completions. Mistral-on-Vertex uses `:rawPredict` and is therefore not supported.
