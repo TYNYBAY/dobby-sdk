@@ -255,6 +255,36 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     _client: AsyncOpenAI
     max_retries: int
 
+    # Model Garden: `model` is required, endpoint parameters are not accepted.
+    @overload
+    def __init__(
+        self,
+        model: str,
+        project: str | None = ...,
+        location: str = ...,
+        credentials: google.auth.credentials.Credentials | None = ...,
+        scopes: Sequence[str] | None = ...,
+        max_retries: int = ...,
+        *,
+        api_version: str = ...,
+    ) -> None: ...
+
+    # Self-deployed: `endpoint_id` is required, `model` is an optional label.
+    @overload
+    def __init__(
+        self,
+        model: str | None = ...,
+        project: str | None = ...,
+        location: str = ...,
+        credentials: google.auth.credentials.Credentials | None = ...,
+        scopes: Sequence[str] | None = ...,
+        max_retries: int = ...,
+        *,
+        endpoint_id: str,
+        endpoint_host: str | None = ...,
+        api_version: str = ...,
+    ) -> None: ...
+
     def __init__(
         self,
         model: str | None = None,
@@ -269,6 +299,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         api_version: str = "v1",
     ):
         """Initialize Vertex AI provider.
+
+        The two endpoint types are separate overloads, so a type checker rejects
+        `endpoint_host` without `endpoint_id`, and a missing `model` without an
+        `endpoint_id`, before the code runs. The runtime checks below still fire
+        for untyped callers.
 
         Args:
             model: Publisher-qualified model id (e.g. "meta/llama-3.1-405b-instruct-maas"),

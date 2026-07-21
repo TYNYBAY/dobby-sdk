@@ -354,12 +354,16 @@ class TestEndpointRouting:
         assert provider.model == "gemma-2-9b-it"
 
     def test_model_still_required_for_model_garden(self) -> None:
+        """A type checker rejects this via the overloads; the runtime check backs it up."""
         with pytest.raises(ValueError, match="non-empty model id"):
-            VertexAIProvider(project="my-project", credentials=_mock_credentials())
+            VertexAIProvider(  # type: ignore[call-overload]
+                project="my-project", credentials=_mock_credentials()
+            )
 
     def test_endpoint_host_without_endpoint_id_rejected(self) -> None:
+        """Same: no overload accepts endpoint_host without endpoint_id."""
         with pytest.raises(ValueError, match="endpoint_host is only valid together"):
-            VertexAIProvider(
+            VertexAIProvider(  # type: ignore[call-overload]
                 model="meta/llama",
                 endpoint_host="546.us-central1-987.prediction.vertexai.goog",
                 project="my-project",
