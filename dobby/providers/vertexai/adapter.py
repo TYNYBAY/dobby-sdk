@@ -177,6 +177,30 @@ _MAX_TOOL_CALL_INDICES = 64
 _MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH = 1_000_000
 
 
+def _usage_from(raw: Any) -> Usage | None:
+    """Build a `Usage` from a Chat Completions usage payload, or `None`.
+
+    Presence of the usage object is not enough: real OpenAI-compatible backends
+    send one whose token counts are all `None` (observed live from Vertex's
+    `openai/gpt-oss-20b-maas`). Constructing `Usage` from those raises a
+    `ValidationError` that kills the stream mid-flight, so every field is checked
+    rather than just the container.
+
+    Returns `None` when any count is missing, which is the documented contract:
+    streaming usage is best-effort and never normalised. Substituting zeros would
+    misreport a real token spend as free.
+    """
+    if raw is None:
+        return None
+    prompt = getattr(raw, "prompt_tokens", None)
+    completion = getattr(raw, "completion_tokens", None)
+    total = getattr(raw, "total_tokens", None)
+    if prompt is None or completion is None or total is None:
+        logger.debug(f"Ignoring incomplete usage payload from Vertex: {raw!r}")
+        return None
+    return Usage(input_tokens=prompt, output_tokens=completion, total_tokens=total)
+
+
 def _map_finish_reason(reason: str | None) -> StopReason:
     """Map a Vertex AI Chat Completions finish_reason onto Dobby's StopReason.
 
@@ -516,7 +540,12 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             model: Per-call model override. Falls back to the instance model. On a
                 self-deployed endpoint the endpoint selects the model, so an override
                 changes only the reported `StreamEndEvent.model`, not what is served.
-            **kwargs: Reserved for future Vertex-specific parameters.
+            **kwargs: Provider-native passthrough params forwarded verbatim to
+                `chat.completions.create()` (e.g. `max_tokens`, `top_p`, `stop`,
+                `extra_body`). Matches how `GeminiProvider` and `OpenAIProvider`
+                treat their own passthrough. Vertex ignores parameters a model
+                does not support rather than rejecting them, and third-party
+                model support varies -- consult the model's own documentation.
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
@@ -533,11 +562,11 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
         if stream:
             return self._stream_chat_completion(
-                vertexai_messages, target_model, temperature, tools
+                vertexai_messages, target_model, temperature, tools, kwargs
             )
 
         return await self._non_stream_chat_completion(
-            vertexai_messages, target_model, temperature, tools
+            vertexai_messages, target_model, temperature, tools, kwargs
         )
 
     def _build_kwargs(
@@ -546,6 +575,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build kwargs for chat.completions.create(), excluding unset optionals.
 
@@ -558,15 +588,21 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             messages: Chat-Completions-formatted messages.
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params, applied first so the
+                fields this provider owns -- `model` above all, which must stay
+                `""` on a self-deployed endpoint -- cannot be overwritten.
 
         Returns:
             Dictionary of kwargs to pass to chat.completions.create().
         """
-        kwargs: dict[str, Any] = {
-            "model": self._target.body_model(model),
-            "messages": messages,
-            "temperature": temperature,
-        }
+        kwargs: dict[str, Any] = dict(extra or {})
+        kwargs.update(
+            {
+                "model": self._target.body_model(model),
+                "messages": messages,
+                "temperature": temperature,
+            }
+        )
         if tools is not None:
             kwargs["tools"] = tools
         return kwargs
@@ -654,6 +690,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         model: str,
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -666,12 +703,14 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             model: Model id (per-call override or instance model).
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params forwarded verbatim to
+                chat.completions.create().
 
         Returns:
             StreamEndEvent with the complete response.
         """
         create_kwargs = self._build_kwargs(
-            model=model, messages=messages, temperature=temperature, tools=tools
+            model=model, messages=messages, temperature=temperature, tools=tools, extra=extra
         )
 
         try:
@@ -699,13 +738,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             "tool_use" if tool_calls else _map_finish_reason(response.choices[0].finish_reason)
         )
 
-        usage: Usage | None = None
-        if response.usage:
-            usage = Usage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
+        usage = _usage_from(response.usage)
 
         return StreamEndEvent(
             model=response.model or model,
@@ -721,6 +754,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         model: str,
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Streaming chat completion with retry support.
 
@@ -743,13 +777,15 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             model: Model id (per-call override or instance model).
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params forwarded verbatim to
+                chat.completions.create().
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
             ToolUseEvent, StreamErrorEvent, StreamEndEvent.
         """
         create_kwargs = self._build_kwargs(
-            model=model, messages=messages, temperature=temperature, tools=tools
+            model=model, messages=messages, temperature=temperature, tools=tools, extra=extra
         )
         create_kwargs["stream"] = True
         create_kwargs["stream_options"] = {"include_usage": True}
@@ -794,12 +830,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             # Checked independent of `choices` length: some OpenAI-compatible
             # (vLLM-backed) servers don't guarantee a dedicated empty-choices
             # usage chunk the way native OpenAI does.
-            if chunk.usage is not None:
-                usage = Usage(
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                    total_tokens=chunk.usage.total_tokens,
-                )
+            chunk_usage = _usage_from(chunk.usage)
+            if chunk_usage is not None:
+                usage = chunk_usage
 
             if not chunk.choices:
                 continue

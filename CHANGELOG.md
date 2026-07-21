@@ -11,7 +11,14 @@ Vertex AI now has one route into this SDK: `VertexAIProvider`, against Vertex's
 OpenAI-compatible Model Garden endpoint. The per-vendor Vertex flags are gone.
 
 ### Added
+- **`VertexAIProvider` supports self-deployed endpoints.** Pass `endpoint_id=` to route through `endpoints/{id}` instead of the shared Model Garden path; the endpoint selects the model, so `model=` becomes an optional display label and is not sent on the wire. `endpoint_host=` carries a dedicated endpoint's DNS, required once an endpoint has `dedicatedEndpointEnabled` because the shared regional DNS stops serving it. `api_version=` defaults to `"v1"`. The docs previously claimed this support without implementing it.
 - `examples/vertexai_example.py` — runnable Vertex AI Model Garden example with tool-calling.
+- `examples/live_vertex_test.py` — live end-to-end test across Gemini, Claude, gpt-oss, Llama and self-deployed endpoints, printing raw responses.
+
+### Fixed
+- **`VertexAIProvider` no longer crashes on a usage payload with null token counts.** Vertex's `openai/gpt-oss-20b-maas` returns a usage object whose `prompt_tokens`/`completion_tokens`/`total_tokens` are all `None`. The guard checked only that the object existed, so those reached `Usage(...)` and raised a `ValidationError` that aborted the stream mid-response. Usage is now omitted when any count is missing rather than zero-filled, which would misreport a real token spend as free. Found by live testing; every unit-test mock supplied integers.
+- **`VertexAIProvider.chat(**kwargs)` now forwards to the API.** `max_tokens`, `top_p`, `stop`, `extra_body` and friends were accepted and silently discarded, so a caller migrating from `GeminiProvider` or `OpenAIProvider` lost their token cap with no error and no warning. Passthrough params are applied first, so the fields the provider owns cannot be overwritten.
+- `location="global"` built the nonexistent host `global-aiplatform.googleapis.com`. Google documents the global endpoint as the bare `aiplatform.googleapis.com` with no region prefix.
 
 ### Removed
 - **`GeminiProvider`'s Vertex mode.** The `vertexai`, `project`, and `location` parameters are gone, along with the matching public attributes and the `"gemini-vertexai"` value of `provider.name`. `GeminiProvider` now targets the Gemini Developer API only.

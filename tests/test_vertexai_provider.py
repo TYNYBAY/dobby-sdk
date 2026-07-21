@@ -1047,6 +1047,171 @@ def _make_openai_error(
     return error_cls()
 
 
+class TestIncompleteUsagePayload:
+    """A usage object whose token counts are all None must not kill the stream.
+
+    Observed live from Vertex's `openai/gpt-oss-20b-maas`: the SSE terminal chunk
+    carries a usage object with prompt_tokens/completion_tokens/total_tokens all
+    None. Guarding on `chunk.usage is not None` let those through into `Usage(...)`,
+    raising a pydantic ValidationError mid-stream and aborting the response.
+    Every mock in this suite supplied real integers, so no unit test caught it.
+    """
+
+    def _null_usage(self) -> SimpleNamespace:
+        return SimpleNamespace(prompt_tokens=None, completion_tokens=None, total_tokens=None)
+
+    def test_streaming_survives_null_usage_counts(self) -> None:
+        provider = _make_chat_provider()
+        chunks = [
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(content="hi"), finish_reason="stop")]
+            ),
+            _make_stream_chunk(choices=[], usage=self._null_usage()),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        end = events[-1]
+        assert isinstance(end, StreamEndEvent)
+        assert end.usage is None
+        assert end.parts == [TextPart(text="hi")]
+
+    def test_non_streaming_survives_null_usage_counts(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response("ok", usage=self._null_usage())
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.usage is None
+        assert result.parts == [TextPart(text="ok")]
+
+    def test_partially_null_usage_is_dropped_not_zero_filled(self) -> None:
+        """Zero-filling would report a real token spend as free."""
+        provider = _make_chat_provider()
+        partial = SimpleNamespace(prompt_tokens=10, completion_tokens=None, total_tokens=None)
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_make_response("ok", usage=partial)
+        )
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.usage is None
+
+    def test_complete_usage_still_reported(self) -> None:
+        provider = _make_chat_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_make_response("ok", usage=_make_usage(7, 3, 10))
+        )
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.usage == Usage(input_tokens=7, output_tokens=3, total_tokens=10)
+
+
+class TestKwargsPassthrough:
+    """`chat(**kwargs)` must reach the wire, as it does on every sibling provider.
+
+    Previously accepted and silently discarded: a caller migrating from
+    GeminiProvider or OpenAIProvider lost max_tokens with no error and no warning.
+    """
+
+    def _run(self, provider: VertexAIProvider, **chat_kwargs) -> dict:
+        provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
+        asyncio.run(
+            provider.chat(
+                messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                stream=False,
+                **chat_kwargs,
+            )
+        )
+        _, kwargs = provider._client.chat.completions.create.call_args
+        return kwargs
+
+    def test_extra_params_forwarded_verbatim(self) -> None:
+        kwargs = self._run(
+            _make_chat_provider(), max_tokens=64, top_p=0.5, stop=["\n"], extra_body={"google": {}}
+        )
+        assert kwargs["max_tokens"] == 64
+        assert kwargs["top_p"] == 0.5
+        assert kwargs["stop"] == ["\n"]
+        assert kwargs["extra_body"] == {"google": {}}
+
+    def test_no_extra_params_leaves_payload_unchanged(self) -> None:
+        """Backwards compatibility: the payload without kwargs is exactly as before."""
+        kwargs = self._run(_make_chat_provider())
+        assert set(kwargs) == {"model", "messages", "temperature"}
+
+    def test_owned_fields_cannot_be_clobbered(self) -> None:
+        """`extra` is applied first, so the provider's own fields win.
+
+        Note `chat()` itself is already safe: `model`, `messages`, `temperature`
+        and `tools` are explicit parameters, so passing them again raises
+        TypeError before `**kwargs` is even formed. This asserts the layer below,
+        where an `extra` dict is the only way those keys could arrive.
+        """
+        provider = _make_chat_provider()
+
+        built = provider._build_kwargs(
+            model="meta/llama-3.1-405b-instruct-maas",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.0,
+            extra={"model": "sneaky", "messages": [], "temperature": 99, "max_tokens": 8},
+        )
+
+        assert built["model"] == "meta/llama-3.1-405b-instruct-maas"
+        assert built["messages"] == [{"role": "user", "content": "hi"}]
+        assert built["temperature"] == 0.0
+        assert built["max_tokens"] == 8
+
+    def test_chat_rejects_duplicate_owned_params(self) -> None:
+        """Belt and braces: the explicit-parameter collision is a loud TypeError."""
+        provider = _make_chat_provider()
+
+        with pytest.raises(TypeError):
+            asyncio.run(
+                provider.chat(
+                    messages=[UserMessagePart(parts=[TextPart(text="hi")])],
+                    stream=False,
+                    **{"messages": []},  # type: ignore[misc]
+                )
+            )
+
+    def test_deployed_endpoint_model_stays_empty_despite_extra(self) -> None:
+        provider = VertexAIProvider(
+            endpoint_id="546", project="my-project", credentials=_mock_credentials()
+        )
+        provider._client = MagicMock()
+        kwargs = self._run(provider, max_tokens=32, model="anything")
+        assert kwargs["model"] == ""
+        assert kwargs["max_tokens"] == 32
+
+    def test_extra_params_forwarded_on_the_streaming_path(self) -> None:
+        provider = _make_chat_provider()
+        provider._client.chat.completions.create = AsyncMock(
+            return_value=_chunk_stream(
+                [
+                    _make_stream_chunk(
+                        choices=[_make_stream_choice(_make_delta(content="hi"), "stop")]
+                    )
+                ]
+            )
+        )
+
+        asyncio.run(_collect_stream_events(provider, max_tokens=64))
+
+        _, kwargs = provider._client.chat.completions.create.call_args
+        assert kwargs["max_tokens"] == 64
+        assert kwargs["stream"] is True
+
+
 class TestDedicatedEndpointHint:
     """A dedicated endpoint stops being served by the shared regional DNS.
 
