@@ -71,18 +71,18 @@ async for event in executor.run_stream(messages):
    ```
 
    ```bash
-   uv run --env-file .env python testVertex.py
+   uv run --env-file .env python examples/vertexai_example.py
    ```
 
    > Note: `scopes` is required here — a service-account credential (whether from `GOOGLE_APPLICATION_CREDENTIALS_JSON` or a key file) has no implicit scope; omitting it fails with `invalid_scope: Invalid OAuth scope or ID token audience provided.`
 
 **On GCP itself** (Cloud Run, GKE, Compute Engine): skip all of the above — attach a service account to the runtime and let ADC resolve it automatically via the metadata server. No key material to manage at all. The env-var approach above is only needed off-GCP (other clouds, local dev without `gcloud auth application-default login`).
 
-See [docs/providers/vertexai.md](./docs/providers/vertexai.md) for full provider docs.
+**Other auth styles** — a service-account key file, service-account impersonation, or plain ADC — are shown as runnable variants in `build_provider()` in [examples/vertexai_example.py](./examples/vertexai_example.py), with the full reference in [docs/providers/vertexai.md](./docs/providers/vertexai.md#authentication).
 
 ## Features
 
-- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic
+- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry), Gemini (Developer API), Vertex AI Model Garden
 - **Streaming**: Real-time token streaming with typed events
 - **Tools**: Dataclass-based tools with auto-generated schemas
 - **Context injection**: Pass runtime context to tools via `Injected[T]`

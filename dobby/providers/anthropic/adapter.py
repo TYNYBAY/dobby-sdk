@@ -1,7 +1,7 @@
 """Anthropic Claude provider for Dobby SDK.
 
 Implements the Provider interface for Anthropic's Messages API,
-supporting both direct Anthropic API and Azure-hosted Claude endpoints.
+supporting the direct Anthropic API and Azure-hosted Claude.
 """
 
 from collections.abc import AsyncIterator, Iterable
@@ -66,12 +66,12 @@ def _map_stop_reason(reason: str | None) -> StopReason:
     return "end_turn"
 
 
-class AnthropicProvider(Provider[AsyncAnthropic]):
-    """Provider for Anthropic Claude and Azure-hosted Claude using Messages API.
+class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
+    """Provider for Anthropic Claude and Azure-hosted Claude.
 
-    Supports direct Anthropic API and Azure AI Foundry deployments.
-    For Azure, uses AsyncAnthropicFoundry which sends the correct "api-key"
-    auth header and sets the proper base URL.
+    Supports the direct Anthropic API and Azure AI Foundry deployments. For
+    Azure, uses AsyncAnthropicFoundry which sends the correct "api-key" auth
+    header and sets the proper base URL.
 
     Azure env vars (read automatically by SDK if params not passed explicitly):
         ANTHROPIC_FOUNDRY_API_KEY: Azure API key.
@@ -82,7 +82,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
     api_key: str | None
     base_url: str | None
     _model: str
-    _client: AsyncAnthropic
+    _client: AsyncAnthropic | AsyncAnthropicFoundry
     _is_azure: bool
     max_retries: int
 
@@ -93,6 +93,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         base_url: str | None = None,
         resource: str | None = None,
         azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
+        *,
         max_retries: int = 3,
     ):
         """Initialize Anthropic provider.
@@ -162,7 +163,7 @@ class AnthropicProvider(Provider[AsyncAnthropic]):
         return self._model
 
     @property
-    def client(self) -> AsyncAnthropic:
+    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry:
         """Authenticated client instance."""
         return self._client
 

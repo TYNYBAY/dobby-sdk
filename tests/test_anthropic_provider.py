@@ -581,6 +581,87 @@ class TestRedactedThinking:
 # ---------------------------------------------------------------------------
 
 
+class TestConstructorSignature:
+    """Pin the public constructor surface of every provider.
+
+    These strings and argument positions are published API. Nothing else in the
+    suite asserts them, so a future edit could narrow or reorder them silently.
+    """
+
+    def test_anthropic_max_retries_is_keyword_only(self) -> None:
+        """max_retries must not be bindable positionally.
+
+        Keyword-only enforcement stops a positional caller from binding their
+        retry count to whatever parameter happens to sit in that slot.
+        """
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        with pytest.raises(TypeError):
+            AnthropicProvider("claude-sonnet-4-5", None, None, None, None, 5)  # type: ignore[misc]
+
+    def test_gemini_max_retries_is_keyword_only(self) -> None:
+        """Regression: `vertexai` used to be the 3rd positional parameter.
+
+        `GeminiProvider("m", None, True)` was valid in published 0.2.15 and meant
+        "use Vertex". With `vertexai` removed, the keyword-only boundary stops True
+        from binding to the retry count and silently routing traffic to the
+        Developer API. It must raise instead.
+        """
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with pytest.raises(TypeError):
+            GeminiProvider("gemini-2.5-flash", None, True)  # type: ignore[misc]
+
+    def test_removed_vertex_params_raise_type_error(self) -> None:
+        """The removals must fail loud, never fall back to another backend."""
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        for anthropic_kwargs in (
+            {"vertex": True},
+            {"project_id": "p"},
+            {"region": "us-east5"},
+            {"access_token": "t"},
+        ):
+            with pytest.raises(TypeError):
+                AnthropicProvider(model="claude-sonnet-4-5", **anthropic_kwargs)  # type: ignore[arg-type]
+
+        for gemini_kwargs in ({"vertexai": True}, {"project": "p"}, {"location": "us-central1"}):
+            with pytest.raises(TypeError):
+                GeminiProvider(model="gemini-2.5-flash", **gemini_kwargs)  # type: ignore[arg-type]
+
+    def test_removed_gemini_attributes_are_gone(self) -> None:
+        """`vertexai`/`project`/`location` were public attributes, not just params.
+
+        Reading them is a distinct failure mode from the constructor TypeError,
+        so it gets its own assertion.
+        """
+        from unittest.mock import patch as _patch
+
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with _patch("dobby.providers.gemini.adapter.genai.Client"):
+            provider = GeminiProvider(model="gemini-2.5-flash", api_key="k")
+
+        for attr in ("vertexai", "project", "location"):
+            assert not hasattr(provider, attr)
+
+    def test_provider_name_values(self) -> None:
+        """`name` values are published API — consumers match on these strings."""
+        from unittest.mock import patch as _patch
+
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        with _patch("dobby.providers.anthropic.adapter.AsyncAnthropic"):
+            assert AnthropicProvider(model="claude-sonnet-4-5", api_key="k").name == "anthropic"
+        with _patch("dobby.providers.anthropic.adapter.AsyncAnthropicFoundry"):
+            azure = AnthropicProvider(model="claude-sonnet-4-5", api_key="k", resource="r")
+        assert azure.name == "azure-anthropic"
+        with _patch("dobby.providers.gemini.adapter.genai.Client"):
+            assert GeminiProvider(model="gemini-2.5-flash", api_key="k").name == "gemini"
+
+
 class TestAzureValidation:
     """Test fail-fast validation of mutually exclusive Azure params."""
 
@@ -605,11 +686,6 @@ class TestAzureValidation:
                 resource="my-resource",
                 base_url="https://my-resource.services.ai.azure.com/anthropic/",
             )
-
-
-# ---------------------------------------------------------------------------
-# Per-call model override + passthrough (end-to-end via mocked client)
-# ---------------------------------------------------------------------------
 
 
 class TestChatModelOverride:

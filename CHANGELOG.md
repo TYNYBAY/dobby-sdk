@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-07-20
+
+Vertex AI now has one route into this SDK: `VertexAIProvider`, against Vertex's
+OpenAI-compatible Model Garden endpoint. The per-vendor Vertex flags are gone.
+
+### Added
+- **`VertexAIProvider` supports self-deployed endpoints.** Pass `endpoint_id=` to route through `endpoints/{id}` instead of the shared Model Garden path; the endpoint selects the model, so `model=` becomes an optional display label and is not sent on the wire. `endpoint_host=` carries a dedicated endpoint's DNS, required once an endpoint has `dedicatedEndpointEnabled` because the shared regional DNS stops serving it. `api_version=` defaults to `"v1"`. The docs previously claimed this support without implementing it.
+- `examples/vertexai_example.py` — runnable Vertex AI Model Garden example with tool-calling.
+- `examples/live_vertex_test.py` — live end-to-end test across Gemini, Claude, gpt-oss, Llama and self-deployed endpoints, printing raw responses.
+
+### Fixed
+- **`VertexAIProvider` no longer crashes on a usage payload with null token counts.** Vertex's `openai/gpt-oss-20b-maas` returns a usage object whose `prompt_tokens`/`completion_tokens`/`total_tokens` are all `None`. The guard checked only that the object existed, so those reached `Usage(...)` and raised a `ValidationError` that aborted the stream mid-response. Usage is now omitted when any count is missing rather than zero-filled, which would misreport a real token spend as free. Found by live testing; every unit-test mock supplied integers.
+- **`VertexAIProvider.chat(**kwargs)` now forwards to the API.** `max_tokens`, `top_p`, `stop`, `extra_body` and friends were accepted and silently discarded, so a caller migrating from `GeminiProvider` or `OpenAIProvider` lost their token cap with no error and no warning. Passthrough params are applied first, so the fields the provider owns cannot be overwritten.
+- `location="global"` built the nonexistent host `global-aiplatform.googleapis.com`. Google documents the global endpoint as the bare `aiplatform.googleapis.com` with no region prefix.
+
+### Removed
+- **`GeminiProvider`'s Vertex mode.** The `vertexai`, `project`, and `location` parameters are gone, along with the matching public attributes and the `"gemini-vertexai"` value of `provider.name`. `GeminiProvider` now targets the Gemini Developer API only.
+- **`AnthropicProvider`'s Vertex mode.** The `vertex`, `project_id`, `region`, `credentials`, and `access_token` parameters are gone, along with the `"anthropic-vertex"` value of `provider.name`. `AnthropicProvider` now targets the direct Anthropic API and Azure AI Foundry only, and no longer imports `google.auth`.
+- **`VertexAIProvider`'s model-family guard.** `google/gemini-*`, `gemini-*`, `claude-*`, and `anthropic/*` model ids are no longer rejected — well-formed ids are forwarded verbatim, at construction and on per-call `model=` overrides alike. The guard also rejected legitimately-named self-deployed containers (e.g. `gemini-finetune-v2`) and matched only unqualified prefixes, so fully-qualified ids bypassed it anyway.
+
+### Breaking
+- **`GeminiProvider`'s Vertex mode was published API.** `vertexai`, `project`, and `location` shipped in `0.2.15`, the latest release on PyPI. Three distinct failure modes for existing callers:
+  - `GeminiProvider(vertexai=True, ...)` raises `TypeError`.
+  - Reading `provider.vertexai`, `provider.project`, or `provider.location` raises `AttributeError`. These were public instance attributes, not only constructor parameters.
+  - `provider.name` can no longer return `"gemini-vertexai"`. Code matching on that string does not raise — it silently takes the wrong branch. Audit routing, metrics dimensions, and log filters that key on it.
+
+  There is no equivalent replacement. `VertexAIProvider` reaches Vertex-hosted models through the OpenAI-compatible endpoint, but on a cruder path: no thought-signature handling, coarser finish-reason mapping. Treat it as a behavior change, not a drop-in swap.
+- `GeminiProvider.__init__` makes `max_retries` keyword-only. Deliberate: `vertexai` used to be the 3rd positional parameter, so `GeminiProvider("gemini-2.5-flash", None, True)` would otherwise bind `True` to the retry count and silently route traffic to the Developer API when the caller meant Vertex. Keyword-only turns that into a loud `TypeError`.
+- `AnthropicProvider(vertex=True, ...)` raises `TypeError` and `provider.name` no longer returns `"anthropic-vertex"`. Unlike the Gemini removal this API was added in the unpublished `0.2.17`, so only callers tracking this branch are affected.
+- `AnthropicProvider.__init__` keeps `max_retries` keyword-only. Against published `0.2.15`, where it was the 6th positional parameter, a positional caller now gets a `TypeError`.
+
+`VertexAIProvider` still rejects a `None`, empty, or whitespace-only model id at
+construction and on per-call overrides. That check is plain input validation and
+survives the family-guard removal.
+
+Version `0.2.16` was never published; the effective upgrade path for users is
+`0.2.15 → 0.2.17`.
+
 ## [0.2.16] - 2026-06-08
 
 ### Added

@@ -1,5 +1,11 @@
 # Vertex AI Provider — Requirements
 
+> **Historical record.** `VertexAIProvider` shipped and most of this document still
+> holds. One premise no longer does: the references below to Gemini-on-Vertex being
+> covered by `GeminiProvider(vertexai=True)` were accurate when written. Those
+> parameters were removed in `0.2.17`, so `VertexAIProvider` is now the only Vertex
+> route in the SDK. See the `0.2.17` CHANGELOG entry.
+
 **Date:** 2026-07-07
 **Status:** Ready for planning
 **Scope tier:** Deep — feature (existing product shape; extends the established Provider abstraction)

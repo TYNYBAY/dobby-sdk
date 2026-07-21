@@ -8,6 +8,7 @@ bearer token transparently on every request via the OpenAI SDK's native async-ca
 `api_key` hook.
 """
 
+from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import AsyncIterator, Iterable, Sequence
 import json
@@ -49,10 +50,103 @@ from .converters import to_vertexai_messages
 
 __all__ = ["VertexAIProvider"]
 
-# Env var carrying a full service-account key as a stringified JSON blob — lets
-# credentials be injected as a single secret (e.g. from a secret manager) rather
-# than a key file on disk. Only consulted when `credentials` isn't passed explicitly.
-_CREDENTIALS_JSON_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+
+def _require_non_empty_model(model: str | None) -> str:
+    """Validate and return a model id.
+
+    Plain input validation, deliberately with no model-family matching: this
+    provider forwards every well-formed id verbatim. Without this check a `None`
+    or empty id constructs successfully and reaches the wire as a null model
+    field, turning a config typo into an opaque server-side error.
+
+    Returns:
+        The validated model id, so callers get a narrowed `str`.
+
+    Raises:
+        ValueError: `model` is `None`, empty, or whitespace-only.
+    """
+    if not model or not model.strip():
+        raise ValueError("VertexAIProvider requires a non-empty model id.")
+    return model
+
+
+class _EndpointTarget(ABC):
+    """Where a request is routed, and what the body's `model` field carries.
+
+    Vertex exposes the same OpenAI-compatible Chat Completions surface at two
+    different paths whose contracts differ in exactly two ways: the endpoints
+    path segment, and whether the body's `model` field means anything. Both are
+    answered here so neither `chat()` nor `_build_kwargs()` has to branch.
+    """
+
+    @property
+    @abstractmethod
+    def path_segment(self) -> str:
+        """Value for the `endpoints/{...}` segment of the base URL."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def body_model(self, model: str) -> str:
+        """Value to send as the request body's `model` field."""
+        raise NotImplementedError()
+
+
+class _ModelGardenTarget(_EndpointTarget):
+    """Model Garden / MaaS publisher models, e.g. `meta/llama-3.3-70b-instruct-maas`.
+
+    Routed through the literal `openapi` path segment. The model id is required
+    and is what selects the model, so it is forwarded verbatim.
+    """
+
+    @property
+    def path_segment(self) -> str:
+        return "openapi"
+
+    def body_model(self, model: str) -> str:
+        return model
+
+
+class _DeployedEndpointTarget(_EndpointTarget):
+    """A self-deployed / custom-deployed endpoint, addressed by its numeric id.
+
+    The endpoint id alone selects the model, so Vertex ignores the body's
+    `model` field entirely -- Google's REST samples omit it and their
+    OpenAI-SDK samples send `""`. We send `""` because the OpenAI SDK requires
+    the argument. Sending anything else is harmless but misleading.
+    """
+
+    def __init__(self, endpoint_id: str) -> None:
+        self._endpoint_id = endpoint_id
+
+    @property
+    def path_segment(self) -> str:
+        return self._endpoint_id
+
+    def body_model(self, model: str) -> str:
+        return ""
+
+
+def _resolve_host(location: str, endpoint_host: str | None) -> str:
+    """Resolve the API host for a location, honouring an explicit override.
+
+    Three cases, in order:
+
+    1. `endpoint_host` given -- a dedicated endpoint's DNS. Used verbatim. Once
+       an endpoint has `dedicatedEndpointEnabled`, the shared regional DNS stops
+       serving it, so this cannot be derived and must be supplied.
+    2. `location == "global"` -- the host carries **no** region prefix. Building
+       `global-aiplatform.googleapis.com` is the classic URL bug here.
+    3. Otherwise the regional host.
+    """
+    if endpoint_host:
+        # The Endpoint resource's `dedicatedEndpointDns` is documented with a
+        # scheme but returned by the API without one, and the official Python
+        # client prepends `https://` unconditionally. Accept either.
+        return endpoint_host.removeprefix("https://").removeprefix("http://").rstrip("/")
+    if location == "global":
+        return "aiplatform.googleapis.com"
+    return f"{location}-aiplatform.googleapis.com"
+
 
 # Vertex Chat Completions finish_reason values that map 1:1 (via this table)
 # onto Dobby's StopReason. "tool_calls" is included for completeness, but
@@ -83,6 +177,30 @@ _MAX_TOOL_CALL_INDICES = 64
 _MAX_ACCUMULATED_TOOL_CALL_ARGUMENTS_LENGTH = 1_000_000
 
 
+def _usage_from(raw: Any) -> Usage | None:
+    """Build a `Usage` from a Chat Completions usage payload, or `None`.
+
+    Presence of the usage object is not enough: real OpenAI-compatible backends
+    send one whose token counts are all `None` (observed live from Vertex's
+    `openai/gpt-oss-20b-maas`). Constructing `Usage` from those raises a
+    `ValidationError` that kills the stream mid-flight, so every field is checked
+    rather than just the container.
+
+    Returns `None` when any count is missing, which is the documented contract:
+    streaming usage is best-effort and never normalised. Substituting zeros would
+    misreport a real token spend as free.
+    """
+    if raw is None:
+        return None
+    prompt = getattr(raw, "prompt_tokens", None)
+    completion = getattr(raw, "completion_tokens", None)
+    total = getattr(raw, "total_tokens", None)
+    if prompt is None or completion is None or total is None:
+        logger.debug(f"Ignoring incomplete usage payload from Vertex: {raw!r}")
+        return None
+    return Usage(input_tokens=prompt, output_tokens=completion, total_tokens=total)
+
+
 def _map_finish_reason(reason: str | None) -> StopReason:
     """Map a Vertex AI Chat Completions finish_reason onto Dobby's StopReason.
 
@@ -100,10 +218,29 @@ def _map_finish_reason(reason: str | None) -> StopReason:
 class VertexAIProvider(Provider[AsyncOpenAI]):
     """Provider for Vertex AI's OpenAI-compatible Model-as-a-Service (MaaS) endpoint.
 
-    Targets Vertex AI's Model Garden catalog (Llama, self-deployed containers, and any
-    other serving container that speaks OpenAI's Chat Completions wire format) through
-    `POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/
-    {location}/endpoints/openapi/chat/completions`.
+    Serves both of Vertex's OpenAI-compatible Chat Completions surfaces:
+
+    - **Model Garden / MaaS** (default) — publisher models such as
+      `meta/llama-3.3-70b-instruct-maas`, routed through the shared `endpoints/openapi`
+      path. The model id selects the model and is sent in the request body.
+    - **Self-deployed endpoints** (`endpoint_id=`) — a model you deployed yourself,
+      routed through `endpoints/{endpoint_id}`. The endpoint selects the model, so
+      Vertex ignores the body's `model` field and this provider sends `""`, matching
+      Google's own OpenAI-SDK samples.
+
+    ```
+    POST https://{host}/{api_version}/projects/{project}/locations/{location}
+         /endpoints/{openapi|endpoint_id}/chat/completions
+    ```
+
+    `host` is `{location}-aiplatform.googleapis.com`, or bare
+    `aiplatform.googleapis.com` when `location="global"`, or an explicit
+    `endpoint_host` for a dedicated endpoint's DNS.
+
+    Model ids are forwarded verbatim — no allow-list, no family validation. This endpoint
+    will also serve native Gemini and Claude ids, though through a cruder path than a
+    dedicated native client would (no thought-signature handling, coarser finish-reason
+    mapping).
 
     Auth resolves, in order: an explicitly supplied `google.auth.credentials.Credentials`
     object; a stringified service-account key in the `GOOGLE_APPLICATION_CREDENTIALS_JSON`
@@ -116,6 +253,8 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     Attributes:
         project: GCP project ID.
         location: GCP location (default: us-central1).
+        endpoint_id: Self-deployed endpoint id, or None for Model Garden.
+        api_version: API version path segment (default: "v1").
         scopes: OAuth scopes forwarded to `google.auth.default()` (only used when no
             explicit `credentials` is supplied).
         max_retries: Maximum retry attempts for transient errors.
@@ -132,25 +271,71 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     project: str
     location: str
     scopes: Sequence[str] | None
+    endpoint_id: str | None
+    api_version: str
+    _target: _EndpointTarget
     _model: str
     _credentials: google.auth.credentials.Credentials
     _client: AsyncOpenAI
     max_retries: int
 
+    # Model Garden: `model` is required, endpoint parameters are not accepted.
+    @overload
     def __init__(
         self,
         model: str,
+        project: str | None = ...,
+        location: str = ...,
+        credentials: google.auth.credentials.Credentials | None = ...,
+        scopes: Sequence[str] | None = ...,
+        max_retries: int = ...,
+        *,
+        api_version: str = ...,
+    ) -> None: ...
+
+    # Self-deployed: `endpoint_id` is required, `model` is an optional label.
+    @overload
+    def __init__(
+        self,
+        model: str | None = ...,
+        project: str | None = ...,
+        location: str = ...,
+        credentials: google.auth.credentials.Credentials | None = ...,
+        scopes: Sequence[str] | None = ...,
+        max_retries: int = ...,
+        *,
+        endpoint_id: str,
+        endpoint_host: str | None = ...,
+        api_version: str = ...,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        model: str | None = None,
         project: str | None = None,
         location: str = "us-central1",
         credentials: google.auth.credentials.Credentials | None = None,
         scopes: Sequence[str] | None = None,
         max_retries: int = 3,
+        *,
+        endpoint_id: str | None = None,
+        endpoint_host: str | None = None,
+        api_version: str = "v1",
     ):
         """Initialize Vertex AI provider.
 
+        The two endpoint types are separate overloads, so a type checker rejects
+        `endpoint_host` without `endpoint_id`, and a missing `model` without an
+        `endpoint_id`, before the code runs. The runtime checks below still fire
+        for untyped callers.
+
         Args:
             model: Publisher-qualified model id (e.g. "meta/llama-3.1-405b-instruct-maas"),
-                forwarded verbatim — no hardcoded allow-list.
+                forwarded verbatim — no hardcoded allow-list. **Required for Model
+                Garden.** For a self-deployed endpoint (`endpoint_id` set) the endpoint
+                itself selects the model, so this is optional and used only as a display
+                label for `provider.model` and `StreamEndEvent.model`; it is never sent
+                on the wire. Defaults to `"endpoint-{endpoint_id}"` in that mode.
             project: GCP project ID. When omitted, derived from the resolved credentials'
                 `project_id` (service-account credentials only — from `GOOGLE_APPLICATION_CREDENTIALS_JSON`,
                 a key file, or a directly-supplied service-account `credentials` object) or
@@ -169,22 +354,69 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 or a service-account key file — those credential types have no
                 implicit scope and requests fail with `invalid_scope` otherwise.
             max_retries: Maximum retry attempts for transient errors (default: 3).
+            endpoint_id: Keyword-only. Numeric id of a self-deployed / custom-deployed
+                endpoint. Switches routing from the shared `endpoints/openapi` path to
+                `endpoints/{endpoint_id}`, and stops sending `model` on the wire because
+                the endpoint selects the model itself. Omit for Model Garden.
+            endpoint_host: Keyword-only. A dedicated endpoint's DNS, as returned in the
+                Endpoint resource's `dedicatedEndpointDns` (e.g.
+                "1234567890.us-central1-987654321.prediction.vertexai.goog"). Required
+                once an endpoint has `dedicatedEndpointEnabled`, because the shared
+                regional DNS stops serving it. Read this value from the API — the uid
+                segment is not always the project number. A leading scheme is stripped
+                if present. Only valid alongside `endpoint_id`.
+            api_version: Keyword-only. API version path segment (default: "v1").
+                Google registers both "v1" and "v1beta1" for this route and documents
+                neither as preferred; their dedicated-endpoint samples use "v1beta1",
+                and "v1beta1" is also required for Gemini preview fields.
 
         Raises:
-            ValueError: `project` is omitted and can't be derived from the resolved
-                credentials.
+            ValueError: `model` is empty/`None`/whitespace-only without an `endpoint_id`;
+                `endpoint_host` is given without `endpoint_id`; `endpoint_id` is empty or
+                whitespace-only; `api_version` is empty; or `project` is omitted and can't
+                be derived from the resolved credentials.
+
+        Note:
+            Chat Completions on a self-deployed endpoint requires a serving container
+            that implements it — Google's prebuilt vLLM and HF TGI containers do, an
+            arbitrary custom container may only support `:rawPredict`, which this
+            provider does not speak.
         """
-        self._model = model
+        self._target: _EndpointTarget
+        if endpoint_id is not None:
+            if not endpoint_id.strip():
+                raise ValueError(
+                    "VertexAIProvider requires a non-empty endpoint_id when one is given."
+                )
+            self._target = _DeployedEndpointTarget(endpoint_id)
+            # The endpoint selects the model, so `model` is a display label only.
+            resolved_model = model or f"endpoint-{endpoint_id}"
+        else:
+            if endpoint_host is not None:
+                raise ValueError(
+                    "endpoint_host is only valid together with endpoint_id — a dedicated "
+                    "DNS belongs to a deployed endpoint, not to the shared Model Garden path."
+                )
+            self._target = _ModelGardenTarget()
+            resolved_model = _require_non_empty_model(model)
+
+        if not api_version.strip():
+            raise ValueError("VertexAIProvider requires a non-empty api_version.")
+
+        self._model = resolved_model
         self.location = location
         self.scopes = scopes
         self.max_retries = max_retries
+        self.endpoint_id = endpoint_id
+        self.api_version = api_version
+        self._endpoint_host = endpoint_host
 
         resolved_project = project
         if credentials is not None:
             self._credentials = credentials
             if resolved_project is None:
                 resolved_project = getattr(credentials, "project_id", None)
-        elif credentials_json := os.environ.get(_CREDENTIALS_JSON_ENV_VAR):
+        elif credentials_json := os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
             info = json.loads(credentials_json)
             self._credentials = service_account.Credentials.from_service_account_info(
                 info, scopes=scopes
@@ -205,17 +437,18 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
 
         self._refresh_lock = asyncio.Lock()
 
+        host = _resolve_host(location, endpoint_host)
         self._client = AsyncOpenAI(
             base_url=(
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/{self.project}"
-                f"/locations/{location}/endpoints/openapi"
+                f"https://{host}/{api_version}/projects/{self.project}"
+                f"/locations/{location}/endpoints/{self._target.path_segment}"
             ),
             api_key=self._bearer_token,
         )
 
     @property
     def name(self) -> str:
-        """Provider name (distinct from GeminiProvider's "gemini-vertexai")."""
+        """Provider name."""
         return "vertexai"
 
     @property
@@ -245,7 +478,13 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 await asyncio.to_thread(
                     self._credentials.refresh, google.auth.transport.requests.Request()
                 )
-            return self._credentials.token
+            token = self._credentials.token
+            if token is None:
+                raise DobbyProviderError(
+                    "Vertex AI credentials resolved to no access token after refresh.",
+                    provider="vertexai",
+                )
+            return token
 
     @overload
     async def chat(
@@ -298,53 +537,96 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 Completions endpoint (see `to_vertexai_tool()`), matching how
                 sibling providers (`OpenAIProvider`, `GeminiProvider`) expect
                 pre-formatted tools rather than converting them here.
-            model: Per-call model override. Falls back to the instance model.
-            **kwargs: Reserved for future Vertex-specific parameters.
+            model: Per-call model override. Falls back to the instance model. On a
+                self-deployed endpoint the endpoint selects the model, so an override
+                changes only the reported `StreamEndEvent.model`, not what is served.
+            **kwargs: Provider-native passthrough params forwarded verbatim to
+                `chat.completions.create()` (e.g. `max_tokens`, `top_p`, `stop`,
+                `extra_body`). Matches how `GeminiProvider` and `OpenAIProvider`
+                treat their own passthrough. Vertex ignores parameters a model
+                does not support rather than rejecting them, and third-party
+                model support varies -- consult the model's own documentation.
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming.
         """
+        # A whitespace-only override is a typo, not a fallback signal; an empty
+        # string still falls through to the instance model as before.
+        if model:
+            _require_non_empty_model(model)
+        target_model = model or self._model
+
         vertexai_messages = to_vertexai_messages(messages)
         if system_prompt is not None:
             vertexai_messages.insert(0, {"role": "system", "content": system_prompt})
 
-        target_model = model or self._model
-
         if stream:
             return self._stream_chat_completion(
-                vertexai_messages, target_model, temperature, tools
+                vertexai_messages, target_model, temperature, tools, kwargs
             )
 
         return await self._non_stream_chat_completion(
-            vertexai_messages, target_model, temperature, tools
+            vertexai_messages, target_model, temperature, tools, kwargs
         )
 
-    @staticmethod
     def _build_kwargs(
+        self,
         model: str,
         messages: list[dict[str, Any]],
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build kwargs for chat.completions.create(), excluding unset optionals.
 
+        The `model` field is delegated to the endpoint target: Model Garden needs
+        it to select the model, a self-deployed endpoint ignores it entirely and
+        receives `""`.
+
         Args:
-            model: Model id.
+            model: Model id (per-call override or instance model).
             messages: Chat-Completions-formatted messages.
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params, applied first so the
+                fields this provider owns -- `model` above all, which must stay
+                `""` on a self-deployed endpoint -- cannot be overwritten.
 
         Returns:
             Dictionary of kwargs to pass to chat.completions.create().
         """
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
+        kwargs: dict[str, Any] = dict(extra or {})
+        kwargs.update(
+            {
+                "model": self._target.body_model(model),
+                "messages": messages,
+                "temperature": temperature,
+            }
+        )
         if tools is not None:
             kwargs["tools"] = tools
         return kwargs
+
+    def _dedicated_endpoint_hint(self) -> str:
+        """Return a remediation hint for the dedicated-endpoint misconfiguration, if it fits.
+
+        Enabling `dedicatedEndpointEnabled` on an endpoint stops the shared regional
+        DNS from serving it, which surfaces as a 404 or a connection failure rather
+        than anything self-describing. Nothing client-side can detect the flag without
+        an admin API call this provider deliberately does not make, so instead of
+        guessing we name the one setting that fixes it — and only when the shape of
+        the failure actually matches (a deployed endpoint reached over the shared host).
+
+        Returns:
+            A hint to append to the error message, or `""` when not applicable.
+        """
+        if self.endpoint_id is None or self._endpoint_host is not None:
+            return ""
+        return (
+            f" — if endpoint {self.endpoint_id!r} has a dedicated DNS "
+            "(`dedicatedEndpointEnabled`), the shared regional host no longer serves it. "
+            "Pass the endpoint's `dedicatedEndpointDns` as `endpoint_host=`."
+        )
 
     def _translate_error(self, e: Exception) -> NoReturn:
         """Map OpenAI SDK exceptions to unified dobby errors.
@@ -366,6 +648,12 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             DobbyProviderError: For all other API errors.
         """
         match e:
+            case openai.APIStatusError() if e.status_code == 404:
+                raise DobbyProviderError(
+                    f"{e}{self._dedicated_endpoint_hint()}",
+                    provider=self.name,
+                    status_code=404,
+                ) from e
             case openai.RateLimitError():
                 retry_after = None
                 if hasattr(e, "response") and e.response is not None:
@@ -381,7 +669,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             case openai.APITimeoutError():
                 raise DobbyAPITimeoutError(str(e), provider=self.name) from e
             case openai.APIConnectionError():
-                raise DobbyAPIConnectionError(str(e), provider=self.name) from e
+                raise DobbyAPIConnectionError(
+                    f"{e}{self._dedicated_endpoint_hint()}", provider=self.name
+                ) from e
             case openai.InternalServerError():
                 raise DobbyInternalServerError(
                     str(e), provider=self.name, status_code=e.status_code
@@ -400,6 +690,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         model: str,
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -412,12 +703,14 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             model: Model id (per-call override or instance model).
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params forwarded verbatim to
+                chat.completions.create().
 
         Returns:
             StreamEndEvent with the complete response.
         """
         create_kwargs = self._build_kwargs(
-            model=model, messages=messages, temperature=temperature, tools=tools
+            model=model, messages=messages, temperature=temperature, tools=tools, extra=extra
         )
 
         try:
@@ -445,13 +738,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             "tool_use" if tool_calls else _map_finish_reason(response.choices[0].finish_reason)
         )
 
-        usage: Usage | None = None
-        if response.usage:
-            usage = Usage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
+        usage = _usage_from(response.usage)
 
         return StreamEndEvent(
             model=response.model or model,
@@ -467,6 +754,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         model: str,
         temperature: float = 0.0,
         tools: list[Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Streaming chat completion with retry support.
 
@@ -489,13 +777,15 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             model: Model id (per-call override or instance model).
             temperature: Sampling temperature.
             tools: Optional, already Chat-Completions-formatted tool schemas.
+            extra: Provider-native passthrough params forwarded verbatim to
+                chat.completions.create().
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
             ToolUseEvent, StreamErrorEvent, StreamEndEvent.
         """
         create_kwargs = self._build_kwargs(
-            model=model, messages=messages, temperature=temperature, tools=tools
+            model=model, messages=messages, temperature=temperature, tools=tools, extra=extra
         )
         create_kwargs["stream"] = True
         create_kwargs["stream_options"] = {"include_usage": True}
@@ -540,12 +830,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
             # Checked independent of `choices` length: some OpenAI-compatible
             # (vLLM-backed) servers don't guarantee a dedicated empty-choices
             # usage chunk the way native OpenAI does.
-            if chunk.usage is not None:
-                usage = Usage(
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                    total_tokens=chunk.usage.total_tokens,
-                )
+            chunk_usage = _usage_from(chunk.usage)
+            if chunk_usage is not None:
+                usage = chunk_usage
 
             if not chunk.choices:
                 continue

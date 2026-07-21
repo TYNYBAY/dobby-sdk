@@ -47,33 +47,21 @@ __all__ = ["GeminiProvider"]
 class GeminiProvider(Provider[genai.Client]):
     """Provider for Google Gemini models using the google-genai SDK.
 
-    Supports both the Gemini Developer API and Vertex AI backends.
-    Implements streaming and non-streaming chat completions with tool support.
+    Targets the Gemini Developer API. Implements streaming and non-streaming
+    chat completions with tool support. For Vertex-hosted models use
+    `VertexAIProvider`.
 
     Attributes:
-        api_key: API key for Gemini Developer API (optional if using Vertex AI)
-        vertexai: Whether to use Vertex AI backend
-        project: GCP project ID (required for Vertex AI)
-        location: GCP location (default: us-central1)
+        api_key: API key for the Gemini Developer API
 
     Example:
         ```python
         # Gemini Developer API
         provider = GeminiProvider(model="gemini-2.5-flash", api_key="...")
-
-        # Vertex AI
-        provider = GeminiProvider(
-            model="gemini-2.5-flash",
-            vertexai=True,
-            project="my-project",
-        )
         ```
     """
 
     api_key: str | None
-    vertexai: bool
-    project: str | None
-    location: str
     _model: str
     _client: genai.Client
     max_retries: int
@@ -82,9 +70,7 @@ class GeminiProvider(Provider[genai.Client]):
         self,
         model: str,
         api_key: str | None = None,
-        vertexai: bool = False,
-        project: str | None = None,
-        location: str = "us-central1",
+        *,
         max_retries: int = 3,
     ):
         """Initialize Gemini provider.
@@ -95,32 +81,25 @@ class GeminiProvider(Provider[genai.Client]):
                         'gemini-3-flash-preview', 'gemini-3-pro-preview'
             api_key: API key for Gemini Developer API.
                 Uses GEMINI_API_KEY or GOOGLE_API_KEY env var if not provided.
-            vertexai: Whether to use Vertex AI instead of Developer API.
-            project: GCP project ID (required for Vertex AI).
-            location: GCP location (default: us-central1).
-            max_retries: Maximum retry attempts for transient errors (default: 3).
+            max_retries: Keyword-only. Maximum retry attempts for transient errors
+                (default: 3).
+
+        `max_retries` is keyword-only because `vertexai` used to occupy the third
+        positional slot. Without the boundary, a caller still writing
+        `GeminiProvider("gemini-2.5-flash", None, True)` would bind `True` to the
+        retry count and be silently routed to the Developer API when they meant
+        Vertex. Keyword-only turns that into a loud `TypeError`.
         """
         self.api_key = api_key
-        self.vertexai = vertexai
-        self.project = project
-        self.location = location
         self._model = model
         self.max_retries = max_retries
 
-        # Initialize client based on backend
-        if vertexai:
-            self._client = genai.Client(
-                vertexai=True,
-                project=project,
-                location=location,
-            )
-        else:
-            self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(api_key=api_key)
 
     @property
     def name(self) -> str:
         """Provider name."""
-        return "gemini-vertexai" if self.vertexai else "gemini"
+        return "gemini"
 
     @property
     def model(self) -> str:

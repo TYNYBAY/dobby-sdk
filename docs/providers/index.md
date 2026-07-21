@@ -8,8 +8,9 @@ Providers are the interface between Dobby and LLM APIs. Each provider handles me
 |----------|--------|-----|
 | [OpenAI](./openai.md) | ✅ Stable | Responses API |
 | Azure OpenAI | ✅ Stable | Responses API |
-| Anthropic | ✅ Stable | Messages API |
-| [Vertex AI](./vertexai.md) | ✅ Stable | Chat Completions API (OpenAI-compatible) |
+| Anthropic | ✅ Stable | Messages API (direct and Azure AI Foundry) |
+| Gemini | ✅ Stable | `google-genai` (Developer API) |
+| [Vertex AI](./vertexai.md) | ✅ Stable | Chat Completions API (OpenAI-compatible; Model Garden) |
 
 ## Common Interface
 

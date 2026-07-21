@@ -1,13 +1,19 @@
 ---
 title: "Add Vertex AI Provider (OpenAI-Compatible MaaS Endpoint)"
 type: feat
-status: active
+status: shipped
 created: 2026-07-07
 deepened: 2026-07-07
 origin: docs/brainstorms/vertexai-provider-requirements.md
 ---
 
 # Add Vertex AI Provider (OpenAI-Compatible MaaS Endpoint)
+
+> **Shipped.** `VertexAIProvider` landed and the plan below still describes it accurately,
+> with one exception: the Problem Frame's claim that Gemini-via-Vertex is covered by
+> `GeminiProvider` was true when written and is not any more. `GeminiProvider`'s
+> `vertexai`/`project`/`location` parameters were removed in `0.2.17`, so `VertexAIProvider`
+> is now the only Vertex route in the SDK. See the `0.2.17` CHANGELOG entry.
 
 ## Problem Frame
 
