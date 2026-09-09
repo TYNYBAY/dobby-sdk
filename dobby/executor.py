@@ -9,6 +9,7 @@ This module provides the AgentExecutor class which handles:
 import asyncio
 from collections.abc import AsyncIterator
 import inspect
+import traceback
 from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ from .types import (
     StreamEndEvent,
     StreamEvent,
     TextPart,
+    ToolErrorDetails,
     ToolResultEvent,
     ToolResultPart,
     ToolStreamEvent,
@@ -35,6 +37,16 @@ from .types import (
 OUTPUT_TOOL_NAME = "final_result"
 
 
+def _tool_error_details(exception: Exception) -> ToolErrorDetails:
+    """Create structured diagnostics for a tool execution exception."""
+    return ToolErrorDetails(
+        exception_type=type(exception).__qualname__,
+        exception_module=type(exception).__module__,
+        message=str(exception),
+        traceback="".join(traceback.format_exception(exception)),
+    )
+
+
 class ToolCallResult(NamedTuple):
     """Result from executing a single tool call."""
 
@@ -42,6 +54,7 @@ class ToolCallResult(NamedTuple):
     tool_call_id: str
     result: Any
     is_error: bool
+    error_details: ToolErrorDetails | None = None
 
 
 class AgentExecutor[ContextT, OutputT: BaseModel]:
@@ -181,6 +194,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         is_error: bool,
         working_messages: list[MessagePart],
         *,
+        error_details: ToolErrorDetails | None = None,
         is_terminal: bool = False,
     ) -> tuple[ToolResultEvent, ToolUseEndEvent]:
         """Build result events and append tool round-trip messages.
@@ -190,6 +204,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             result: The tool execution result (or error dict)
             is_error: Whether the result represents an error
             working_messages: Conversation message list to append to
+            error_details: Structured diagnostics for a tool execution exception
             is_terminal: Whether this tool ends the agent loop
 
         Returns:
@@ -214,6 +229,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 name=tool_call.name,
                 result=result,
                 is_error=is_error,
+                error_details=error_details,
                 is_terminal=is_terminal,
             ),
             ToolUseEndEvent(
@@ -357,13 +373,19 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             for tc, call_result in zip(parallel_calls, results, strict=True):
                 if isinstance(call_result, ApprovalRequired):
                     raise call_result
-                if isinstance(call_result, BaseException):
+                if isinstance(call_result, asyncio.CancelledError):
+                    raise call_result
+                if isinstance(call_result, Exception):
                     call_result = ToolCallResult(
                         tc.name, tc.id, {"error": str(call_result)}, True,
+                        _tool_error_details(call_result),
                     )
+                elif isinstance(call_result, BaseException):
+                    raise call_result
 
                 result_event, end_event = self._emit_tool_result(
                     tc, call_result.result, call_result.is_error, working_messages,
+                    error_details=call_result.error_details,
                 )
                 yield result_event
                 yield end_event
@@ -372,6 +394,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             for tc in streaming_calls:
                 result = None
                 is_error = False
+                error_details: ToolErrorDetails | None = None
                 try:
                     async for event_or_result in self._execute_tool_stream(
                         tc.name, tc.id, tc.inputs, context, approved
@@ -380,13 +403,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             yield event_or_result
                         else:
                             result = event_or_result
+                except (ApprovalRequired, asyncio.CancelledError):
+                    raise
                 except Exception as e:
-                    logger.error(f"Error executing streaming tool {tc.name}: {e}")
+                    logger.exception(f"Error executing streaming tool {tc.name}")
                     result = {"error": str(e)}
                     is_error = True
+                    error_details = _tool_error_details(e)
 
                 result_event, end_event = self._emit_tool_result(
                     tc, result, is_error, working_messages,
+                    error_details=error_details,
                 )
                 yield result_event
                 yield end_event
@@ -396,6 +423,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 tc = terminal_calls[0]
                 result = None
                 is_error = False
+                error_details = None
                 try:
                     async for event_or_result in self._execute_tool_stream(
                         tc.name, tc.id, tc.inputs, context, approved
@@ -404,12 +432,16 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             yield event_or_result
                         else:
                             result = event_or_result
+                except (ApprovalRequired, asyncio.CancelledError):
+                    raise
                 except Exception as e:
-                    logger.error(f"Error executing terminal tool {tc.name}: {e}")
+                    logger.exception(f"Error executing terminal tool {tc.name}")
                     result = {"error": str(e)}
                     is_error = True
+                    error_details = _tool_error_details(e)
                 result_event, _ = self._emit_tool_result(
                     tc, result, is_error, working_messages, is_terminal=True,
+                    error_details=error_details,
                 )
                 yield result_event
                 return
@@ -448,8 +480,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         except ApprovalRequired:
             raise
         except Exception as e:
-            logger.error(f"Error executing tool {tool_name}: {e}")
-            return ToolCallResult(tool_name, tool_call_id, {"error": str(e)}, True)
+            logger.exception(f"Error executing tool {tool_name}")
+            return ToolCallResult(
+                tool_name,
+                tool_call_id,
+                {"error": str(e)},
+                True,
+                _tool_error_details(e),
+            )
 
     async def _execute_tool_stream(
         self,

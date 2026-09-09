@@ -13,6 +13,15 @@ class ToolStreamEvent(BaseModel):
     data: Any
 
 
+class ToolErrorDetails(BaseModel):
+    """Structured diagnostics for an exception raised during tool execution."""
+
+    exception_type: str
+    exception_module: str
+    message: str
+    traceback: str
+
+
 class ToolResultEvent(BaseModel):
     """Result from tool execution."""
 
@@ -21,6 +30,7 @@ class ToolResultEvent(BaseModel):
     name: str
     result: Any
     is_error: bool = False
+    error_details: ToolErrorDetails | None = None
     is_terminal: bool = False
     """If True, this tool execution exits the agent loop."""
 
