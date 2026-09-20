@@ -15,7 +15,13 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel
 
 from ._logging import logger
-from .exceptions import ApprovalRequired
+from .exceptions import (
+    ApprovalRequired,
+    ErrorCode,
+    ModelRetry,
+    classify_tool_error,
+    format_model_error,
+)
 from .providers.base import Provider
 from .providers.vertexai.converters import to_vertexai_tool
 from .tools.tool import Tool
@@ -55,6 +61,24 @@ class ToolCallResult(NamedTuple):
     result: Any
     is_error: bool
     error_details: ToolErrorDetails | None = None
+
+
+def _model_retry_result(
+    tool_name: str,
+    tool_call_id: str,
+    exception: ModelRetry,
+) -> ToolCallResult:
+    """Build a safe model-facing result for a correctable tool-call error."""
+    decision = classify_tool_error(exception)
+    if decision is None:
+        raise RuntimeError("ModelRetry must produce an error decision")
+    return ToolCallResult(
+        tool_name,
+        tool_call_id,
+        format_model_error(decision),
+        True,
+        _tool_error_details(exception),
+    )
 
 
 class AgentExecutor[ContextT, OutputT: BaseModel]:
@@ -263,6 +287,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             context: Context to inject into tools (e.g., RunToolContext)
             max_iterations: Maximum tool calling iterations
             reasoning_effort: Optional reasoning effort override
+            max_tokens: Optional maximum number of model output tokens.
             approved_tool_calls: Set of tool_call_ids that have been approved
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
@@ -331,11 +356,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             parallel_calls: list[ToolUsePart] = []
             terminal_calls: list[ToolUsePart] = []
             for tc in tool_calls:
-                if tc.name == OUTPUT_TOOL_NAME:
+                if tc.name == OUTPUT_TOOL_NAME and self.output_type:
                     continue
                 tool = self._tools.get(tc.name)
                 if not tool:
                     logger.warning(f"Tool not found: {tc.name}")
+                    parallel_calls.append(tc)
                     continue
                 if tool.terminal:
                     terminal_calls.append(tc)
@@ -347,7 +373,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             # Any sequential tool in the batch forces the entire batch to run
             # sequentially to preserve execution-order guarantees
             force_sequential = any(
-                self._tools[tc.name].sequential for tc in parallel_calls
+                self._tools[tc.name].sequential
+                for tc in parallel_calls
+                if tc.name in self._tools
             )
 
             # Execute non-streaming tools (parallel or sequential)
@@ -399,7 +427,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     async for event_or_result in self._execute_tool_stream(
                         tc.name, tc.id, tc.inputs, context, approved
                     ):
-                        if isinstance(event_or_result, ToolStreamEvent):
+                        if isinstance(event_or_result, ToolCallResult):
+                            result = event_or_result.result
+                            is_error = event_or_result.is_error
+                            error_details = event_or_result.error_details
+                        elif isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
                             result = event_or_result
@@ -424,11 +456,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 result = None
                 is_error = False
                 error_details = None
+                input_invalid = False
                 try:
                     async for event_or_result in self._execute_tool_stream(
                         tc.name, tc.id, tc.inputs, context, approved
                     ):
-                        if isinstance(event_or_result, ToolStreamEvent):
+                        if isinstance(event_or_result, ToolCallResult):
+                            result = event_or_result.result
+                            is_error = event_or_result.is_error
+                            error_details = event_or_result.error_details
+                            input_invalid = True
+                        elif isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
                             result = event_or_result
@@ -439,12 +477,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     result = {"error": str(e)}
                     is_error = True
                     error_details = _tool_error_details(e)
-                result_event, _ = self._emit_tool_result(
-                    tc, result, is_error, working_messages, is_terminal=True,
+                result_event, end_event = self._emit_tool_result(
+                    tc, result, is_error, working_messages, is_terminal=not input_invalid,
                     error_details=error_details,
                 )
                 yield result_event
-                return
+                if input_invalid:
+                    yield end_event
+                else:
+                    return
 
     async def _execute_tool_call(
         self,
@@ -469,13 +510,27 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         Raises:
             ApprovalRequired: If tool requires approval and not approved
         """
-        tool = self._tools[tool_name]
-
-        if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, inputs)
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            return _model_retry_result(
+                tool_name,
+                tool_call_id,
+                ModelRetry(
+                    f"The requested tool '{tool_name}' is not available.",
+                    code=ErrorCode.TOOL_NOT_FOUND,
+                ),
+            )
 
         try:
-            result = await self._invoke_tool(tool, inputs, context)
+            validated_inputs = tool.validate_inputs(inputs)
+        except ModelRetry as exception:
+            return _model_retry_result(tool_name, tool_call_id, exception)
+
+        if tool.requires_approval and tool_call_id not in approved_tool_calls:
+            raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
+
+        try:
+            result = await self._invoke_tool(tool, validated_inputs, context)
             return ToolCallResult(tool_name, tool_call_id, result, False)
         except ApprovalRequired:
             raise
@@ -496,7 +551,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         inputs: dict[str, Any],
         context: ContextT | None,
         approved_tool_calls: set[str],
-    ) -> AsyncIterator[ToolStreamEvent | Any]:
+    ) -> AsyncIterator[ToolStreamEvent | ToolCallResult | Any]:
         """Execute a tool, yielding streaming events for streaming tools or the final result.
 
         For streaming tools (stream_output=True), yields ToolStreamEvent instances as
@@ -520,12 +575,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         """
         tool = self._tools[tool_name]
 
+        try:
+            validated_inputs = tool.validate_inputs(inputs)
+        except ModelRetry as exception:
+            yield _model_retry_result(tool_name, tool_call_id, exception)
+            return
+
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, inputs)
+            raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
 
         logger.debug(f"Executing tool: {tool_name}")
 
-        kwargs = dict(inputs)
+        kwargs = dict(validated_inputs)
 
         if tool.stream_output:
             if tool.takes_ctx and context is not None:
@@ -535,5 +596,5 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 async for event in tool(**kwargs):  # type: ignore[misc]
                     yield event
         else:
-            result = await self._invoke_tool(tool, inputs, context)
+            result = await self._invoke_tool(tool, validated_inputs, context)
             yield result
