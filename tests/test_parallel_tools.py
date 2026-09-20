@@ -1,9 +1,9 @@
 """Tests for parallel tool execution in AgentExecutor."""
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import time
-from dataclasses import dataclass
 from typing import Annotated
 from unittest.mock import AsyncMock, patch
 
@@ -13,15 +13,15 @@ from dobby import AgentExecutor
 from dobby.exceptions import ApprovalRequired
 from dobby.tools import Tool
 from dobby.types import (
+    AssistantMessagePart,
     StreamEndEvent,
     ToolResultEvent,
     ToolResultPart,
     ToolStreamEvent,
     ToolUsePart,
-    UserMessagePart,
     Usage,
+    UserMessagePart,
 )
-
 
 # --- Helpers ---
 
@@ -77,6 +77,61 @@ async def _collect_results_and_emitted_messages(executor):
 
     assert emit_result.call_args is not None
     return results, emit_result.call_args.args[3]
+
+
+async def _collect_batch_until_control_flow(executor, exception_type):
+    """Collect an assembled batch and the host control-flow exception."""
+    results = []
+    caught = None
+    with patch.object(
+        executor, "_emit_tool_result", wraps=executor._emit_tool_result
+    ) as emit_result:
+        try:
+            async for event in executor.run_stream(messages=[], system_prompt=None):
+                if isinstance(event, ToolResultEvent):
+                    results.append(event)
+        except exception_type as exception:
+            caught = exception
+
+    assert caught is not None
+    assert emit_result.call_args is not None
+    return results, emit_result.call_args.args[3], caught
+
+
+def _tool_result_parts(messages):
+    """Return model-facing tool results in conversation order."""
+    return [
+        part
+        for message in messages
+        if isinstance(message, UserMessagePart)
+        for part in message.parts
+        if isinstance(part, ToolResultPart)
+    ]
+
+
+def _tool_use_ids(messages):
+    """Return assembled assistant tool-call IDs in conversation order."""
+    return [
+        part.id
+        for message in messages
+        if isinstance(message, AssistantMessagePart)
+        for part in message.parts
+        if isinstance(part, ToolUsePart)
+    ]
+
+
+def _assert_unsuccessful_control_flow(event, part, *, approval: bool) -> None:
+    """Control-flow entries must be unsuccessful and unclassified."""
+    expected = {"approval_required": True} if approval else {"cancelled": True}
+    assert event.is_error is True
+    assert event.error_details is None
+    assert event.result == expected
+    assert part.is_error is True
+    assert part.tool_use_id == event.tool_use_id
+    assert str(expected) in part.parts[0].text
+    assert "[tool_execution_error]" not in part.parts[0].text
+    assert "[tool_failure]" not in part.parts[0].text
+    assert "[tool_retry]" not in part.parts[0].text
 
 
 # --- Tool definitions ---
@@ -545,14 +600,20 @@ class TestToolErrorHandling:
                 llm=provider,
                 tools=[SyncTool(), FailingTool()],
             )
-            return await _collect_results(executor)
+            return await _collect_results_and_emitted_messages(executor)
 
-        results = asyncio.run(run())
+        results, messages = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
         assert len(results) == 2
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2"]
+        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
         ok_result = next(r for r in results if r.name == "sync_tool")
         err_result = next(r for r in results if r.name == "failing_tool")
         assert ok_result.is_error is False
+        assert result_parts[0].is_error is False
         assert err_result.is_error is True
+        assert result_parts[1].is_error is True
         assert "intentional failure" in str(err_result.result)
 
     def test_regular_tool_error_logs_exception_with_traceback(
@@ -594,8 +655,84 @@ class TestToolErrorHandling:
         assert "logged failure" in caplog.text
         assert "Traceback (most recent call last)" in caplog.text
 
-    def test_parallel_cancellation_propagates_without_tool_result(self) -> None:
-        """Cancellation remains control flow instead of becoming a tool error."""
+    @pytest.mark.parametrize(
+        "tool_order",
+        [
+            ("approval_tool", "sync_tool"),
+            ("sync_tool", "approval_tool"),
+        ],
+        ids=["approval-first", "approval-last"],
+    )
+    def test_parallel_approval_assembles_sibling_results_before_propagating(
+        self, tool_order: tuple[str, str]
+    ) -> None:
+        """Approval remains host control flow after ordered results are assembled."""
+        sibling_ran = False
+
+        @dataclass
+        class ApprovalTool(Tool):
+            name = "approval_tool"
+            description = "Requires approval"
+            requires_approval = True
+
+            async def __call__(self) -> dict:
+                return {"approved": True}
+
+        @dataclass
+        class SiblingTool(Tool):
+            name = "sync_tool"
+            description = "Completes normally"
+
+            async def __call__(self, value: Annotated[str, "A value"]) -> dict[str, str]:
+                nonlocal sibling_ran
+                sibling_ran = True
+                return {"value": value}
+
+        async def run():
+            tool_calls = [
+                ToolUsePart(
+                    id=f"tc{index}",
+                    name=name,
+                    inputs={} if name == "approval_tool" else {"value": "ok"},
+                )
+                for index, name in enumerate(tool_order, start=1)
+            ]
+            executor = AgentExecutor(
+                provider="openai",
+                llm=_make_mock_provider(tool_calls),
+                tools=[SiblingTool(), ApprovalTool()],
+            )
+            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
+
+        results, messages, exception = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
+        approval_index = tool_order.index("approval_tool")
+
+        assert exception.tool_call_id == f"tc{approval_index + 1}"
+        assert sibling_ran is True
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2"]
+        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
+        _assert_unsuccessful_control_flow(
+            results[approval_index], result_parts[approval_index], approval=True
+        )
+        sibling_index = 1 - approval_index
+        assert results[sibling_index].is_error is False
+        assert results[sibling_index].result == {"value": "ok"}
+        assert result_parts[sibling_index].is_error is False
+
+    @pytest.mark.parametrize(
+        "tool_order",
+        [
+            ("cancelling_tool", "completing_tool"),
+            ("completing_tool", "cancelling_tool"),
+        ],
+        ids=["cancellation-first", "cancellation-last"],
+    )
+    def test_parallel_cancellation_assembles_results_in_call_order(
+        self, tool_order: tuple[str, str]
+    ) -> None:
+        """Cancellation propagates only after every ordered result is assembled."""
         completed = False
 
         @dataclass
@@ -619,22 +756,94 @@ class TestToolErrorHandling:
 
         async def run():
             tool_calls = [
-                ToolUsePart(id="tc1", name="cancelling_tool", inputs={}),
-                ToolUsePart(id="tc2", name="completing_tool", inputs={}),
+                ToolUsePart(id=f"tc{index}", name=name, inputs={})
+                for index, name in enumerate(tool_order, start=1)
             ]
-            provider = _make_mock_provider(tool_calls)
             executor = AgentExecutor(
                 provider="openai",
-                llm=provider,
+                llm=_make_mock_provider(tool_calls),
                 tools=[CancellingTool(), CompletingTool()],
             )
+            return await _collect_batch_until_control_flow(executor, asyncio.CancelledError)
 
-            with patch.object(executor, "_emit_tool_result") as emit_result:
-                with pytest.raises(asyncio.CancelledError):
-                    await _collect_results(executor)
-                return emit_result.call_count
+        results, messages, exception = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
+        cancel_index = tool_order.index("cancelling_tool")
 
-        emit_count = asyncio.run(run())
-
+        assert isinstance(exception, asyncio.CancelledError)
         assert completed is True
-        assert emit_count == 0
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2"]
+        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
+        _assert_unsuccessful_control_flow(
+            results[cancel_index], result_parts[cancel_index], approval=False
+        )
+        sibling_index = 1 - cancel_index
+        assert results[sibling_index].is_error is False
+        assert results[sibling_index].result == {"status": "done"}
+        assert result_parts[sibling_index].is_error is False
+
+    def test_sequential_approval_assembles_earlier_success_before_propagating(self) -> None:
+        """Sequential approval keeps earlier results and does not invoke later tools."""
+        execution_order = []
+
+        @dataclass
+        class SuccessfulSequentialTool(Tool):
+            name = "successful_sequential_tool"
+            description = "Completes before approval"
+            sequential = True
+
+            async def __call__(self) -> dict:
+                execution_order.append(self.name)
+                return {"status": "done"}
+
+        @dataclass
+        class ApprovalSequentialTool(Tool):
+            name = "approval_sequential_tool"
+            description = "Requires approval after an earlier call"
+            requires_approval = True
+            sequential = True
+
+            async def __call__(self) -> dict:
+                execution_order.append(self.name)
+                return {"approved": True}
+
+        @dataclass
+        class LaterSequentialTool(Tool):
+            name = "later_sequential_tool"
+            description = "Must not run after approval"
+            sequential = True
+
+            async def __call__(self) -> dict:
+                execution_order.append(self.name)
+                return {"late": True}
+
+        async def run():
+            tool_calls = [
+                ToolUsePart(id="tc1", name="successful_sequential_tool", inputs={}),
+                ToolUsePart(id="tc2", name="approval_sequential_tool", inputs={}),
+                ToolUsePart(id="tc3", name="later_sequential_tool", inputs={}),
+            ]
+            executor = AgentExecutor(
+                provider="openai",
+                llm=_make_mock_provider(tool_calls),
+                tools=[
+                    SuccessfulSequentialTool(),
+                    ApprovalSequentialTool(),
+                    LaterSequentialTool(),
+                ],
+            )
+            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
+
+        results, messages, exception = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
+
+        assert exception.tool_call_id == "tc2"
+        assert execution_order == ["successful_sequential_tool"]
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2"]
+        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
+        assert results[0].is_error is False
+        assert results[0].result == {"status": "done"}
+        assert result_parts[0].is_error is False
+        _assert_unsuccessful_control_flow(results[1], result_parts[1], approval=True)

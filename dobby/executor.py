@@ -81,6 +81,23 @@ def _model_retry_result(
     )
 
 
+def _control_flow_result(
+    tool_call: ToolUsePart,
+    exception: ApprovalRequired | asyncio.CancelledError,
+) -> ToolCallResult:
+    """Build an unsuccessful placeholder without classifying host control flow.
+
+    Approval and cancellation remain host signals. The placeholder is marked
+    unsuccessful so history does not look like the tool completed, but it is
+    not routed through error classification.
+    """
+    if isinstance(exception, ApprovalRequired):
+        result = {"approval_required": True}
+    else:
+        result = {"cancelled": True}
+    return ToolCallResult(tool_call.name, tool_call.id, result, True)
+
+
 class AgentExecutor[ContextT, OutputT: BaseModel]:
     """Manages tool registration, execution, and LLM interactions with streaming support.
 
@@ -383,9 +400,13 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             if parallel_calls:
                 if force_sequential or len(parallel_calls) == 1:
                     for tc in parallel_calls:
-                        call_result = await self._execute_tool_call(
-                            tc.name, tc.id, tc.inputs, context, approved
-                        )
+                        try:
+                            call_result = await self._execute_tool_call(
+                                tc.name, tc.id, tc.inputs, context, approved
+                            )
+                        except (ApprovalRequired, asyncio.CancelledError) as exception:
+                            results.append(exception)
+                            break
                         results.append(call_result)
                 else:
                     results = await asyncio.gather(
@@ -398,12 +419,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         return_exceptions=True,
                     )
 
-            for tc, call_result in zip(parallel_calls, results, strict=True):
-                if isinstance(call_result, ApprovalRequired):
-                    raise call_result
-                if isinstance(call_result, asyncio.CancelledError):
-                    raise call_result
-                if isinstance(call_result, Exception):
+            assembled_calls = parallel_calls[: len(results)]
+            control_flow: ApprovalRequired | asyncio.CancelledError | None = None
+            for tc, call_result in zip(assembled_calls, results, strict=True):
+                if isinstance(call_result, (ApprovalRequired, asyncio.CancelledError)):
+                    if control_flow is None:
+                        control_flow = call_result
+                    call_result = _control_flow_result(tc, call_result)
+                elif isinstance(call_result, Exception):
                     call_result = ToolCallResult(
                         tc.name, tc.id, {"error": str(call_result)}, True,
                         _tool_error_details(call_result),
@@ -417,6 +440,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 )
                 yield result_event
                 yield end_event
+
+            if control_flow is not None:
+                raise control_flow
 
             # Execute streaming tools sequentially
             for tc in streaming_calls:
