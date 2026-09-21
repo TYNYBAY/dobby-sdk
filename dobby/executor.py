@@ -70,6 +70,27 @@ class ToolCallResult(NamedTuple):
     retry_model: bool = False
 
 
+def _classified_tool_result(
+    tool_name: str,
+    tool_call_id: str,
+    exception: Exception,
+    *,
+    error_details: ToolErrorDetails | None = None,
+) -> ToolCallResult:
+    """Build a model-facing result for a classified tool-call error."""
+    decision = classify_tool_error(exception)
+    if decision is None:
+        raise RuntimeError("tool error must produce an error decision")
+    return ToolCallResult(
+        tool_name,
+        tool_call_id,
+        format_model_error(decision),
+        True,
+        error_details or _tool_error_details(exception),
+        decision.retry_model,
+    )
+
+
 def _model_retry_result(
     tool_name: str,
     tool_call_id: str,
@@ -78,16 +99,11 @@ def _model_retry_result(
     error_details: ToolErrorDetails | None = None,
 ) -> ToolCallResult:
     """Build a safe model-facing result for a correctable tool-call error."""
-    decision = classify_tool_error(exception)
-    if decision is None:
-        raise RuntimeError("ModelRetry must produce an error decision")
-    return ToolCallResult(
+    return _classified_tool_result(
         tool_name,
         tool_call_id,
-        format_model_error(decision),
-        True,
-        error_details or _tool_error_details(exception),
-        decision.retry_model,
+        exception,
+        error_details=error_details,
     )
 
 
@@ -573,13 +589,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         control_flow = call_result
                     call_result = _control_flow_result(tc, call_result)
                 elif isinstance(call_result, Exception):
-                    call_result = ToolCallResult(
-                        tc.name,
-                        tc.id,
-                        {"error": str(call_result)},
-                        True,
-                        _tool_error_details(call_result),
-                    )
+                    call_result = _classified_tool_result(tc.name, tc.id, call_result)
                 elif isinstance(call_result, BaseException):
                     raise call_result
 
@@ -601,7 +611,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 raise control_flow
 
             # Execute streaming tools sequentially
-            for tc in streaming_calls:
+            for index, tc in enumerate(streaming_calls):
                 result = None
                 is_error = False
                 error_details: ToolErrorDetails | None = None
@@ -620,13 +630,28 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             yield event_or_result
                         else:
                             result = event_or_result
-                except (ApprovalRequired, asyncio.CancelledError):
+                except (ApprovalRequired, asyncio.CancelledError) as exception:
+                    call_result = _control_flow_result(tc, exception)
+                    result_event, end_event = self._emit_tool_result(
+                        tc,
+                        call_result.result,
+                        call_result.is_error,
+                        working_messages,
+                    )
+                    yield result_event
+                    yield end_event
+                    unexecuted = streaming_calls[index + 1 :] + terminal_calls
+                    for remaining in unexecuted:
+                        remaining_result = _control_flow_result(remaining, exception)
+                        remaining_event, remaining_end = self._emit_tool_result(
+                            remaining,
+                            remaining_result.result,
+                            remaining_result.is_error,
+                            working_messages,
+                        )
+                        yield remaining_event
+                        yield remaining_end
                     raise
-                except Exception as e:
-                    logger.exception(f"Error executing streaming tool {tc.name}")
-                    result = {"error": str(e)}
-                    is_error = True
-                    error_details = _tool_error_details(e)
 
                 result_event, end_event = self._emit_tool_result(
                     tc,
@@ -645,7 +670,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 result = None
                 is_error = False
                 error_details = None
-                input_invalid = False
+                skip_terminal_exit = False
                 try:
                     async for event_or_result in self._execute_tool_stream(
                         tc.name, tc.id, tc.inputs, context, approved
@@ -654,31 +679,45 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             result = event_or_result.result
                             is_error = event_or_result.is_error
                             error_details = event_or_result.error_details
-                            input_invalid = True
                             if event_or_result.retry_model:
                                 batch_has_model_correction = True
                                 batch_last_correction_error = event_or_result.error_details
+                                skip_terminal_exit = True
                         elif isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
                             result = event_or_result
-                except (ApprovalRequired, asyncio.CancelledError):
+                except (ApprovalRequired, asyncio.CancelledError) as exception:
+                    call_result = _control_flow_result(tc, exception)
+                    result_event, end_event = self._emit_tool_result(
+                        tc,
+                        call_result.result,
+                        call_result.is_error,
+                        working_messages,
+                    )
+                    yield result_event
+                    yield end_event
+                    for remaining in terminal_calls[1:]:
+                        remaining_result = _control_flow_result(remaining, exception)
+                        remaining_event, remaining_end = self._emit_tool_result(
+                            remaining,
+                            remaining_result.result,
+                            remaining_result.is_error,
+                            working_messages,
+                        )
+                        yield remaining_event
+                        yield remaining_end
                     raise
-                except Exception as e:
-                    logger.exception(f"Error executing terminal tool {tc.name}")
-                    result = {"error": str(e)}
-                    is_error = True
-                    error_details = _tool_error_details(e)
                 result_event, end_event = self._emit_tool_result(
                     tc,
                     result,
                     is_error,
                     working_messages,
-                    is_terminal=not input_invalid,
+                    is_terminal=not skip_terminal_exit,
                     error_details=error_details,
                 )
                 yield result_event
-                if input_invalid:
+                if skip_terminal_exit:
                     yield end_event
                 else:
                     terminal_completed = True
@@ -750,15 +789,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return ToolCallResult(tool_name, tool_call_id, result, False)
         except ApprovalRequired:
             raise
-        except Exception as e:
+        except Exception as exception:
             logger.exception(f"Error executing tool {tool_name}")
-            return ToolCallResult(
-                tool_name,
-                tool_call_id,
-                {"error": str(e)},
-                True,
-                _tool_error_details(e),
-            )
+            return _classified_tool_result(tool_name, tool_call_id, exception)
 
     async def _execute_tool_stream(
         self,
@@ -800,10 +833,16 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
             raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
 
-        if tool.stream_output:
-            logger.debug(f"Executing tool: {tool_name}")
-            async for event in self._stream_tool(tool, validated_inputs, context):
-                yield event
-        else:
-            result = await self._invoke_tool(tool, validated_inputs, context)
-            yield result
+        try:
+            if tool.stream_output:
+                logger.debug(f"Executing tool: {tool_name}")
+                async for event in self._stream_tool(tool, validated_inputs, context):
+                    yield event
+            else:
+                result = await self._invoke_tool(tool, validated_inputs, context)
+                yield result
+        except ApprovalRequired:
+            raise
+        except Exception as exception:
+            logger.exception(f"Error executing tool {tool_name}")
+            yield _classified_tool_result(tool_name, tool_call_id, exception)

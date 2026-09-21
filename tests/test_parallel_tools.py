@@ -413,7 +413,8 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert "diagnostic failure" in model_text
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
+        assert "diagnostic failure" not in model_text
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
@@ -462,7 +463,8 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert "streaming diagnostic failure" in model_text
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
+        assert "streaming diagnostic failure" not in model_text
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
@@ -510,7 +512,8 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert "terminal diagnostic failure" in model_text
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
+        assert "terminal diagnostic failure" not in model_text
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
@@ -537,13 +540,15 @@ class TestToolErrorHandling:
                 llm=provider,
                 tools=[ApprovalStreamingTool()],
             )
-            return await _collect_results(executor)
+            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
 
-        with pytest.raises(ApprovalRequired) as exc_info:
-            asyncio.run(run())
+        results, messages, exception = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
 
-        assert exc_info.value.tool_call_id == "tc1"
-        assert exc_info.value.tool_name == "approval_streaming_tool"
+        assert exception.tool_call_id == "tc1"
+        assert exception.tool_name == "approval_streaming_tool"
+        assert [result.tool_use_id for result in results] == ["tc1"]
+        _assert_unsuccessful_control_flow(results[0], result_parts[0], approval=True)
 
     def test_terminal_tool_approval_required_propagates(self) -> None:
         """Terminal tool approval remains control flow rather than a tool error."""
@@ -568,13 +573,15 @@ class TestToolErrorHandling:
                 llm=provider,
                 tools=[ApprovalTerminalTool()],
             )
-            return await _collect_results(executor)
+            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
 
-        with pytest.raises(ApprovalRequired) as exc_info:
-            asyncio.run(run())
+        results, messages, exception = asyncio.run(run())
+        result_parts = _tool_result_parts(messages)
 
-        assert exc_info.value.tool_call_id == "tc1"
-        assert exc_info.value.tool_name == "approval_terminal_tool"
+        assert exception.tool_call_id == "tc1"
+        assert exception.tool_name == "approval_terminal_tool"
+        assert [result.tool_use_id for result in results] == ["tc1"]
+        _assert_unsuccessful_control_flow(results[0], result_parts[0], approval=True)
 
     def test_error_in_one_tool_doesnt_break_others(self) -> None:
         """If one parallel tool fails, others still return results."""
@@ -612,7 +619,8 @@ class TestToolErrorHandling:
         assert result_parts[0].is_error is False
         assert err_result.is_error is True
         assert result_parts[1].is_error is True
-        assert "intentional failure" in str(err_result.result)
+        assert str(err_result.result) == "[tool_execution_error] The tool failed unexpectedly."
+        assert "intentional failure" not in str(err_result.result)
 
     def test_retrying_tool_does_not_change_sibling_result_order(self) -> None:
         """A retrying parallel tool does not reorder or re-run its sibling."""

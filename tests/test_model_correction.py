@@ -265,15 +265,14 @@ def test_run_wide_limit_survives_non_correction_progress(middle_fails: bool) -> 
     ]
 
 
-@pytest.mark.parametrize("body_error", [ValueError("failure"), ModelRetry("retry body")])
-def test_execution_errors_do_not_consume_correction_budget(body_error: Exception) -> None:
+def test_execution_errors_do_not_consume_correction_budget() -> None:
     @dataclass
     class FailingTool(Tool):
         name = "failing"
         description = "Fail during execution."
 
         async def __call__(self) -> None:
-            raise body_error
+            raise ValueError("failure")
 
     provider = ScriptedProvider([[ToolUsePart(id="call-failing", name="failing", inputs={})], []])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[FailingTool()])
@@ -285,6 +284,36 @@ def test_execution_errors_do_not_consume_correction_budget(body_error: Exception
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "failure" not in str(results[0].result)
+
+
+def test_body_model_retry_consumes_correction_budget() -> None:
+    @dataclass
+    class RetryTool(Tool):
+        name = "retrying"
+        description = "Request model correction from the tool body."
+
+        async def __call__(self) -> None:
+            raise ModelRetry("retry body")
+
+    provider = ScriptedProvider(
+        [[ToolUsePart(id="call-retrying", name="retrying", inputs={})], []]
+    )
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[RetryTool()])
+
+    events, messages, error = asyncio.run(
+        _collect_until_exception(executor, ModelRetryExhaustedError, max_model_retries=0)
+    )
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert isinstance(error, ModelRetryExhaustedError)
+    assert error.attempts == 1
+    assert len(provider.calls) == 1
+    assert len(results) == 1
+    assert results[0].is_error is True
+    assert str(results[0].result) == "[tool_retry] retry body"
+    assert [part.tool_use_id for part in _tool_results(messages)] == ["call-retrying"]
 
 
 def test_retry_exhausted_execution_error_does_not_consume_correction_budget() -> None:
@@ -313,7 +342,8 @@ def test_retry_exhausted_execution_error_does_not_consume_correction_budget() ->
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
-    assert "transient" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "transient" not in str(results[0].result)
 
 
 def test_streaming_validation_correction_exhausts_after_result() -> None:

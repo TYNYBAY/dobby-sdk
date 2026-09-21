@@ -299,7 +299,7 @@ def test_terminal_tool_inputs_are_validated_before_execution() -> None:
     assert len([event for event in events if isinstance(event, StreamEndEvent)]) == 2
 
 
-def test_model_retry_from_streaming_and_terminal_bodies_remains_execution_error() -> None:
+def test_model_retry_from_streaming_and_terminal_bodies_requests_correction() -> None:
     @dataclass
     class StreamingTool(Tool):
         name = "body_streaming"
@@ -334,10 +334,10 @@ def test_model_retry_from_streaming_and_terminal_bodies_remains_execution_error(
         "call-terminal-body",
     ]
     assert all(result.is_error for result in results)
-    assert all("[tool_input_invalid]" not in str(result.result) for result in results)
+    assert all(str(result.result).startswith("[tool_input_invalid]") for result in results)
     assert "streaming body failure" in str(results[0].result)
     assert "terminal body failure" in str(results[1].result)
-    assert results[1].is_terminal is True
+    assert results[1].is_terminal is False
 
 
 def test_exception_inside_executed_tool_is_not_input_validation_error() -> None:
@@ -359,4 +359,7 @@ def test_exception_inside_executed_tool_is_not_input_validation_error() -> None:
     assert len(results) == 1
     assert results[0].is_error is True
     assert "[tool_input_invalid]" not in str(results[0].result)
-    assert "failure inside tool: 1" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "failure inside tool: 1" not in str(results[0].result)
+    assert results[0].error_details is not None
+    assert results[0].error_details.message == "failure inside tool: 1"

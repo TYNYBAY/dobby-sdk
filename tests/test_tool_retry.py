@@ -74,7 +74,8 @@ def test_default_policy_does_not_retry_value_error() -> None:
     assert calls == 1
     assert len(results) == 1
     assert results[0].is_error is True
-    assert "not retryable by default" in str(results[0].result)
+    assert "not retryable by default" not in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
     assert FailingTool().retry_policy() == ToolRetryPolicy(
         max_retries=1,
         retryable_exceptions=(),
@@ -140,7 +141,8 @@ def test_retry_exhaustion_uses_last_error() -> None:
     assert calls == 2
     assert len(results) == 1
     assert results[0].is_error is True
-    assert "last timeout" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "last timeout" not in str(results[0].result)
     assert results[0].error_details is not None
     assert results[0].error_details.exception_type == "TimeoutError"
     assert results[0].error_details.message == "last timeout"
@@ -172,7 +174,8 @@ def test_max_retries_zero_gives_exactly_one_call() -> None:
     assert calls == 1
     assert sleep.await_count == 0
     assert results[0].is_error is True
-    assert "still fail" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "still fail" not in str(results[0].result)
 
 
 def test_non_listed_exception_does_not_retry() -> None:
@@ -199,7 +202,8 @@ def test_non_listed_exception_does_not_retry() -> None:
 
     assert calls == 1
     assert sleep.await_count == 0
-    assert "not listed" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "not listed" not in str(results[0].result)
 
 
 def test_model_retry_from_tool_body_does_not_retry() -> None:
@@ -227,8 +231,7 @@ def test_model_retry_from_tool_body_does_not_retry() -> None:
     assert calls == 1
     assert sleep.await_count == 0
     assert results[0].is_error is True
-    assert "[tool_retry]" not in str(results[0].result)
-    assert "correct the arguments" in str(results[0].result)
+    assert str(results[0].result) == "[tool_retry] correct the arguments"
 
 
 def test_tool_failure_from_tool_body_does_not_retry() -> None:
@@ -255,7 +258,7 @@ def test_tool_failure_from_tool_body_does_not_retry() -> None:
 
     assert calls == 1
     assert sleep.await_count == 0
-    assert "account is closed" in str(results[0].result)
+    assert str(results[0].result) == "[tool_failure] account is closed"
 
 
 def test_approval_required_is_raised_and_not_retried() -> None:
@@ -370,7 +373,8 @@ def test_retry_attempts_do_not_consume_model_correction_budget() -> None:
     assert provider.chat_calls() == 2
     assert len(results) == 1
     assert results[0].is_error is True
-    assert "timeout 2" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "timeout 2" not in str(results[0].result)
 
 
 def test_backoff_sleep_occurs_only_between_retry_attempts() -> None:
@@ -467,7 +471,8 @@ def test_streaming_yield_then_failure_does_not_retry() -> None:
     assert sleep.await_count == 0
     assert [event.data for event in stream_events] == ["started"]
     assert results[0].is_error is True
-    assert "after yield" in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
+    assert "after yield" not in str(results[0].result)
     assert results[0].error_details is not None
     assert results[0].error_details.exception_type == "TimeoutError"
     assert results[0].error_details.message == "after yield"
