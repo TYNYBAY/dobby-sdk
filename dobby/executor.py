@@ -19,6 +19,7 @@ from .exceptions import (
     ApprovalRequired,
     ErrorCode,
     ModelRetry,
+    ModelRetryExhaustedError,
     classify_tool_error,
     format_model_error,
 )
@@ -61,6 +62,7 @@ class ToolCallResult(NamedTuple):
     result: Any
     is_error: bool
     error_details: ToolErrorDetails | None = None
+    retry_model: bool = False
 
 
 def _model_retry_result(
@@ -78,6 +80,7 @@ def _model_retry_result(
         format_model_error(decision),
         True,
         _tool_error_details(exception),
+        decision.retry_model,
     )
 
 
@@ -289,6 +292,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
+        max_model_retries: int = 3,
+        max_consecutive_model_retries: int = 3,
     ) -> AsyncIterator[StreamEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
 
@@ -309,6 +314,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
                 is raised.
+            max_model_retries: Maximum model-correction turns permitted per run.
+            max_consecutive_model_retries: Maximum consecutive model-correction
+                turns permitted.
 
         Yields:
             StreamEvent: LLM streaming events
@@ -323,9 +331,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)
         approved = approved_tool_calls or set()
+        consecutive_model_corrections = 0
+        run_model_corrections = 0
+        last_correction_error: ToolErrorDetails | None = None
 
         for _ in range(max_iterations):
             tool_calls: list[ToolUsePart] = []
+            batch_has_model_correction = False
+            batch_last_correction_error: ToolErrorDetails | None = None
 
             async for event in await self.llm.chat(
                 working_messages,
@@ -434,6 +447,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 elif isinstance(call_result, BaseException):
                     raise call_result
 
+                if call_result.retry_model:
+                    batch_has_model_correction = True
+                    batch_last_correction_error = call_result.error_details
+
                 result_event, end_event = self._emit_tool_result(
                     tc, call_result.result, call_result.is_error, working_messages,
                     error_details=call_result.error_details,
@@ -457,6 +474,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             result = event_or_result.result
                             is_error = event_or_result.is_error
                             error_details = event_or_result.error_details
+                            if event_or_result.retry_model:
+                                batch_has_model_correction = True
+                                batch_last_correction_error = event_or_result.error_details
                         elif isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
@@ -477,6 +497,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 yield end_event
 
             # Terminal tool exits the loop
+            terminal_completed = False
             if terminal_calls:
                 tc = terminal_calls[0]
                 result = None
@@ -492,6 +513,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             is_error = event_or_result.is_error
                             error_details = event_or_result.error_details
                             input_invalid = True
+                            if event_or_result.retry_model:
+                                batch_has_model_correction = True
+                                batch_last_correction_error = event_or_result.error_details
                         elif isinstance(event_or_result, ToolStreamEvent):
                             yield event_or_result
                         else:
@@ -511,7 +535,27 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 if input_invalid:
                     yield end_event
                 else:
-                    return
+                    terminal_completed = True
+
+            if batch_has_model_correction:
+                consecutive_model_corrections += 1
+                run_model_corrections += 1
+                last_correction_error = batch_last_correction_error
+                if consecutive_model_corrections > max_consecutive_model_retries:
+                    raise ModelRetryExhaustedError(
+                        consecutive_model_corrections,
+                        last_error=last_correction_error,
+                    )
+                if run_model_corrections > max_model_retries:
+                    raise ModelRetryExhaustedError(
+                        run_model_corrections,
+                        last_error=last_correction_error,
+                    )
+            else:
+                consecutive_model_corrections = 0
+
+            if terminal_completed:
+                return
 
     async def _execute_tool_call(
         self,
