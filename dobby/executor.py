@@ -12,7 +12,7 @@ import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ._logging import logger
 from .exceptions import (
@@ -69,6 +69,8 @@ def _model_retry_result(
     tool_name: str,
     tool_call_id: str,
     exception: ModelRetry,
+    *,
+    error_details: ToolErrorDetails | None = None,
 ) -> ToolCallResult:
     """Build a safe model-facing result for a correctable tool-call error."""
     decision = classify_tool_error(exception)
@@ -79,9 +81,18 @@ def _model_retry_result(
         tool_call_id,
         format_model_error(decision),
         True,
-        _tool_error_details(exception),
+        error_details or _tool_error_details(exception),
         decision.retry_model,
     )
+
+
+def _final_result_validation_message(exception: ValidationError) -> str:
+    """Build field-level final-result feedback without model input values."""
+    issues = []
+    for error in exception.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in error["loc"])
+        issues.append(f"{location}: {error['msg']}" if location else error["msg"])
+    return "Invalid final result: " + "; ".join(issues)
 
 
 def _control_flow_result(
@@ -294,6 +305,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         approved_tool_calls: set[str] | None = None,
         max_model_retries: int = 3,
         max_consecutive_model_retries: int = 3,
+        max_final_result_retries: int = 3,
+        max_consecutive_final_result_retries: int = 3,
     ) -> AsyncIterator[StreamEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
 
@@ -317,6 +330,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             max_model_retries: Maximum model-correction turns permitted per run.
             max_consecutive_model_retries: Maximum consecutive model-correction
                 turns permitted.
+            max_final_result_retries: Maximum structured-output correction turns
+                permitted per run.
+            max_consecutive_final_result_retries: Maximum consecutive
+                structured-output correction turns permitted.
 
         Yields:
             StreamEvent: LLM streaming events
@@ -334,6 +351,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         consecutive_model_corrections = 0
         run_model_corrections = 0
         last_correction_error: ToolErrorDetails | None = None
+        consecutive_final_result_corrections = 0
+        run_final_result_corrections = 0
+        last_final_result_error: ToolErrorDetails | None = None
 
         for _ in range(max_iterations):
             tool_calls: list[ToolUsePart] = []
@@ -359,10 +379,52 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 break
 
             # Handle output tool (final_result)
+            final_result_invalid = False
             for tc in tool_calls:
                 if tc.name == OUTPUT_TOOL_NAME and self.output_type:
                     try:
-                        self.last_output = self.output_type.model_validate(tc.inputs)
+                        validated_output = self.output_type.model_validate(tc.inputs)
+                    except ValidationError as exception:
+                        retry = ModelRetry(
+                            _final_result_validation_message(exception),
+                            code=ErrorCode.FINAL_RESULT_INVALID,
+                        )
+                        call_result = _model_retry_result(
+                            tc.name,
+                            tc.id,
+                            retry,
+                            error_details=_tool_error_details(exception),
+                        )
+                        result_event, end_event = self._emit_tool_result(
+                            tc,
+                            call_result.result,
+                            call_result.is_error,
+                            working_messages,
+                            error_details=call_result.error_details,
+                        )
+                        yield result_event
+                        yield end_event
+
+                        consecutive_final_result_corrections += 1
+                        run_final_result_corrections += 1
+                        last_final_result_error = call_result.error_details
+                        if (
+                            consecutive_final_result_corrections
+                            > max_consecutive_final_result_retries
+                        ):
+                            raise ModelRetryExhaustedError(
+                                consecutive_final_result_corrections,
+                                last_error=last_final_result_error,
+                            ) from exception
+                        if run_final_result_corrections > max_final_result_retries:
+                            raise ModelRetryExhaustedError(
+                                run_final_result_corrections,
+                                last_error=last_final_result_error,
+                            ) from exception
+                        final_result_invalid = True
+                        break
+                    else:
+                        self.last_output = validated_output
                         logger.debug(f"Validated output: {self.last_output}")
                         yield ToolResultEvent(
                             tool_use_id=tc.id,
@@ -376,10 +438,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             tool_name=tc.name,
                         )
                         return
-                    except Exception as e:
-                        logger.error(f"Output validation error: {e}")
-                        # TODO: Implement retry logic
-                        raise
+
+            if final_result_invalid:
+                consecutive_model_corrections = 0
+                continue
+
+            consecutive_final_result_corrections = 0
 
             # Categorize tool calls
             streaming_calls: list[ToolUsePart] = []
