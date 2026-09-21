@@ -378,7 +378,17 @@ class GeminiProvider(Provider[genai.Client]):
         except Exception as e:
             self._translate_error(e)
 
-        async for chunk in stream_response:
+        async def translated_chunks() -> AsyncIterator[Any]:
+            stream_iter = stream_response.__aiter__()
+            while True:
+                try:
+                    yield await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    return
+                except Exception as e:
+                    self._translate_error(e)
+
+        async for chunk in translated_chunks():
             # Emit stream start on first chunk
             if not stream_started:
                 yield StreamStartEvent(

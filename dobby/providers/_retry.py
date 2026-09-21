@@ -14,6 +14,7 @@ from tenacity import (
 )
 from tenacity.stop import stop_base
 
+from .._context import run_id_var
 from .._logging import logger
 from .base import RETRYABLE_ERRORS
 
@@ -25,6 +26,7 @@ def create_retry_config(
     stop_after_delay_seconds: float | None = None,
     errors: Sequence[type[BaseException]] = (),
     func_name: str = "LLM call",
+    provider_name: str = "unknown",
 ) -> dict[str, Any]:
     """Create tenacity retry configuration.
 
@@ -35,6 +37,7 @@ def create_retry_config(
         stop_after_delay_seconds: Optional total timeout for all retries.
         errors: Tuple of exception types to retry on.
         func_name: Name of the function for logging purposes.
+        provider_name: Provider name included in retry diagnostics.
 
     Returns:
         Dictionary of tenacity configuration options.
@@ -50,9 +53,19 @@ def create_retry_config(
         exc = retry_state.outcome.exception()
         exc_name = type(exc).__name__ if exc else "unknown error"
         logger.warning(
-            f"Retrying {func_name} in {retry_state.next_action.sleep:.1f}s "
-            f"(attempt {retry_state.attempt_number}/{max_retries}) "
-            f"after {exc_name}: {exc}"
+            f"Retrying provider call layer=provider run_id={run_id_var.get()} "
+            f"provider={provider_name} method={func_name} "
+            f"attempt={retry_state.attempt_number}/{max_retries} "
+            f"in {retry_state.next_action.sleep:.1f}s after {exc_name}: {exc}",
+            extra={
+                "layer": "provider",
+                "run_id": run_id_var.get(),
+                "provider": provider_name,
+                "method": func_name,
+                "attempt": retry_state.attempt_number,
+                "max_attempts": max_retries,
+                "exception_type": exc_name,
+            },
         )
 
     return {
@@ -85,6 +98,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
             stop_after_delay_seconds=120,
             errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
+            provider_name=getattr(self, "name", type(self).__name__),
         )
 
         async for attempt in AsyncRetrying(**config):
@@ -107,6 +121,7 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
             stop_after_delay_seconds=120,
             errors=RETRYABLE_ERRORS,
             func_name=f.__name__,
+            provider_name=getattr(self, "name", type(self).__name__),
         )
 
         # Retry getting the async generator (where the API call happens)

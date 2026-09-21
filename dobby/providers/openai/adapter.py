@@ -492,7 +492,17 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         accumulated_reasoning: str = ""
         function_calls: list[ToolUseEvent] = []
 
-        async for event in response_stream:
+        async def translated_events() -> AsyncIterator[Any]:
+            stream_iter = response_stream.__aiter__()
+            while True:
+                try:
+                    yield await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    return
+                except Exception as e:
+                    self._translate_error(e)
+
+        async for event in translated_events():
             match event.type:
                 case "response.created":
                     response_id = event.response.id

@@ -20,6 +20,12 @@ class ToolErrorDetails(BaseModel):
     exception_module: str
     message: str
     traceback: str
+    error_code: str | None = None
+    run_id: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    attempt: int | None = None
+    max_attempts: int | None = None
 
 
 class ToolResultEvent(BaseModel):

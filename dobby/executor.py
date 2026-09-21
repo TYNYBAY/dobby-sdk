@@ -11,19 +11,29 @@ from collections.abc import AsyncIterator
 import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
+from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from ._context import (
+    correlation_fields,
+    run_id_var,
+    tool_attempt_var,
+    tool_call_id_var,
+    tool_max_attempts_var,
+    tool_name_var,
+)
 from ._logging import logger
 from .exceptions import (
     ApprovalRequired,
     ErrorCode,
     ModelRetry,
     ModelRetryExhaustedError,
+    ToolFailure,
     classify_tool_error,
     format_model_error,
 )
-from .providers.base import Provider
+from .providers.base import Provider, ProviderError
 from .providers.vertexai.converters import to_vertexai_tool
 from .tools.retry import (
     is_retryable_tool_exception,
@@ -49,14 +59,53 @@ from .types import (
 OUTPUT_TOOL_NAME = "final_result"
 
 
-def _tool_error_details(exception: Exception) -> ToolErrorDetails:
+def _tool_error_details(
+    exception: Exception,
+    *,
+    error_code: ErrorCode | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+) -> ToolErrorDetails:
     """Create structured diagnostics for a tool execution exception."""
+    decision = classify_tool_error(exception)
     return ToolErrorDetails(
         exception_type=type(exception).__qualname__,
         exception_module=type(exception).__module__,
         message=str(exception),
         traceback="".join(traceback.format_exception(exception)),
+        error_code=(error_code or (decision.code if decision else None)),
+        run_id=run_id_var.get(),
+        tool_name=tool_name or tool_name_var.get(),
+        tool_call_id=tool_call_id or tool_call_id_var.get(),
+        attempt=tool_attempt_var.get(),
+        max_attempts=tool_max_attempts_var.get(),
     )
+
+
+def _log_tool_exception(exception: Exception) -> None:
+    """Log a tool exception according to its semantic classification."""
+    fields = correlation_fields()
+    context = " ".join(f"{key}={value}" for key, value in fields.items())
+    if isinstance(exception, ModelRetry):
+        logger.warning(
+            f"Tool requested model correction {context} error_code={exception.code.value}",
+            extra={**fields, "layer": "tool", "error_code": exception.code.value},
+        )
+    elif isinstance(exception, ToolFailure):
+        logger.error(
+            f"Tool reported failure {context} error_code={exception.code.value}: {exception}",
+            extra={**fields, "layer": "tool", "error_code": exception.code.value},
+        )
+    else:
+        logger.exception(
+            f"Unexpected tool execution error {context} "
+            f"error_code={ErrorCode.TOOL_EXECUTION_ERROR.value}",
+            extra={
+                **fields,
+                "layer": "tool",
+                "error_code": ErrorCode.TOOL_EXECUTION_ERROR.value,
+            },
+        )
 
 
 class ToolCallResult(NamedTuple):
@@ -277,19 +326,24 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         logger.debug(f"Executing tool: {tool.name}")
         policy = tool.retry_policy()
         max_attempts = max_tool_invocations(policy)
+        tool_max_attempts_var.set(max_attempts)
         attempt = 0
         while True:
             attempt += 1
+            tool_attempt_var.set(attempt)
             try:
                 return await self._call_tool(tool, inputs, context)
             except Exception as exception:
                 if attempt >= max_attempts or not is_retryable_tool_exception(exception, policy):
                     raise
                 delay = retry_backoff_seconds(policy, failed_attempt=attempt)
+                fields = correlation_fields()
                 logger.warning(
-                    f"Retrying tool {tool.name} in {delay:.1f}s "
-                    f"(attempt {attempt}/{max_attempts}) "
-                    f"after {type(exception).__name__}: {exception}"
+                    f"Retrying tool layer=tool run_id={run_id_var.get()} "
+                    f"tool_name={tool.name} tool_call_id={tool_call_id_var.get()} "
+                    f"attempt={attempt}/{max_attempts} in {delay:.1f}s "
+                    f"after {type(exception).__name__}: {exception}",
+                    extra={**fields, "layer": "tool", "exception_type": type(exception).__name__},
                 )
                 await asyncio.sleep(delay)
 
@@ -303,9 +357,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         kwargs = dict(inputs)
         policy = tool.retry_policy()
         max_attempts = max_tool_invocations(policy)
+        tool_max_attempts_var.set(max_attempts)
         attempt = 0
         while True:
             attempt += 1
+            tool_attempt_var.set(attempt)
             yielded = False
             try:
                 if tool.takes_ctx and context is not None:
@@ -324,10 +380,13 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 ):
                     raise
                 delay = retry_backoff_seconds(policy, failed_attempt=attempt)
+                fields = correlation_fields()
                 logger.warning(
-                    f"Retrying tool {tool.name} in {delay:.1f}s "
-                    f"(attempt {attempt}/{max_attempts}) "
-                    f"after {type(exception).__name__}: {exception}"
+                    f"Retrying tool layer=tool run_id={run_id_var.get()} "
+                    f"tool_name={tool.name} tool_call_id={tool_call_id_var.get()} "
+                    f"attempt={attempt}/{max_attempts} in {delay:.1f}s "
+                    f"after {type(exception).__name__}: {exception}",
+                    extra={**fields, "layer": "tool", "exception_type": type(exception).__name__},
                 )
                 await asyncio.sleep(delay)
 
@@ -384,6 +443,58 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         )
 
     async def run_stream(
+        self,
+        messages: list[MessagePart],
+        system_prompt: str | None = None,
+        context: ContextT | None = None,
+        max_iterations: int = 10,
+        reasoning_effort: str | int | None = None,
+        max_tokens: int | None = None,
+        approved_tool_calls: set[str] | None = None,
+        max_model_retries: int = 3,
+        max_consecutive_model_retries: int = 3,
+        max_final_result_retries: int = 3,
+        max_consecutive_final_result_retries: int = 3,
+    ) -> AsyncIterator[StreamEvent]:
+        """Run the agent under a run-scoped correlation context."""
+        run_id = uuid4().hex
+        token = run_id_var.set(run_id)
+        logger.debug(
+            f"Starting agent run run_id={run_id}",
+            extra={"run_id": run_id, "layer": "executor"},
+        )
+        try:
+            async for event in self._run_stream(
+                messages=messages,
+                system_prompt=system_prompt,
+                context=context,
+                max_iterations=max_iterations,
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
+                approved_tool_calls=approved_tool_calls,
+                max_model_retries=max_model_retries,
+                max_consecutive_model_retries=max_consecutive_model_retries,
+                max_final_result_retries=max_final_result_retries,
+                max_consecutive_final_result_retries=max_consecutive_final_result_retries,
+            ):
+                yield event
+        except ProviderError as exception:
+            logger.error(
+                f"Provider call failed layer=provider run_id={run_id} "
+                f"provider={exception.provider or self.llm.name} "
+                f"exception_type={type(exception).__name__}: {exception}",
+                extra={
+                    "layer": "provider",
+                    "run_id": run_id,
+                    "provider": exception.provider or self.llm.name,
+                    "exception_type": type(exception).__name__,
+                },
+            )
+            raise
+        finally:
+            run_id_var.reset(token)
+
+    async def _run_stream(
         self,
         messages: list[MessagePart],
         system_prompt: str | None = None,
@@ -482,7 +593,25 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             tc.name,
                             tc.id,
                             retry,
-                            error_details=_tool_error_details(exception),
+                            error_details=_tool_error_details(
+                                exception,
+                                error_code=ErrorCode.FINAL_RESULT_INVALID,
+                                tool_name=tc.name,
+                                tool_call_id=tc.id,
+                            ),
+                        )
+                        logger.warning(
+                            f"Final result requires model correction layer=tool "
+                            f"run_id={run_id_var.get()} tool_name={tc.name} "
+                            f"tool_call_id={tc.id} "
+                            f"error_code={ErrorCode.FINAL_RESULT_INVALID.value}",
+                            extra={
+                                "layer": "tool",
+                                "run_id": run_id_var.get(),
+                                "tool_name": tc.name,
+                                "tool_call_id": tc.id,
+                                "error_code": ErrorCode.FINAL_RESULT_INVALID.value,
+                            },
                         )
                         result_event, end_event = self._emit_tool_result(
                             tc,
@@ -543,7 +672,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     continue
                 tool = self._tools.get(tc.name)
                 if not tool:
-                    logger.warning(f"Tool not found: {tc.name}")
+                    logger.warning(
+                        f"Tool not found layer=tool run_id={run_id_var.get()} "
+                        f"tool_name={tc.name} tool_call_id={tc.id} "
+                        f"error_code={ErrorCode.TOOL_NOT_FOUND.value}",
+                        extra={
+                            "layer": "tool",
+                            "run_id": run_id_var.get(),
+                            "tool_name": tc.name,
+                            "tool_call_id": tc.id,
+                            "error_code": ErrorCode.TOOL_NOT_FOUND.value,
+                        },
+                    )
                     parallel_calls.append(tc)
                     continue
                 if tool.terminal:
@@ -750,6 +890,33 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         context: ContextT | None,
         approved_tool_calls: set[str],
     ) -> ToolCallResult:
+        """Execute a tool call with call-scoped correlation context."""
+        name_token = tool_name_var.set(tool_name)
+        call_token = tool_call_id_var.set(tool_call_id)
+        attempt_token = tool_attempt_var.set(None)
+        max_attempts_token = tool_max_attempts_var.set(None)
+        try:
+            return await self._execute_tool_call_impl(
+                tool_name,
+                tool_call_id,
+                inputs,
+                context,
+                approved_tool_calls,
+            )
+        finally:
+            tool_max_attempts_var.reset(max_attempts_token)
+            tool_attempt_var.reset(attempt_token)
+            tool_call_id_var.reset(call_token)
+            tool_name_var.reset(name_token)
+
+    async def _execute_tool_call_impl(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+        approved_tool_calls: set[str],
+    ) -> ToolCallResult:
         """Execute a single non-streaming tool call.
 
         Args:
@@ -779,6 +946,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         try:
             validated_inputs = tool.validate_inputs(inputs)
         except ModelRetry as exception:
+            _log_tool_exception(exception)
             return _model_retry_result(tool_name, tool_call_id, exception)
 
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
@@ -790,10 +958,38 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         except ApprovalRequired:
             raise
         except Exception as exception:
-            logger.exception(f"Error executing tool {tool_name}")
+            _log_tool_exception(exception)
             return _classified_tool_result(tool_name, tool_call_id, exception)
 
     async def _execute_tool_stream(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+        approved_tool_calls: set[str],
+    ) -> AsyncIterator[ToolStreamEvent | ToolCallResult | Any]:
+        """Execute a streaming tool with call-scoped correlation context."""
+        name_token = tool_name_var.set(tool_name)
+        call_token = tool_call_id_var.set(tool_call_id)
+        attempt_token = tool_attempt_var.set(None)
+        max_attempts_token = tool_max_attempts_var.set(None)
+        try:
+            async for event in self._execute_tool_stream_impl(
+                tool_name,
+                tool_call_id,
+                inputs,
+                context,
+                approved_tool_calls,
+            ):
+                yield event
+        finally:
+            tool_max_attempts_var.reset(max_attempts_token)
+            tool_attempt_var.reset(attempt_token)
+            tool_call_id_var.reset(call_token)
+            tool_name_var.reset(name_token)
+
+    async def _execute_tool_stream_impl(
         self,
         tool_name: str,
         tool_call_id: str,
@@ -827,6 +1023,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         try:
             validated_inputs = tool.validate_inputs(inputs)
         except ModelRetry as exception:
+            _log_tool_exception(exception)
             yield _model_retry_result(tool_name, tool_call_id, exception)
             return
 
@@ -844,5 +1041,5 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         except ApprovalRequired:
             raise
         except Exception as exception:
-            logger.exception(f"Error executing tool {tool_name}")
+            _log_tool_exception(exception)
             yield _classified_tool_result(tool_name, tool_call_id, exception)
