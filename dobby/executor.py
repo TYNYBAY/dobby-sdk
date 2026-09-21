@@ -748,6 +748,16 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 yield end_event
 
             if control_flow is not None:
+                for remaining in streaming_calls + terminal_calls:
+                    remaining_result = _control_flow_result(remaining, control_flow)
+                    remaining_event, remaining_end = self._emit_tool_result(
+                        remaining,
+                        remaining_result.result,
+                        remaining_result.is_error,
+                        working_messages,
+                    )
+                    yield remaining_event
+                    yield remaining_end
                 raise control_flow
 
             # Execute streaming tools sequentially

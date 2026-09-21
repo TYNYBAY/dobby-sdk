@@ -302,6 +302,89 @@ def test_streaming_then_later_terminal_assemble_control_flow() -> None:
     assert all(result.error_details is None for result in results)
 
 
+@pytest.mark.parametrize(
+    ("later_kind", "control_flow"),
+    [
+        ("streaming", "approval"),
+        ("streaming", "cancellation"),
+        ("terminal", "approval"),
+        ("terminal", "cancellation"),
+    ],
+)
+def test_regular_control_flow_assembles_later_unexecuted_tools(
+    later_kind: str,
+    control_flow: str,
+) -> None:
+    later_ran = False
+
+    @dataclass
+    class RegularTool(Tool):
+        name = "regular"
+        description = "Host control flow."
+        requires_approval = control_flow == "approval"
+
+        async def __call__(self) -> str:
+            if control_flow == "cancellation":
+                raise asyncio.CancelledError
+            return "should not run"
+
+    @dataclass
+    class StreamingLaterTool(Tool):
+        name = "streaming"
+        description = "Must not run after regular control flow."
+        stream_output = True
+
+        async def __call__(self):
+            nonlocal later_ran
+            later_ran = True
+            yield "should not run"
+
+    @dataclass
+    class TerminalLaterTool(Tool):
+        name = "terminal"
+        description = "Must not run after regular control flow."
+        terminal = True
+
+        async def __call__(self) -> str:
+            nonlocal later_ran
+            later_ran = True
+            return "should not run"
+
+    later_tool = StreamingLaterTool() if later_kind == "streaming" else TerminalLaterTool()
+    expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
+    events, messages, error = asyncio.run(
+        _collect_until_exception(
+            [RegularTool(), later_tool],
+            [
+                ToolUsePart(id="call-regular", name="regular", inputs={}),
+                ToolUsePart(id=f"call-{later_kind}", name=later_kind, inputs={}),
+            ],
+            expected,
+        )
+    )
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    parts = _tool_result_parts(messages)
+    expected_result = (
+        {"approval_required": True} if control_flow == "approval" else {"cancelled": True}
+    )
+
+    assert isinstance(error, expected)
+    assert later_ran is False
+    assert [result.tool_use_id for result in results] == [
+        "call-regular",
+        f"call-{later_kind}",
+    ]
+    assert [part.tool_use_id for part in parts] == [
+        "call-regular",
+        f"call-{later_kind}",
+    ]
+    assert [result.result for result in results] == [expected_result, expected_result]
+    assert all(result.is_error is True for result in results)
+    assert all(result.error_details is None for result in results)
+    assert all("[tool_execution_error]" not in part.parts[0].text for part in parts)
+    assert all("[tool_retry]" not in part.parts[0].text for part in parts)
+
+
 @pytest.mark.parametrize("control_flow", ["approval", "cancellation"])
 def test_streaming_control_flow_is_unclassified(control_flow: str) -> None:
     @dataclass
