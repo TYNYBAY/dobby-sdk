@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 from ..exceptions import ErrorCode, ModelRetry
 from .base import ToolParameter
 from .injected import is_injected
+from .retry import ToolRetryPolicy
 from .schema_utils import process_tool_definition
 
 
@@ -47,7 +48,10 @@ class Tool:
     Class Attributes (define in subclass as class variables, NOT fields):
         name: Tool name (defaults to class name if not set)
         description: Tool description for the LLM
-        max_retries: Maximum retry attempts on failure (default: 1)
+        max_retries: Extra retry attempts after a retryable invocation
+            failure (default: 1). ``0`` means one invocation only.
+        retryable_exceptions: Exception types that may be retried (default: ()).
+            Empty means no host-side retry.
         requires_approval: Whether tool needs human approval before execution (default: False)
         stream_output: Whether tool yields streaming events (default: False)
         terminal: Whether tool exits the agent loop (default: False)
@@ -70,6 +74,7 @@ class Tool:
     name: ClassVar[str] = ""  # Falls back to class name if None
     description: ClassVar[str]  # Required! No default
     max_retries: ClassVar[int] = 1
+    retryable_exceptions: ClassVar[tuple[type[BaseException], ...]] = ()
     requires_approval: ClassVar[bool] = False
     stream_output: ClassVar[bool] = False
     terminal: ClassVar[bool] = False
@@ -172,6 +177,13 @@ class Tool:
         tool._model = model
         return tool
 
+    def retry_policy(self) -> ToolRetryPolicy:
+        """Return the host-side retry policy for this tool."""
+        return ToolRetryPolicy(
+            max_retries=self.max_retries,
+            retryable_exceptions=self.retryable_exceptions,
+        )
+
     def __call__(self, *args, **kwargs) -> Any:
         """Execute the tool. Override in subclass.
 
@@ -226,7 +238,9 @@ class Tool:
                     injected_names.add(name)
                     continue
 
-                default = ... if parameter.default is inspect.Parameter.empty else parameter.default
+                default = (
+                    ... if parameter.default is inspect.Parameter.empty else parameter.default
+                )
                 fields[name] = (annotation, default)
 
             supplied_injected = injected_names.intersection(inputs)

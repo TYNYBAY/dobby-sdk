@@ -355,9 +355,7 @@ class TestSequentialFallback:
 
         results, elapsed = asyncio.run(run())
         assert len(results) == 3
-        assert elapsed >= 2.5, (
-            f"Took {elapsed:.2f}s, expected >=2.5s for sequential execution"
-        )
+        assert elapsed >= 2.5, f"Took {elapsed:.2f}s, expected >=2.5s for sequential execution"
 
 
 class TestToolErrorHandling:
@@ -615,6 +613,62 @@ class TestToolErrorHandling:
         assert err_result.is_error is True
         assert result_parts[1].is_error is True
         assert "intentional failure" in str(err_result.result)
+
+    def test_retrying_tool_does_not_change_sibling_result_order(self) -> None:
+        """A retrying parallel tool does not reorder or re-run its sibling."""
+        retry_calls = 0
+        sibling_calls = 0
+
+        @dataclass
+        class RetryingTool(Tool):
+            name = "retrying_tool"
+            description = "Fail once, then succeed"
+            retryable_exceptions = (TimeoutError,)
+
+            async def __call__(self) -> dict:
+                nonlocal retry_calls
+                retry_calls += 1
+                if retry_calls == 1:
+                    raise TimeoutError("transient")
+                return {"status": "recovered"}
+
+        @dataclass
+        class SiblingTool(Tool):
+            name = "sibling_tool"
+            description = "Succeed once"
+
+            async def __call__(self) -> dict:
+                nonlocal sibling_calls
+                sibling_calls += 1
+                return {"status": "ok"}
+
+        async def run():
+            tool_calls = [
+                ToolUsePart(id="tc1", name="retrying_tool", inputs={}),
+                ToolUsePart(id="tc2", name="sibling_tool", inputs={}),
+            ]
+            provider = _make_mock_provider(tool_calls)
+            executor = AgentExecutor(
+                provider="openai",
+                llm=provider,
+                tools=[RetryingTool(), SiblingTool()],
+            )
+            return await _collect_results_and_emitted_messages(executor)
+
+        with patch("dobby.executor.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            results, messages = asyncio.run(run())
+
+        result_parts = _tool_result_parts(messages)
+        assert retry_calls == 2
+        assert sibling_calls == 1
+        assert sleep.await_count == 1
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2"]
+        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
+        assert results[0].is_error is False
+        assert results[1].is_error is False
+        assert results[0].result == {"status": "recovered"}
+        assert results[1].result == {"status": "ok"}
 
     def test_regular_tool_error_logs_exception_with_traceback(
         self, caplog: pytest.LogCaptureFixture

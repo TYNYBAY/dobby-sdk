@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -275,9 +275,7 @@ def test_execution_errors_do_not_consume_correction_budget(body_error: Exception
         async def __call__(self) -> None:
             raise body_error
 
-    provider = ScriptedProvider(
-        [[ToolUsePart(id="call-failing", name="failing", inputs={})], []]
-    )
+    provider = ScriptedProvider([[ToolUsePart(id="call-failing", name="failing", inputs={})], []])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[FailingTool()])
 
     events = asyncio.run(_collect_events(executor, max_model_retries=0))
@@ -287,6 +285,35 @@ def test_execution_errors_do_not_consume_correction_budget(body_error: Exception
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
+
+
+def test_retry_exhausted_execution_error_does_not_consume_correction_budget() -> None:
+    calls = 0
+
+    @dataclass
+    class TimeoutTool(Tool):
+        name = "timeout"
+        description = "Always time out."
+        retryable_exceptions = (TimeoutError,)
+
+        async def __call__(self) -> None:
+            nonlocal calls
+            calls += 1
+            raise TimeoutError("transient")
+
+    provider = ScriptedProvider([[ToolUsePart(id="call-timeout", name="timeout", inputs={})], []])
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[TimeoutTool()])
+
+    with patch("dobby.executor.asyncio.sleep", new_callable=AsyncMock):
+        events = asyncio.run(_collect_events(executor, max_model_retries=0))
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert calls == 2
+    assert len(provider.calls) == 2
+    assert len(results) == 1
+    assert results[0].is_error is True
+    assert results[0].error_details is not None
+    assert "transient" in str(results[0].result)
 
 
 def test_streaming_validation_correction_exhausts_after_result() -> None:
@@ -428,9 +455,7 @@ def test_host_control_flow_does_not_become_model_retry_exhaustion(control_flow: 
             if control_flow == "cancellation":
                 raise asyncio.CancelledError
 
-    provider = ScriptedProvider(
-        [[ToolUsePart(id="call-control", name="control", inputs={})]]
-    )
+    provider = ScriptedProvider([[ToolUsePart(id="call-control", name="control", inputs={})]])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[ControlFlowTool()])
 
     expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError

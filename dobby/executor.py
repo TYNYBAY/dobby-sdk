@@ -25,6 +25,11 @@ from .exceptions import (
 )
 from .providers.base import Provider
 from .providers.vertexai.converters import to_vertexai_tool
+from .tools.retry import (
+    is_retryable_tool_exception,
+    max_tool_invocations,
+    retry_backoff_seconds,
+)
 from .tools.tool import Tool
 from .types import (
     AssistantMessagePart,
@@ -168,7 +173,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 output_type.model_json_schema().get("description")
                 or f"Return the final structured result as {output_type.__name__}"
             )
-            output_tool = Tool.from_model(output_type, name=OUTPUT_TOOL_NAME, description=description)
+            output_tool = Tool.from_model(
+                output_type, name=OUTPUT_TOOL_NAME, description=description
+            )
             self._tools[output_tool.name] = output_tool
 
         if tools:
@@ -216,23 +223,13 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     self._formatted_tools = []
         return self._formatted_tools
 
-    async def _invoke_tool(
+    async def _call_tool(
         self,
         tool: Tool,
         inputs: dict[str, Any],
         context: ContextT | None,
     ) -> Any:
-        """Invoke a non-streaming tool, handling context injection and sync/async dispatch.
-
-        Args:
-            tool: The Tool instance to invoke
-            inputs: Tool input arguments from LLM
-            context: Context to inject if tool takes_ctx
-
-        Returns:
-            The tool's return value
-        """
-        logger.debug(f"Executing tool: {tool.name}")
+        """Dispatch a non-streaming tool once, including context injection."""
         kwargs = dict(inputs)
         if tool.takes_ctx and context is not None:
             if inspect.iscoroutinefunction(tool.__call__):
@@ -241,6 +238,82 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         if inspect.iscoroutinefunction(tool.__call__):
             return await tool(**kwargs)
         return tool(**kwargs)
+
+    async def _invoke_tool(
+        self,
+        tool: Tool,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+    ) -> Any:
+        """Invoke a non-streaming tool, retrying listed transient failures.
+
+        Lookup, input validation, and approval happen before this method.
+        Retry state is local to this call.
+
+        Args:
+            tool: The Tool instance to invoke
+            inputs: Validated tool input arguments from LLM
+            context: Context to inject if tool takes_ctx
+
+        Returns:
+            The tool's return value
+        """
+        logger.debug(f"Executing tool: {tool.name}")
+        policy = tool.retry_policy()
+        max_attempts = max_tool_invocations(policy)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._call_tool(tool, inputs, context)
+            except Exception as exception:
+                if attempt >= max_attempts or not is_retryable_tool_exception(exception, policy):
+                    raise
+                delay = retry_backoff_seconds(policy, failed_attempt=attempt)
+                logger.warning(
+                    f"Retrying tool {tool.name} in {delay:.1f}s "
+                    f"(attempt {attempt}/{max_attempts}) "
+                    f"after {type(exception).__name__}: {exception}"
+                )
+                await asyncio.sleep(delay)
+
+    async def _stream_tool(
+        self,
+        tool: Tool,
+        inputs: dict[str, Any],
+        context: ContextT | None,
+    ) -> AsyncIterator[Any]:
+        """Stream a tool, retrying only if failure occurs before the first yield."""
+        kwargs = dict(inputs)
+        policy = tool.retry_policy()
+        max_attempts = max_tool_invocations(policy)
+        attempt = 0
+        while True:
+            attempt += 1
+            yielded = False
+            try:
+                if tool.takes_ctx and context is not None:
+                    stream = tool(context, **kwargs)  # type: ignore[misc]
+                else:
+                    stream = tool(**kwargs)  # type: ignore[misc]
+                async for event in stream:
+                    yielded = True
+                    yield event
+                return
+            except Exception as exception:
+                if (
+                    yielded
+                    or attempt >= max_attempts
+                    or not is_retryable_tool_exception(exception, policy)
+                ):
+                    raise
+                delay = retry_backoff_seconds(policy, failed_attempt=attempt)
+                logger.warning(
+                    f"Retrying tool {tool.name} in {delay:.1f}s "
+                    f"(attempt {attempt}/{max_attempts}) "
+                    f"after {type(exception).__name__}: {exception}"
+                )
+                await asyncio.sleep(delay)
 
     def _emit_tool_result(
         self,
@@ -467,9 +540,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             # Any sequential tool in the batch forces the entire batch to run
             # sequentially to preserve execution-order guarantees
             force_sequential = any(
-                self._tools[tc.name].sequential
-                for tc in parallel_calls
-                if tc.name in self._tools
+                self._tools[tc.name].sequential for tc in parallel_calls if tc.name in self._tools
             )
 
             # Execute non-streaming tools (parallel or sequential)
@@ -488,9 +559,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 else:
                     results = await asyncio.gather(
                         *[
-                            self._execute_tool_call(
-                                tc.name, tc.id, tc.inputs, context, approved
-                            )
+                            self._execute_tool_call(tc.name, tc.id, tc.inputs, context, approved)
                             for tc in parallel_calls
                         ],
                         return_exceptions=True,
@@ -505,7 +574,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     call_result = _control_flow_result(tc, call_result)
                 elif isinstance(call_result, Exception):
                     call_result = ToolCallResult(
-                        tc.name, tc.id, {"error": str(call_result)}, True,
+                        tc.name,
+                        tc.id,
+                        {"error": str(call_result)},
+                        True,
                         _tool_error_details(call_result),
                     )
                 elif isinstance(call_result, BaseException):
@@ -516,7 +588,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     batch_last_correction_error = call_result.error_details
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, call_result.result, call_result.is_error, working_messages,
+                    tc,
+                    call_result.result,
+                    call_result.is_error,
+                    working_messages,
                     error_details=call_result.error_details,
                 )
                 yield result_event
@@ -554,7 +629,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     error_details = _tool_error_details(e)
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, result, is_error, working_messages,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
                     error_details=error_details,
                 )
                 yield result_event
@@ -592,7 +670,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     is_error = True
                     error_details = _tool_error_details(e)
                 result_event, end_event = self._emit_tool_result(
-                    tc, result, is_error, working_messages, is_terminal=not input_invalid,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
+                    is_terminal=not input_invalid,
                     error_details=error_details,
                 )
                 yield result_event
@@ -718,17 +800,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
             raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
 
-        logger.debug(f"Executing tool: {tool_name}")
-
-        kwargs = dict(validated_inputs)
-
         if tool.stream_output:
-            if tool.takes_ctx and context is not None:
-                async for event in tool(context, **kwargs):  # type: ignore[misc]
-                    yield event
-            else:
-                async for event in tool(**kwargs):  # type: ignore[misc]
-                    yield event
+            logger.debug(f"Executing tool: {tool_name}")
+            async for event in self._stream_tool(tool, validated_inputs, context):
+                yield event
         else:
             result = await self._invoke_tool(tool, validated_inputs, context)
             yield result
