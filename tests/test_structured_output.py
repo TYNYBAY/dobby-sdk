@@ -636,9 +636,7 @@ def test_valid_final_result_terminates_normally() -> None:
 
 
 def test_final_result_without_output_type_remains_unknown_tool() -> None:
-    provider = ScriptedProvider(
-        [[_final_call("call-final", {"value": "x"})], []]
-    )
+    provider = ScriptedProvider([[_final_call("call-final", {"value": "x"})], []])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[])
 
     events = asyncio.run(_collect_events(executor))
@@ -657,9 +655,7 @@ def test_unexpected_output_validation_exception_remains_host_raised() -> None:
         def explode(cls, value: str) -> str:
             raise RuntimeError("internal validator secret")
 
-    provider = ScriptedProvider(
-        [[_final_call("call-final", {"value": "trigger"})]]
-    )
+    provider = ScriptedProvider([[_final_call("call-final", {"value": "trigger"})]])
     executor = AgentExecutor(
         provider="openai",
         llm=provider,

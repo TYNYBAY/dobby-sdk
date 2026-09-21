@@ -243,9 +243,7 @@ def test_final_result_validation_has_no_invocation_attempts() -> None:
         [ToolUsePart(id="call-final", name="final_result", inputs={"value": "bad"})]
     )
     executor = AgentExecutor(provider="openai", llm=provider, output_type=Output)
-    events = asyncio.run(
-        _collect(executor.run_stream(messages=[], max_final_result_retries=1))
-    )
+    events = asyncio.run(_collect(executor.run_stream(messages=[], max_final_result_retries=1)))
 
     details = _results(events)[0].error_details
     assert details is not None
@@ -292,9 +290,7 @@ def test_provider_retry_does_not_change_tool_attempt_metadata() -> None:
                 raise RateLimitError("provider retry", provider=self.name)
             return await super().chat(messages, **kwargs)
 
-    provider = RetryingProvider(
-        [ToolUsePart(id="call-broken", name="broken", inputs={})]
-    )
+    provider = RetryingProvider([ToolUsePart(id="call-broken", name="broken", inputs={})])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[BrokenTool()])
     with patch(
         "dobby.providers._retry.create_retry_config",
