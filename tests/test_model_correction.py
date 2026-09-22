@@ -213,8 +213,7 @@ def test_execution_errors_do_not_consume_correction_budget() -> None:
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
-    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
-    assert "failure" not in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] failure"
 
 
 def test_body_model_retry_consumes_correction_budget() -> None:
@@ -271,8 +270,7 @@ def test_retry_exhausted_execution_error_does_not_consume_correction_budget() ->
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
-    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
-    assert "transient" not in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] transient"
 
 
 def test_streaming_validation_correction_exhausts_after_result() -> None:

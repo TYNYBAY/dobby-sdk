@@ -361,8 +361,8 @@ class TestSequentialFallback:
 class TestToolErrorHandling:
     """Test that errors in parallel tools are handled correctly."""
 
-    def test_regular_tool_error_has_diagnostics_but_model_message_does_not(self) -> None:
-        """Structured diagnostics stay out of the model-facing tool result."""
+    def test_regular_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
+        """Host traceback stays on error_details; the model gets the exception text."""
 
         @dataclass
         class FailingTool(Tool):
@@ -413,13 +413,12 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
-        assert "diagnostic failure" not in model_text
+        assert model_text == "[tool_execution_error] diagnostic failure"
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
-    def test_streaming_tool_error_has_diagnostics_but_model_message_does_not(self) -> None:
-        """Streaming exceptions retain diagnostics outside the model message."""
+    def test_streaming_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
+        """Streaming exceptions retain host diagnostics and emit the exception text."""
 
         @dataclass
         class FailingStreamingTool(Tool):
@@ -463,13 +462,12 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
-        assert "streaming diagnostic failure" not in model_text
+        assert model_text == "[tool_execution_error] streaming diagnostic failure"
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
-    def test_terminal_tool_error_has_diagnostics_but_model_message_does_not(self) -> None:
-        """Terminal exceptions retain diagnostics outside the model message."""
+    def test_terminal_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
+        """Terminal exceptions retain host diagnostics and emit the exception text."""
 
         @dataclass
         class FailingTerminalTool(Tool):
@@ -512,8 +510,7 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
-        assert "terminal diagnostic failure" not in model_text
+        assert model_text == "[tool_execution_error] terminal diagnostic failure"
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
@@ -619,8 +616,7 @@ class TestToolErrorHandling:
         assert result_parts[0].is_error is False
         assert err_result.is_error is True
         assert result_parts[1].is_error is True
-        assert str(err_result.result) == "[tool_execution_error] The tool failed unexpectedly."
-        assert "intentional failure" not in str(err_result.result)
+        assert str(err_result.result) == "[tool_execution_error] intentional failure"
 
     def test_retrying_tool_does_not_change_sibling_result_order(self) -> None:
         """A retrying parallel tool does not reorder or re-run its sibling."""

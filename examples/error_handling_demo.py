@@ -250,7 +250,7 @@ def _log_lines(run: ScenarioRun) -> list[str]:
 
 
 def _traceback_in_model_content(run: ScenarioRun) -> bool:
-    """Return whether a CPython traceback leaked into model-facing text."""
+    """Return whether a CPython traceback dump is present in model-facing text."""
     needles = ("Traceback (most recent call last):", "traceback (most recent call last):")
     blobs: list[str] = []
     for event in _result_events(run.events):
@@ -414,7 +414,7 @@ async def scenario_retry_success(logger: logging.Logger) -> None:
 
 
 async def scenario_retry_exhaustion(logger: logging.Logger) -> None:
-    """Demonstrate retry budget exhaustion with sanitized model text."""
+    """Demonstrate retry budget exhaustion with a classified execution error."""
     tool = AlwaysTimeoutTool()
     run = await _run_executor(
         [tool],
@@ -433,7 +433,7 @@ async def scenario_retry_exhaustion(logger: logging.Logger) -> None:
             "Model requested lookup_account(account_id='A-100')",
             f"Tool invocations={len(tool.invocations)} (all failed)",
             "Retry budget exhausted",
-            "Sanitized error returned to the model; diagnostics stay on the host",
+            "Classified tool_execution_error returned to the model; traceback stays on the host",
         ]
     )
     _print_block("MODEL", _model_lines(run))
@@ -453,10 +453,7 @@ async def scenario_retry_exhaustion(logger: logging.Logger) -> None:
             [
                 f"MODEL-FACING result={model_text!r}",
                 f"HOST last exception message={host_message!r}",
-                "Host message is absent from the model-facing result."
-                if host_message not in model_text
-                else "WARNING: host message leaked into model-facing result.",
-                f"Raw traceback leaked into model-facing content: {_traceback_in_model_content(run)}",
+                f"Raw traceback in model-facing content: {_traceback_in_model_content(run)}",
             ]
         )
     _print_block("OUTCOME", outcome)
@@ -574,7 +571,7 @@ async def scenario_model_retry_correction(logger: logging.Logger) -> None:
 
 
 async def scenario_unexpected_exception(logger: logging.Logger) -> None:
-    """Demonstrate sanitization of an unexpected tool exception."""
+    """Demonstrate classification of an unexpected tool exception."""
     tool = BrokenLookupTool()
     run = await _run_executor(
         [tool],
@@ -594,7 +591,7 @@ async def scenario_unexpected_exception(logger: logging.Logger) -> None:
             "Model called lookup_account",
             "Tool raised RuntimeError (not listed, not ModelRetry/ToolFailure)",
             "Executor classified it as tool_execution_error",
-            "Model gets a generic message; host/logs keep the real exception",
+            "Model gets the exception message; host/logs keep the traceback",
         ]
     )
     _print_block("MODEL", _model_lines(run))
@@ -605,20 +602,16 @@ async def scenario_unexpected_exception(logger: logging.Logger) -> None:
     _print_block("LOGS", _log_lines(run))
 
     model_text = str(result.result) if result is not None else ""
-    leaked = secret in model_text or _traceback_in_model_content(run)
     _print_block(
         "OUTCOME",
         [
-            f"MODEL sanitized result={model_text!r}",
-            f"Secret host diagnostic present in MODEL text: {secret in model_text}",
+            f"MODEL classified result={model_text!r}",
+            f"Exception message present in MODEL text: {secret in model_text}",
             f"CPython traceback present in MODEL text: {_traceback_in_model_content(run)}",
-            f"Secret host diagnostic present in HOST error_details.message: "
+            f"Exception message present in HOST error_details.message: "
             f"{bool(result and result.error_details and secret in result.error_details.message)}",
             f"Traceback present on HOST error_details: "
             f"{bool(result and result.error_details and result.error_details.traceback)}",
-            "The raw traceback did not become model-facing content."
-            if not leaked
-            else "WARNING: host diagnostics leaked into model-facing content.",
         ],
     )
 

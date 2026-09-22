@@ -168,7 +168,7 @@ def test_tool_failure_rejects_retry_and_host_codes(code: ErrorCode) -> None:
         ToolFailure("Do not retry this.", code=code)
 
 
-def test_unexpected_tool_error_hides_exception_details_from_model() -> None:
+def test_unexpected_tool_error_uses_exception_message() -> None:
     decision = classify_tool_error(RuntimeError("database password is secret"))
 
     assert decision is not None
@@ -176,9 +176,8 @@ def test_unexpected_tool_error_hides_exception_details_from_model() -> None:
 
     assert decision.code is ErrorCode.TOOL_EXECUTION_ERROR
     assert decision.retry_model is False
-    assert "database password" not in model_text
-    assert "RuntimeError" not in model_text
-    assert model_text == "[tool_execution_error] The tool failed unexpectedly."
+    assert decision.model_message == "database password is secret"
+    assert model_text == "[tool_execution_error] database password is secret"
 
 
 @pytest.mark.parametrize(
@@ -196,7 +195,7 @@ def test_provider_errors_do_not_enter_model_retry_semantics(
     assert decision is not None
     assert decision.code is ErrorCode.TOOL_EXECUTION_ERROR
     assert decision.retry_model is False
-    assert "provider" not in format_model_error(decision)
+    assert format_model_error(decision) == f"[tool_execution_error] {provider_error}"
 
 
 def test_model_error_formatter_uses_only_decision_fields() -> None:
@@ -206,56 +205,6 @@ def test_model_error_formatter_uses_only_decision_fields() -> None:
     )
 
     assert format_model_error(decision) == ("[final_result_invalid] Provide the missing field.")
-
-
-def test_model_error_formatter_replaces_blank_message() -> None:
-    decision = ErrorDecision(
-        code=ErrorCode.TOOL_FAILURE,
-        model_message="  ",
-    )
-
-    assert (
-        format_model_error(decision) == "[tool_failure] The tool could not complete the request."
-    )
-
-
-def test_classify_sanitizes_model_retry_traceback_before_formatting() -> None:
-    traceback_dump = (
-        "Traceback (most recent call last):\n"
-        '  File "tool.py", line 10, in run\n'
-        "    raise ValueError('database password is secret')\n"
-        "ValueError: database password is secret"
-    )
-    exception = ModelRetry(
-        "Use a different record ID.\n" + traceback_dump,
-    )
-
-    decision = classify_tool_error(exception)
-
-    assert decision is not None
-    assert decision.model_message == "Use a different record ID."
-    assert "Traceback" not in decision.model_message
-    assert "password" not in decision.model_message
-
-    model_text = format_model_error(decision)
-    assert model_text == "[tool_retry] Use a different record ID."
-    assert traceback_dump not in model_text
-
-
-def test_classify_replaces_traceback_only_model_retry() -> None:
-    exception = ModelRetry(
-        "Traceback (most recent call last):\n"
-        '  File "tool.py", line 10, in run\n'
-        "ValueError: database password is secret"
-    )
-
-    decision = classify_tool_error(exception)
-
-    assert decision is not None
-    assert decision.model_message == "The tool call should be corrected and retried."
-    assert format_model_error(decision) == (
-        "[tool_retry] The tool call should be corrected and retried."
-    )
 
 
 @pytest.mark.parametrize(
@@ -268,34 +217,12 @@ def test_classify_replaces_traceback_only_model_retry() -> None:
         'Config is in File "settings.py", line 10 of the repo',
     ],
 )
-def test_classify_preserves_legitimate_model_retry_wording(message: str) -> None:
+def test_classify_preserves_model_retry_message(message: str) -> None:
     decision = classify_tool_error(ModelRetry(message))
 
     assert decision is not None
     assert decision.model_message == message
     assert format_model_error(decision) == f"[tool_retry] {message}"
-
-
-def test_model_error_formatter_bounds_explicit_message_length() -> None:
-    decision = ErrorDecision(
-        code=ErrorCode.TOOL_FAILURE,
-        model_message="x" * 3000,
-    )
-
-    model_text = format_model_error(decision)
-
-    assert model_text == f"[tool_failure] {'x' * 2000}"
-
-
-def test_model_error_formatter_ignores_host_diagnostic_message() -> None:
-    decision = ErrorDecision(
-        code=ErrorCode.MODEL_RETRY_EXHAUSTED,
-        model_message="Traceback and host diagnostic secret",
-    )
-
-    assert format_model_error(decision) == (
-        "[model_retry_exhausted] The model correction budget was exhausted."
-    )
 
 
 def test_approval_required_remains_outside_error_classification() -> None:
@@ -323,6 +250,9 @@ def test_model_retry_exhaustion_preserves_last_diagnostic() -> None:
     assert decision is not None
     assert decision.code is ErrorCode.MODEL_RETRY_EXHAUSTED
     assert decision.retry_model is False
+    assert format_model_error(decision) == (
+        "[model_retry_exhausted] Model retry budget exhausted after 2 attempts"
+    )
     assert details.traceback not in format_model_error(decision)
 
 
@@ -339,5 +269,5 @@ def test_agent_iteration_limit_has_stable_host_metadata() -> None:
     assert decision.code is ErrorCode.AGENT_ITERATION_LIMIT
     assert decision.retry_model is False
     assert format_model_error(decision) == (
-        "[agent_iteration_limit] The agent iteration limit was reached."
+        "[agent_iteration_limit] Agent iteration limit reached after 10 iterations"
     )

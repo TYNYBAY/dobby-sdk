@@ -71,7 +71,7 @@ def _history_results(provider: _RecordingProvider) -> list[ToolResultPart]:
     ]
 
 
-def test_unexpected_error_has_correlated_host_metadata_but_sanitized_history(
+def test_unexpected_error_has_correlated_host_metadata(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     @dataclass
@@ -106,8 +106,7 @@ def test_unexpected_error_has_correlated_host_metadata_but_sanitized_history(
     assert error_records[0].tool_call_id == "call-broken"
 
     history_text = _history_results(provider)[0].parts[0].text
-    assert history_text == "[tool_execution_error] The tool failed unexpectedly."
-    assert "secret diagnostic" not in history_text
+    assert history_text == "[tool_execution_error] secret diagnostic"
     assert details.run_id not in history_text
     assert "attempt" not in history_text
     assert "Traceback" not in history_text

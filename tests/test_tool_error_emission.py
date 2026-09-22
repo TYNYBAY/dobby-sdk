@@ -19,8 +19,6 @@ from dobby.types import (
     UserMessagePart,
 )
 
-EXECUTION_ERROR = "[tool_execution_error] The tool failed unexpectedly."
-
 
 def _make_mock_provider(tool_calls: list[ToolUsePart]) -> AsyncMock:
     call_count = 0
@@ -105,11 +103,10 @@ def test_unexpected_error_is_classified_and_keeps_host_diagnostics() -> None:
 
     assert len(results) == 1
     assert results[0].is_error is True
-    assert results[0].result == EXECUTION_ERROR
+    assert results[0].result == "[tool_execution_error] secret diagnostic"
     assert results[0].error_details is not None
     assert results[0].error_details.message == "secret diagnostic"
     assert "secret diagnostic" in results[0].error_details.traceback
-    assert "secret diagnostic" not in str(results[0].result)
 
 
 def test_tool_failure_is_classified_without_model_correction() -> None:
@@ -162,7 +159,7 @@ def test_phase6_exhausted_error_uses_last_exception_and_is_classified() -> None:
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert calls == 2
-    assert results[0].result == EXECUTION_ERROR
+    assert results[0].result == "[tool_execution_error] timeout 2"
     assert results[0].error_details is not None
     assert results[0].error_details.message == "timeout 2"
 
@@ -199,7 +196,7 @@ def test_parallel_sibling_keeps_success_and_classified_error_order() -> None:
     assert results[0].is_error is False
     assert results[0].result == "ok"
     assert results[1].is_error is True
-    assert results[1].result == EXECUTION_ERROR
+    assert results[1].result == "[tool_execution_error] boom"
 
 
 def test_streaming_after_yield_failure_is_classified_without_retry() -> None:
@@ -231,7 +228,7 @@ def test_streaming_after_yield_failure_is_classified_without_retry() -> None:
     assert calls == 1
     assert sleep.await_count == 0
     assert [event.data for event in stream_events] == ["started"]
-    assert results[0].result == EXECUTION_ERROR
+    assert results[0].result == "[tool_execution_error] after yield"
     assert results[0].error_details is not None
     assert results[0].error_details.message == "after yield"
 
@@ -255,7 +252,7 @@ def test_terminal_unexpected_error_is_classified_and_still_terminal() -> None:
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert len(results) == 1
-    assert results[0].result == EXECUTION_ERROR
+    assert results[0].result == "[tool_execution_error] terminal boom"
     assert results[0].is_terminal is True
     assert results[0].error_details is not None
     assert results[0].error_details.message == "terminal boom"

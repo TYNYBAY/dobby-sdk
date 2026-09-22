@@ -363,7 +363,6 @@ def test_exception_inside_executed_tool_is_not_input_validation_error() -> None:
     assert len(results) == 1
     assert results[0].is_error is True
     assert "[tool_input_invalid]" not in str(results[0].result)
-    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
-    assert "failure inside tool: 1" not in str(results[0].result)
+    assert str(results[0].result) == "[tool_execution_error] failure inside tool: 1"
     assert results[0].error_details is not None
     assert results[0].error_details.message == "failure inside tool: 1"

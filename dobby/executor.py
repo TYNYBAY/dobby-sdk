@@ -189,7 +189,7 @@ def _model_retry_result(
     *,
     error_details: ToolErrorDetails | None = None,
 ) -> ToolCallResult:
-    """Build a safe model-facing result for a correctable tool-call error."""
+    """Build a model-facing result for a correctable tool-call error."""
     return _classified_tool_result(
         tool_name,
         tool_call_id,
@@ -199,7 +199,7 @@ def _model_retry_result(
 
 
 def _final_result_validation_message(exception: ValidationError) -> str:
-    """Build field-level final-result feedback without model input values."""
+    """Build field-level final-result validation feedback."""
     issues = []
     for error in exception.errors(include_input=False, include_url=False):
         location = ".".join(str(part) for part in error["loc"])
