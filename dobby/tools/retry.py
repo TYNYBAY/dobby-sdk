@@ -37,8 +37,12 @@ class ToolRetryPolicy:
 
 
 def max_tool_invocations(policy: ToolRetryPolicy) -> int:
-    """Return the maximum number of invocations for this policy."""
-    if policy.max_retries <= 0:
+    """Return the maximum number of invocations for this policy.
+
+    When ``retryable_exceptions`` is empty, retry is impossible, so the
+    effective budget is always one invocation regardless of ``max_retries``.
+    """
+    if policy.max_retries <= 0 or not policy.retryable_exceptions:
         return 1
     return policy.max_retries + 1
 

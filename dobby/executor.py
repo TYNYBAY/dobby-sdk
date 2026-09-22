@@ -12,7 +12,6 @@ import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
 from uuid import uuid4
-import warnings
 
 from pydantic import BaseModel, ValidationError
 
@@ -61,43 +60,10 @@ OUTPUT_TOOL_NAME = "final_result"
 _DEFAULT_MAX_MODEL_CORRECTIONS = 3
 
 
-def _resolve_max_model_corrections(
-    max_model_corrections: int | None,
-    *,
-    max_model_retries: int | None = None,
-    max_consecutive_model_retries: int | None = None,
-    max_final_result_retries: int | None = None,
-    max_consecutive_final_result_retries: int | None = None,
-) -> int:
-    """Map public correction kwargs onto one run-level budget.
-
-    Legacy limits are not restored as separate counters. Any explicitly
-    provided legacy values collapse to ``min(...)`` unless
-    ``max_model_corrections`` is set, in which case that value wins.
-    """
-    legacy = {
-        name: value
-        for name, value in (
-            ("max_model_retries", max_model_retries),
-            ("max_consecutive_model_retries", max_consecutive_model_retries),
-            ("max_final_result_retries", max_final_result_retries),
-            ("max_consecutive_final_result_retries", max_consecutive_final_result_retries),
-        )
-        if value is not None
-    }
-    if legacy:
-        names = ", ".join(legacy)
-        warnings.warn(
-            f"{names} is deprecated; use max_model_corrections. "
-            "Legacy correction limits map to a single run-level "
-            "max_model_corrections budget.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+def _resolve_max_model_corrections(max_model_corrections: int | None) -> int:
+    """Resolve the run-level model-correction budget."""
     if max_model_corrections is not None:
         return max_model_corrections
-    if legacy:
-        return min(legacy.values())
     return _DEFAULT_MAX_MODEL_CORRECTIONS
 
 
@@ -504,27 +470,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
         max_model_corrections: int | None = None,
-        *,
-        max_model_retries: int | None = None,
-        max_consecutive_model_retries: int | None = None,
-        max_final_result_retries: int | None = None,
-        max_consecutive_final_result_retries: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent under a run-scoped correlation context.
 
-        ``max_model_corrections`` is the canonical run-level model-correction
-        budget. The legacy ``max_model_retries``,
-        ``max_consecutive_model_retries``, ``max_final_result_retries``, and
-        ``max_consecutive_final_result_retries`` kwargs are deprecated and map
-        onto that same budget; they do not restore separate counters.
+        ``max_model_corrections`` is the run-level model-correction budget
+        shared by tool-call and final-result corrections.
         """
-        resolved_max_model_corrections = _resolve_max_model_corrections(
-            max_model_corrections,
-            max_model_retries=max_model_retries,
-            max_consecutive_model_retries=max_consecutive_model_retries,
-            max_final_result_retries=max_final_result_retries,
-            max_consecutive_final_result_retries=max_consecutive_final_result_retries,
-        )
+        resolved_max_model_corrections = _resolve_max_model_corrections(max_model_corrections)
+        self.last_output = None
         run_id = uuid4().hex
         token = run_id_var.set(run_id)
         logger.debug(
@@ -647,8 +600,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             tc.id,
                             retry,
                             error_details=_tool_error_details(
-                                exception,
-                                error_code=ErrorCode.FINAL_RESULT_INVALID,
+                                retry,
                                 tool_name=tc.name,
                                 tool_call_id=tc.id,
                             ),
@@ -768,6 +720,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             results.append(exception)
                             break
                         results.append(call_result)
+                        if call_result.retry_model:
+                            break
                 else:
                     results = await asyncio.gather(
                         *[
@@ -817,128 +771,165 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     yield remaining_end
                 raise control_flow
 
-            # Execute streaming tools sequentially
-            for index, tc in enumerate(streaming_calls):
-                result = None
-                is_error = False
-                error_details: ToolErrorDetails | None = None
-                try:
-                    async for event_or_result in self._execute_tool_stream(
-                        tc.name, tc.id, tc.inputs, context, approved
-                    ):
-                        if isinstance(event_or_result, ToolCallResult):
-                            result = event_or_result.result
-                            is_error = event_or_result.is_error
-                            error_details = event_or_result.error_details
-                            if event_or_result.retry_model:
-                                batch_has_model_correction = True
-                                batch_last_correction_error = event_or_result.error_details
-                        elif isinstance(event_or_result, ToolStreamEvent):
-                            yield event_or_result
-                        else:
-                            result = event_or_result
-                except (ApprovalRequired, asyncio.CancelledError) as exception:
-                    call_result = _control_flow_result(tc, exception)
-                    result_event, end_event = self._emit_tool_result(
-                        tc,
-                        call_result.result,
-                        call_result.is_error,
-                        working_messages,
-                    )
-                    yield result_event
-                    yield end_event
-                    unexecuted = streaming_calls[index + 1 :] + terminal_calls
-                    for remaining in unexecuted:
-                        remaining_result = _control_flow_result(remaining, exception)
-                        remaining_event, remaining_end = self._emit_tool_result(
-                            remaining,
-                            remaining_result.result,
-                            remaining_result.is_error,
-                            working_messages,
-                        )
-                        yield remaining_event
-                        yield remaining_end
-                    raise
-
-                result_event, end_event = self._emit_tool_result(
-                    tc,
-                    result,
-                    is_error,
-                    working_messages,
-                    error_details=error_details,
-                )
-                yield result_event
-                yield end_event
-
-            # Terminal tool exits the loop
             terminal_completed = False
-            if terminal_calls and batch_has_model_correction:
-                for tc in terminal_calls:
-                    call_result = _unexecuted_result(tc, reason="model_correction")
-                    result_event, end_event = self._emit_tool_result(
-                        tc,
-                        call_result.result,
-                        call_result.is_error,
+            if batch_has_model_correction:
+                for remaining in parallel_calls[len(results) :] + streaming_calls + terminal_calls:
+                    remaining_result = _unexecuted_result(
+                        remaining,
+                        reason="model_correction",
+                    )
+                    remaining_event, remaining_end = self._emit_tool_result(
+                        remaining,
+                        remaining_result.result,
+                        remaining_result.is_error,
                         working_messages,
                     )
-                    yield result_event
-                    yield end_event
-            elif terminal_calls:
-                tc = terminal_calls[0]
-                result = None
-                is_error = False
-                error_details = None
-                skip_terminal_exit = False
-                try:
-                    async for event_or_result in self._execute_tool_stream(
-                        tc.name, tc.id, tc.inputs, context, approved
-                    ):
-                        if isinstance(event_or_result, ToolCallResult):
-                            result = event_or_result.result
-                            is_error = event_or_result.is_error
-                            error_details = event_or_result.error_details
-                            if event_or_result.retry_model:
-                                batch_has_model_correction = True
-                                batch_last_correction_error = event_or_result.error_details
-                                skip_terminal_exit = True
-                        elif isinstance(event_or_result, ToolStreamEvent):
-                            yield event_or_result
-                        else:
-                            result = event_or_result
-                except (ApprovalRequired, asyncio.CancelledError) as exception:
-                    call_result = _control_flow_result(tc, exception)
-                    result_event, end_event = self._emit_tool_result(
-                        tc,
-                        call_result.result,
-                        call_result.is_error,
-                        working_messages,
-                    )
-                    yield result_event
-                    yield end_event
-                    for remaining in terminal_calls[1:]:
-                        remaining_result = _control_flow_result(remaining, exception)
-                        remaining_event, remaining_end = self._emit_tool_result(
-                            remaining,
-                            remaining_result.result,
-                            remaining_result.is_error,
+                    yield remaining_event
+                    yield remaining_end
+            else:
+                # Execute streaming tools sequentially
+                streaming_correction = False
+                for index, tc in enumerate(streaming_calls):
+                    result = None
+                    is_error = False
+                    error_details: ToolErrorDetails | None = None
+                    try:
+                        async for event_or_result in self._execute_tool_stream(
+                            tc.name, tc.id, tc.inputs, context, approved
+                        ):
+                            if isinstance(event_or_result, ToolCallResult):
+                                result = event_or_result.result
+                                is_error = event_or_result.is_error
+                                error_details = event_or_result.error_details
+                                if event_or_result.retry_model:
+                                    batch_has_model_correction = True
+                                    batch_last_correction_error = event_or_result.error_details
+                                    streaming_correction = True
+                            elif isinstance(event_or_result, ToolStreamEvent):
+                                yield event_or_result
+                            else:
+                                result = event_or_result
+                    except (ApprovalRequired, asyncio.CancelledError) as exception:
+                        call_result = _control_flow_result(tc, exception)
+                        result_event, end_event = self._emit_tool_result(
+                            tc,
+                            call_result.result,
+                            call_result.is_error,
                             working_messages,
                         )
-                        yield remaining_event
-                        yield remaining_end
-                    raise
-                result_event, end_event = self._emit_tool_result(
-                    tc,
-                    result,
-                    is_error,
-                    working_messages,
-                    is_terminal=not skip_terminal_exit,
-                    error_details=error_details,
-                )
-                yield result_event
-                if skip_terminal_exit:
+                        yield result_event
+                        yield end_event
+                        unexecuted = streaming_calls[index + 1 :] + terminal_calls
+                        for remaining in unexecuted:
+                            remaining_result = _control_flow_result(remaining, exception)
+                            remaining_event, remaining_end = self._emit_tool_result(
+                                remaining,
+                                remaining_result.result,
+                                remaining_result.is_error,
+                                working_messages,
+                            )
+                            yield remaining_event
+                            yield remaining_end
+                        raise
+
+                    result_event, end_event = self._emit_tool_result(
+                        tc,
+                        result,
+                        is_error,
+                        working_messages,
+                        error_details=error_details,
+                    )
+                    yield result_event
                     yield end_event
+
+                    if streaming_correction:
+                        for remaining in streaming_calls[index + 1 :] + terminal_calls:
+                            remaining_result = _unexecuted_result(
+                                remaining,
+                                reason="model_correction",
+                            )
+                            remaining_event, remaining_end = self._emit_tool_result(
+                                remaining,
+                                remaining_result.result,
+                                remaining_result.is_error,
+                                working_messages,
+                            )
+                            yield remaining_event
+                            yield remaining_end
+                        break
                 else:
-                    terminal_completed = True
+                    # Terminal tool exits the loop
+                    if terminal_calls:
+                        tc = terminal_calls[0]
+                        result = None
+                        is_error = False
+                        error_details = None
+                        skip_terminal_exit = False
+                        try:
+                            async for event_or_result in self._execute_tool_stream(
+                                tc.name, tc.id, tc.inputs, context, approved
+                            ):
+                                if isinstance(event_or_result, ToolCallResult):
+                                    result = event_or_result.result
+                                    is_error = event_or_result.is_error
+                                    error_details = event_or_result.error_details
+                                    if event_or_result.retry_model:
+                                        batch_has_model_correction = True
+                                        batch_last_correction_error = event_or_result.error_details
+                                        skip_terminal_exit = True
+                                elif isinstance(event_or_result, ToolStreamEvent):
+                                    yield event_or_result
+                                else:
+                                    result = event_or_result
+                        except (ApprovalRequired, asyncio.CancelledError) as exception:
+                            call_result = _control_flow_result(tc, exception)
+                            result_event, end_event = self._emit_tool_result(
+                                tc,
+                                call_result.result,
+                                call_result.is_error,
+                                working_messages,
+                            )
+                            yield result_event
+                            yield end_event
+                            for remaining in terminal_calls[1:]:
+                                remaining_result = _control_flow_result(remaining, exception)
+                                remaining_event, remaining_end = self._emit_tool_result(
+                                    remaining,
+                                    remaining_result.result,
+                                    remaining_result.is_error,
+                                    working_messages,
+                                )
+                                yield remaining_event
+                                yield remaining_end
+                            raise
+                        result_event, end_event = self._emit_tool_result(
+                            tc,
+                            result,
+                            is_error,
+                            working_messages,
+                            is_terminal=not skip_terminal_exit,
+                            error_details=error_details,
+                        )
+                        yield result_event
+                        if skip_terminal_exit:
+                            yield end_event
+                        else:
+                            terminal_completed = True
+
+                        skip_reason = "model_correction" if skip_terminal_exit else "terminal"
+                        for remaining in terminal_calls[1:]:
+                            remaining_result = _unexecuted_result(
+                                remaining,
+                                reason=skip_reason,
+                            )
+                            remaining_event, remaining_end = self._emit_tool_result(
+                                remaining,
+                                remaining_result.result,
+                                remaining_result.is_error,
+                                working_messages,
+                            )
+                            yield remaining_event
+                            yield remaining_end
 
             if batch_has_model_correction:
                 model_corrections += 1

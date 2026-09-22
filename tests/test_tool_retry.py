@@ -9,7 +9,29 @@ import pytest
 from dobby import AgentExecutor
 from dobby.exceptions import ApprovalRequired, ModelRetry, ToolFailure
 from dobby.tools import Tool, ToolRetryPolicy
+from dobby.tools.retry import max_tool_invocations
 from dobby.types import StreamEndEvent, ToolResultEvent, ToolStreamEvent, ToolUsePart, Usage
+
+
+def test_max_tool_invocations_is_one_when_retry_impossible() -> None:
+    assert (
+        max_tool_invocations(
+            ToolRetryPolicy(max_retries=1, retryable_exceptions=()),
+        )
+        == 1
+    )
+    assert (
+        max_tool_invocations(
+            ToolRetryPolicy(max_retries=3, retryable_exceptions=(TimeoutError,)),
+        )
+        == 4
+    )
+    assert (
+        max_tool_invocations(
+            ToolRetryPolicy(max_retries=0, retryable_exceptions=(TimeoutError,)),
+        )
+        == 1
+    )
 
 
 def _make_mock_provider(tool_calls: list[ToolUsePart]) -> AsyncMock:

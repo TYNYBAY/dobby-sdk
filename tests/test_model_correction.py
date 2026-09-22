@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 import warnings
 
+from pydantic import BaseModel
 import pytest
 
 from dobby import AgentExecutor
@@ -566,69 +567,6 @@ def test_resolve_default_is_canonical_budget() -> None:
     assert _resolve_max_model_corrections(4) == 4
 
 
-def test_resolve_maps_legacy_limits_to_min_without_separate_counters() -> None:
-    with pytest.warns(DeprecationWarning, match="max_model_retries"):
-        assert (
-            _resolve_max_model_corrections(
-                None,
-                max_model_retries=5,
-                max_consecutive_model_retries=2,
-                max_final_result_retries=4,
-                max_consecutive_final_result_retries=3,
-            )
-            == 2
-        )
-
-
-def test_resolve_canonical_budget_wins_over_legacy_kwargs() -> None:
-    with pytest.warns(DeprecationWarning, match="max_model_retries"):
-        assert _resolve_max_model_corrections(2, max_model_retries=0) == 2
-
-
-def test_legacy_max_model_retries_maps_to_shared_correction_budget() -> None:
-    provider = ScriptedProvider(
-        [[ToolUsePart(id="call-invalid", name="typed", inputs={"count": "bad"})], []]
-    )
-    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
-
-    with pytest.warns(DeprecationWarning, match="max_model_retries"):
-        events, messages, error = asyncio.run(
-            _collect_until_exception(
-                executor,
-                ModelRetryExhaustedError,
-                max_model_retries=0,
-            )
-        )
-
-    assert len(provider.calls) == 1
-    assert error.attempts == 1
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-invalid"
-    ]
-    assert [part.tool_use_id for part in _tool_results(messages)] == ["call-invalid"]
-
-
-def test_canonical_max_model_corrections_overrides_legacy_retries() -> None:
-    provider = ScriptedProvider(
-        [[ToolUsePart(id="call-first", name="typed", inputs={"count": "bad"})], []]
-    )
-    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
-
-    with pytest.warns(DeprecationWarning, match="max_model_retries"):
-        events = asyncio.run(
-            _collect_events(
-                executor,
-                max_model_corrections=1,
-                max_model_retries=0,
-            )
-        )
-
-    assert len(provider.calls) == 2
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-first"
-    ]
-
-
 def test_canonical_max_model_corrections_does_not_warn() -> None:
     provider = ScriptedProvider(
         [[ToolUsePart(id="call-invalid", name="typed", inputs={"count": "bad"})], []]
@@ -651,3 +589,274 @@ def test_canonical_max_model_corrections_does_not_warn() -> None:
         "call-invalid"
     ]
 
+
+def test_sequential_model_correction_skips_later_sequential_and_streaming() -> None:
+    later_sequential_calls = 0
+    later_streaming_calls = 0
+
+    @dataclass
+    class FirstSequentialTool(Tool):
+        name = "first"
+        description = "Request correction."
+        sequential = True
+
+        async def __call__(self, count: int) -> int:
+            return count
+
+    @dataclass
+    class LaterSequentialTool(Tool):
+        name = "later_sequential"
+        description = "Must not run after correction."
+        sequential = True
+
+        async def __call__(self) -> str:
+            nonlocal later_sequential_calls
+            later_sequential_calls += 1
+            return "later"
+
+    @dataclass
+    class LaterStreamingTool(Tool):
+        name = "later_streaming"
+        description = "Must not stream after correction."
+        stream_output = True
+
+        async def __call__(self):
+            nonlocal later_streaming_calls
+            later_streaming_calls += 1
+            yield "streamed"
+
+    provider = ScriptedProvider(
+        [
+            [
+                ToolUsePart(id="call-first", name="first", inputs={"count": "bad"}),
+                ToolUsePart(id="call-later-seq", name="later_sequential", inputs={}),
+                ToolUsePart(id="call-later-stream", name="later_streaming", inputs={}),
+            ],
+            [],
+        ]
+    )
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[FirstSequentialTool(), LaterSequentialTool(), LaterStreamingTool()],
+    )
+
+    events = asyncio.run(_collect_events(executor, max_model_corrections=1))
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert later_sequential_calls == 0
+    assert later_streaming_calls == 0
+    assert [result.tool_use_id for result in results] == [
+        "call-first",
+        "call-later-seq",
+        "call-later-stream",
+    ]
+    assert results[0].is_error is True
+    assert results[1].result == {"skipped": True, "reason": "model_correction"}
+    assert results[2].result == {"skipped": True, "reason": "model_correction"}
+    assert [part.tool_use_id for part in _tool_results(provider.calls[1])] == [
+        "call-first",
+        "call-later-seq",
+        "call-later-stream",
+    ]
+
+
+def test_streaming_model_correction_skips_later_streaming_and_terminal() -> None:
+    later_streaming_calls = 0
+    terminal_calls = 0
+
+    @dataclass
+    class FirstStreamingTool(Tool):
+        name = "first_streaming"
+        description = "Stream then request correction."
+        stream_output = True
+
+        async def __call__(self, count: int):
+            yield count
+
+    @dataclass
+    class LaterStreamingTool(Tool):
+        name = "later_streaming"
+        description = "Must not run."
+        stream_output = True
+
+        async def __call__(self):
+            nonlocal later_streaming_calls
+            later_streaming_calls += 1
+            yield "later"
+
+    @dataclass
+    class TerminalTool(Tool):
+        name = "terminal"
+        description = "Must not run."
+        terminal = True
+
+        async def __call__(self) -> str:
+            nonlocal terminal_calls
+            terminal_calls += 1
+            return "done"
+
+    provider = ScriptedProvider(
+        [
+            [
+                ToolUsePart(
+                    id="call-first",
+                    name="first_streaming",
+                    inputs={"count": "bad"},
+                ),
+                ToolUsePart(id="call-later", name="later_streaming", inputs={}),
+                ToolUsePart(id="call-terminal", name="terminal", inputs={}),
+            ],
+            [],
+        ]
+    )
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[FirstStreamingTool(), LaterStreamingTool(), TerminalTool()],
+    )
+
+    events = asyncio.run(_collect_events(executor, max_model_corrections=1))
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert later_streaming_calls == 0
+    assert terminal_calls == 0
+    assert [result.tool_use_id for result in results] == [
+        "call-first",
+        "call-later",
+        "call-terminal",
+    ]
+    assert results[1].result == {"skipped": True, "reason": "model_correction"}
+    assert results[2].result == {"skipped": True, "reason": "model_correction"}
+
+
+def test_multiple_terminals_are_all_represented_after_first_completes() -> None:
+    second_calls = 0
+
+    @dataclass
+    class FirstTerminal(Tool):
+        name = "first_terminal"
+        description = "Ends the run."
+        terminal = True
+
+        async def __call__(self) -> str:
+            return "done"
+
+    @dataclass
+    class SecondTerminal(Tool):
+        name = "second_terminal"
+        description = "Must be represented as skipped."
+        terminal = True
+
+        async def __call__(self) -> str:
+            nonlocal second_calls
+            second_calls += 1
+            return "also done"
+
+    provider = ScriptedProvider(
+        [
+            [
+                ToolUsePart(id="call-first", name="first_terminal", inputs={}),
+                ToolUsePart(id="call-second", name="second_terminal", inputs={}),
+            ],
+        ]
+    )
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[FirstTerminal(), SecondTerminal()],
+    )
+
+    events = []
+    messages = []
+    with patch.object(
+        executor, "_emit_tool_result", wraps=executor._emit_tool_result
+    ) as emit_result:
+        events = asyncio.run(_collect_events(executor))
+        messages = emit_result.call_args.args[3] if emit_result.call_args else []
+
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert second_calls == 0
+    assert [result.tool_use_id for result in results] == ["call-first", "call-second"]
+    assert results[0].result == "done"
+    assert results[0].is_terminal is True
+    assert results[1].result == {"skipped": True, "reason": "terminal"}
+    assert results[1].is_error is True
+    assert [part.tool_use_id for part in _tool_results(messages)] == [
+        "call-first",
+        "call-second",
+    ]
+
+
+def test_multiple_terminals_skipped_as_model_correction_when_first_retries() -> None:
+    second_calls = 0
+
+    @dataclass
+    class FirstTerminal(Tool):
+        name = "first_terminal"
+        description = "Request correction then stop exit."
+        terminal = True
+
+        async def __call__(self, count: int) -> int:
+            return count
+
+    @dataclass
+    class SecondTerminal(Tool):
+        name = "second_terminal"
+        description = "Must be skipped for correction."
+        terminal = True
+
+        async def __call__(self) -> str:
+            nonlocal second_calls
+            second_calls += 1
+            return "done"
+
+    provider = ScriptedProvider(
+        [
+            [
+                ToolUsePart(
+                    id="call-first",
+                    name="first_terminal",
+                    inputs={"count": "bad"},
+                ),
+                ToolUsePart(id="call-second", name="second_terminal", inputs={}),
+            ],
+            [],
+        ]
+    )
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[FirstTerminal(), SecondTerminal()],
+    )
+
+    events = asyncio.run(_collect_events(executor, max_model_corrections=1))
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert second_calls == 0
+    assert [result.tool_use_id for result in results] == ["call-first", "call-second"]
+    assert results[0].is_error is True
+    assert results[0].is_terminal is False
+    assert results[1].result == {"skipped": True, "reason": "model_correction"}
+
+
+def test_last_output_is_reset_at_start_of_each_run() -> None:
+    class Output(BaseModel):
+        value: int
+
+    valid = {"value": 1}
+    provider = ScriptedProvider(
+        [
+            [ToolUsePart(id="call-valid", name="final_result", inputs=valid)],
+            [ToolUsePart(id="call-invalid", name="final_result", inputs={})],
+        ]
+    )
+    executor = AgentExecutor(provider="openai", llm=provider, output_type=Output)
+
+    asyncio.run(_collect_events(executor))
+    assert executor.last_output == Output(value=1)
+
+    with pytest.raises(ModelRetryExhaustedError):
+        asyncio.run(_collect_events(executor, max_model_corrections=0))
+
+    assert executor.last_output is None

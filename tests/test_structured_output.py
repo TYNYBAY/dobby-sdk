@@ -254,7 +254,9 @@ def test_zero_final_result_limit_exhausts_after_emission() -> None:
     assert len(provider.calls) == 1
     assert error.attempts == 1
     assert error.last_error is not None
-    assert error.last_error.exception_type == "ValidationError"
+    assert error.last_error.exception_type == "ModelRetry"
+    assert error.last_error.error_code == "final_result_invalid"
+    assert error.last_error.message.startswith("Invalid final result:")
     assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
         "call-invalid"
     ]
@@ -325,65 +327,6 @@ def test_run_wide_final_result_limit_does_not_reset() -> None:
 
     assert len(provider.calls) == 3
     assert error.attempts == 2
-
-
-def test_legacy_final_result_retry_kwargs_map_to_shared_budget() -> None:
-    provider = ScriptedProvider([[_final_call("call-invalid", {})], []])
-    executor = AgentExecutor(
-        provider="openai",
-        llm=provider,
-        output_type=StructuredResult,
-    )
-
-    with pytest.warns(DeprecationWarning, match="max_final_result_retries"):
-        events, messages, error = asyncio.run(
-            _collect_until_exception(
-                executor,
-                ModelRetryExhaustedError,
-                max_final_result_retries=0,
-                max_consecutive_final_result_retries=3,
-            )
-        )
-
-    assert len(provider.calls) == 1
-    assert error.attempts == 1
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-invalid"
-    ]
-    _assert_paired_final_result(messages, "call-invalid")
-
-
-def test_legacy_model_and_final_result_kwargs_share_one_mapped_budget() -> None:
-    provider = ScriptedProvider(
-        [
-            [ToolUsePart(id="call-tool", name="typed", inputs={"count": "bad"})],
-            [_final_call("call-final", {})],
-            [],
-        ]
-    )
-    executor = AgentExecutor(
-        provider="openai",
-        llm=provider,
-        tools=[TypedTool()],
-        output_type=StructuredResult,
-    )
-
-    with pytest.warns(DeprecationWarning, match="max_model_retries"):
-        events, _, error = asyncio.run(
-            _collect_until_exception(
-                executor,
-                ModelRetryExhaustedError,
-                max_model_retries=1,
-                max_final_result_retries=1,
-            )
-        )
-
-    assert len(provider.calls) == 2
-    assert error.attempts == 2
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-tool",
-        "call-final",
-    ]
 
 
 def test_tool_and_final_result_corrections_share_one_budget() -> None:

@@ -98,7 +98,7 @@ def test_unexpected_error_has_correlated_host_metadata(
     assert details.tool_name == "broken"
     assert details.tool_call_id == "call-broken"
     assert details.attempt == 1
-    assert details.max_attempts == 2
+    assert details.max_attempts == 1
 
     error_records = [record for record in caplog.records if record.exc_info]
     assert len(error_records) == 1
