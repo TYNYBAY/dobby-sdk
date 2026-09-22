@@ -125,7 +125,7 @@ def test_tool_failure_is_classified_without_model_correction() -> None:
         _collect_events(
             [ClosedTool()],
             [ToolUsePart(id="call-closed", name="closed", inputs={})],
-            max_model_retries=0,
+            max_model_corrections=0,
         )
     )
     results = [event for event in events if isinstance(event, ToolResultEvent)]
@@ -156,7 +156,7 @@ def test_phase6_exhausted_error_uses_last_exception_and_is_classified() -> None:
             _collect_events(
                 [TimeoutTool()],
                 [ToolUsePart(id="call-timeout", name="timeout", inputs={})],
-                max_model_retries=0,
+                max_model_corrections=0,
             )
         )
     results = [event for event in events if isinstance(event, ToolResultEvent)]

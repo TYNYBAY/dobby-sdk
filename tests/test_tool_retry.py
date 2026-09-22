@@ -363,7 +363,7 @@ def test_retry_attempts_do_not_consume_model_correction_budget() -> None:
     executor = AgentExecutor(provider="openai", llm=provider, tools=[TimeoutTool()])
 
     async def run():
-        return [event async for event in executor.run_stream(messages=[], max_model_retries=0)]
+        return [event async for event in executor.run_stream(messages=[], max_model_corrections=0)]
 
     with patch("dobby.executor.asyncio.sleep", new_callable=AsyncMock):
         events = asyncio.run(run())

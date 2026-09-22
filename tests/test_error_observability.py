@@ -222,7 +222,7 @@ def test_non_invocation_corrections_have_no_attempt_metadata() -> None:
         _run(
             [],
             [ToolUsePart(id="call-missing", name="missing", inputs={})],
-            max_model_retries=1,
+            max_model_corrections=1,
         )
     )
 
@@ -243,7 +243,7 @@ def test_final_result_validation_has_no_invocation_attempts() -> None:
         [ToolUsePart(id="call-final", name="final_result", inputs={"value": "bad"})]
     )
     executor = AgentExecutor(provider="openai", llm=provider, output_type=Output)
-    events = asyncio.run(_collect(executor.run_stream(messages=[], max_final_result_retries=1)))
+    events = asyncio.run(_collect(executor.run_stream(messages=[], max_model_corrections=1)))
 
     details = _results(events)[0].error_details
     assert details is not None

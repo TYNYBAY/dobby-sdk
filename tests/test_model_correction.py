@@ -3,12 +3,13 @@
 import asyncio
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
+import warnings
 
 import pytest
 
 from dobby import AgentExecutor
 from dobby.exceptions import ApprovalRequired, ModelRetry, ModelRetryExhaustedError
-from dobby.executor import _control_flow_result
+from dobby.executor import _control_flow_result, _resolve_max_model_corrections
 from dobby.tools import Tool
 from dobby.types import (
     StreamEndEvent,
@@ -123,8 +124,7 @@ def test_unknown_tool_with_successful_sibling_counts_as_one_correction_batch() -
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_model_retries=1,
-            max_consecutive_model_retries=5,
+            max_model_corrections=1,
         )
     )
     results = [event for event in events if isinstance(event, ToolResultEvent)]
@@ -141,76 +141,6 @@ def test_unknown_tool_with_successful_sibling_counts_as_one_correction_batch() -
         "call-unknown",
         "call-success",
         "call-second-correction",
-    ]
-
-
-def test_consecutive_limit_exhausts_after_results_without_extra_chat() -> None:
-    provider = ScriptedProvider(
-        [
-            [ToolUsePart(id="call-first", name="typed", inputs={"first": 1})],
-            [ToolUsePart(id="call-second", name="typed", inputs={"second": 1})],
-            [],
-        ]
-    )
-    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
-
-    events, messages, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_model_retries=5,
-            max_consecutive_model_retries=1,
-        )
-    )
-    results = [event for event in events if isinstance(event, ToolResultEvent)]
-
-    assert len(provider.calls) == 2
-    assert [result.tool_use_id for result in results] == ["call-first", "call-second"]
-    assert [part.tool_use_id for part in _tool_results(messages)] == [
-        "call-first",
-        "call-second",
-    ]
-    assert error.attempts == 2
-    assert error.last_error is not None
-    assert error.last_error.exception_type == "ModelRetry"
-    assert "second" in error.last_error.message
-    assert results[-1].result.startswith("[tool_input_invalid]")
-
-
-def test_consecutive_limit_resets_after_non_correction_progress() -> None:
-    provider = ScriptedProvider(
-        [
-            [ToolUsePart(id="call-first", name="typed", inputs={"first": 1})],
-            [ToolUsePart(id="call-success", name="typed", inputs={"count": 1})],
-            [ToolUsePart(id="call-third", name="typed", inputs={"third": 1})],
-            [ToolUsePart(id="call-fourth", name="typed", inputs={"fourth": 1})],
-            [],
-        ]
-    )
-    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
-
-    events, messages, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_model_retries=10,
-            max_consecutive_model_retries=1,
-        )
-    )
-
-    assert len(provider.calls) == 4
-    assert error.attempts == 2
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-first",
-        "call-success",
-        "call-third",
-        "call-fourth",
-    ]
-    assert [part.tool_use_id for part in _tool_results(messages)] == [
-        "call-first",
-        "call-success",
-        "call-third",
-        "call-fourth",
     ]
 
 
@@ -244,8 +174,7 @@ def test_run_wide_limit_survives_non_correction_progress(middle_fails: bool) -> 
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_model_retries=1,
-            max_consecutive_model_retries=10,
+            max_model_corrections=1,
         )
     )
 
@@ -277,7 +206,7 @@ def test_execution_errors_do_not_consume_correction_budget() -> None:
     provider = ScriptedProvider([[ToolUsePart(id="call-failing", name="failing", inputs={})], []])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[FailingTool()])
 
-    events = asyncio.run(_collect_events(executor, max_model_retries=0))
+    events = asyncio.run(_collect_events(executor, max_model_corrections=0))
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert len(provider.calls) == 2
@@ -303,7 +232,7 @@ def test_body_model_retry_consumes_correction_budget() -> None:
     executor = AgentExecutor(provider="openai", llm=provider, tools=[RetryTool()])
 
     events, messages, error = asyncio.run(
-        _collect_until_exception(executor, ModelRetryExhaustedError, max_model_retries=0)
+        _collect_until_exception(executor, ModelRetryExhaustedError, max_model_corrections=0)
     )
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
@@ -334,7 +263,7 @@ def test_retry_exhausted_execution_error_does_not_consume_correction_budget() ->
     executor = AgentExecutor(provider="openai", llm=provider, tools=[TimeoutTool()])
 
     with patch("dobby.executor.asyncio.sleep", new_callable=AsyncMock):
-        events = asyncio.run(_collect_events(executor, max_model_retries=0))
+        events = asyncio.run(_collect_events(executor, max_model_corrections=0))
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert calls == 2
@@ -365,8 +294,7 @@ def test_streaming_validation_correction_exhausts_after_result() -> None:
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_model_retries=5,
-            max_consecutive_model_retries=0,
+            max_model_corrections=0,
         )
     )
 
@@ -396,7 +324,7 @@ def test_terminal_validation_correction_exhausts_after_result() -> None:
     executor = AgentExecutor(provider="openai", llm=provider, tools=[TerminalTool()])
 
     events, messages, error = asyncio.run(
-        _collect_until_exception(executor, ModelRetryExhaustedError, max_model_retries=0)
+        _collect_until_exception(executor, ModelRetryExhaustedError, max_model_corrections=0)
     )
 
     assert len(provider.calls) == 1
@@ -454,7 +382,7 @@ def test_successful_terminal_waits_for_mixed_batch_correction_gate(
         tools=[TypedTool(), StreamingTool(), TerminalTool()],
     )
 
-    events = asyncio.run(_collect_events(executor, max_model_retries=1))
+    events = asyncio.run(_collect_events(executor, max_model_corrections=1))
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert len(provider.calls) == 2
@@ -501,7 +429,7 @@ def test_host_control_flow_does_not_become_model_retry_exhaustion(control_flow: 
         side_effect=capture_control_flow_result,
     ):
         events, messages, error = asyncio.run(
-            _collect_until_exception(executor, expected, max_model_retries=0)
+            _collect_until_exception(executor, expected, max_model_corrections=0)
         )
 
     assert isinstance(error, expected)
@@ -529,8 +457,7 @@ def test_parallel_corrections_count_once_per_batch() -> None:
     events = asyncio.run(
         _collect_events(
             executor,
-            max_model_retries=1,
-            max_consecutive_model_retries=1,
+            max_model_corrections=1,
         )
     )
 
@@ -561,7 +488,7 @@ def test_exhaustion_waits_for_complete_multi_result_batch() -> None:
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_model_retries=0,
+            max_model_corrections=0,
         )
     )
 
@@ -593,7 +520,7 @@ def test_exhausted_multi_correction_batch_keeps_last_error_in_batch_order() -> N
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_model_retries=0,
+            max_model_corrections=0,
         )
     )
 
@@ -625,8 +552,7 @@ def test_max_iterations_still_silently_limits_model_calls() -> None:
         _collect_events(
             executor,
             max_iterations=2,
-            max_model_retries=10,
-            max_consecutive_model_retries=10,
+            max_model_corrections=10,
         )
     )
 
@@ -635,3 +561,95 @@ def test_max_iterations_still_silently_limits_model_calls() -> None:
         "call-one",
         "call-two",
     ]
+
+
+def test_resolve_default_is_canonical_budget() -> None:
+    assert _resolve_max_model_corrections(None) == 3
+    assert _resolve_max_model_corrections(4) == 4
+
+
+def test_resolve_maps_legacy_limits_to_min_without_separate_counters() -> None:
+    with pytest.warns(DeprecationWarning, match="max_model_retries"):
+        assert (
+            _resolve_max_model_corrections(
+                None,
+                max_model_retries=5,
+                max_consecutive_model_retries=2,
+                max_final_result_retries=4,
+                max_consecutive_final_result_retries=3,
+            )
+            == 2
+        )
+
+
+def test_resolve_canonical_budget_wins_over_legacy_kwargs() -> None:
+    with pytest.warns(DeprecationWarning, match="max_model_retries"):
+        assert _resolve_max_model_corrections(2, max_model_retries=0) == 2
+
+
+def test_legacy_max_model_retries_maps_to_shared_correction_budget() -> None:
+    provider = ScriptedProvider(
+        [[ToolUsePart(id="call-invalid", name="typed", inputs={"count": "bad"})], []]
+    )
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
+
+    with pytest.warns(DeprecationWarning, match="max_model_retries"):
+        events, messages, error = asyncio.run(
+            _collect_until_exception(
+                executor,
+                ModelRetryExhaustedError,
+                max_model_retries=0,
+            )
+        )
+
+    assert len(provider.calls) == 1
+    assert error.attempts == 1
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-invalid"
+    ]
+    assert [part.tool_use_id for part in _tool_results(messages)] == ["call-invalid"]
+
+
+def test_canonical_max_model_corrections_overrides_legacy_retries() -> None:
+    provider = ScriptedProvider(
+        [[ToolUsePart(id="call-first", name="typed", inputs={"count": "bad"})], []]
+    )
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
+
+    with pytest.warns(DeprecationWarning, match="max_model_retries"):
+        events = asyncio.run(
+            _collect_events(
+                executor,
+                max_model_corrections=1,
+                max_model_retries=0,
+            )
+        )
+
+    assert len(provider.calls) == 2
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-first"
+    ]
+
+
+def test_canonical_max_model_corrections_does_not_warn() -> None:
+    provider = ScriptedProvider(
+        [[ToolUsePart(id="call-invalid", name="typed", inputs={"count": "bad"})], []]
+    )
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[TypedTool()])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        events, _, error = asyncio.run(
+            _collect_until_exception(
+                executor,
+                ModelRetryExhaustedError,
+                max_model_corrections=0,
+            )
+        )
+
+    assert len(provider.calls) == 1
+    assert error.attempts == 1
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-invalid"
+    ]
+

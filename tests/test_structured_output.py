@@ -196,7 +196,7 @@ def test_final_result_feedback_is_safe_and_field_level(mutate, expected, secret)
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_final_result_retries=0,
+            max_model_corrections=0,
         )
     )
     result = next(event for event in events if isinstance(event, ToolResultEvent))
@@ -252,7 +252,7 @@ def test_zero_final_result_limit_exhausts_after_emission() -> None:
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_final_result_retries=0,
+            max_model_corrections=0,
         )
     )
 
@@ -265,31 +265,6 @@ def test_zero_final_result_limit_exhausts_after_emission() -> None:
     ]
     part = _assert_paired_final_result(messages, "call-invalid")
     assert part.parts[0].text.startswith("[final_result_invalid]")
-
-
-def test_consecutive_final_result_limit_zero_exhausts_first_invalid() -> None:
-    provider = ScriptedProvider([[_final_call("call-invalid", {})], []])
-    executor = AgentExecutor(
-        provider="openai",
-        llm=provider,
-        output_type=StructuredResult,
-    )
-
-    events, messages, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_final_result_retries=10,
-            max_consecutive_final_result_retries=0,
-        )
-    )
-
-    assert len(provider.calls) == 1
-    assert error.attempts == 1
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-invalid"
-    ]
-    _assert_paired_final_result(messages, "call-invalid")
 
 
 def test_multiple_field_errors_count_as_one_structured_output_correction() -> None:
@@ -310,8 +285,7 @@ def test_multiple_field_errors_count_as_one_structured_output_correction() -> No
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_final_result_retries=1,
-            max_consecutive_final_result_retries=10,
+            max_model_corrections=1,
         )
     )
 
@@ -328,43 +302,6 @@ def test_multiple_field_errors_count_as_one_structured_output_correction() -> No
     assert "count: Field required" in first.parts[0].text
     assert "details: Field required" in first.parts[0].text
     assert second.parts[0].text.startswith("[final_result_invalid]")
-
-
-def test_consecutive_final_result_limit() -> None:
-    provider = ScriptedProvider(
-        [
-            [_final_call("call-one", {"count": 1, "details": {"score": 2}})],
-            [_final_call("call-two", {"name": "x", "details": {"score": 2}})],
-            [],
-        ]
-    )
-    executor = AgentExecutor(
-        provider="openai",
-        llm=provider,
-        output_type=StructuredResult,
-    )
-
-    events, messages, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_final_result_retries=10,
-            max_consecutive_final_result_retries=1,
-        )
-    )
-
-    assert len(provider.calls) == 2
-    assert error.attempts == 2
-    assert error.last_error is not None
-    assert "count" in error.last_error.message
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-one",
-        "call-two",
-    ]
-    assert [part.tool_use_id for part in _tool_results(messages)] == [
-        "call-one",
-        "call-two",
-    ]
 
 
 def test_run_wide_final_result_limit_does_not_reset() -> None:
@@ -387,8 +324,7 @@ def test_run_wide_final_result_limit_does_not_reset() -> None:
         _collect_until_exception(
             executor,
             ModelRetryExhaustedError,
-            max_final_result_retries=1,
-            max_consecutive_final_result_retries=10,
+            max_model_corrections=1,
         )
     )
 
@@ -396,68 +332,40 @@ def test_run_wide_final_result_limit_does_not_reset() -> None:
     assert error.attempts == 2
 
 
-@pytest.mark.parametrize(
-    "middle_kind",
-    ["success", "tool-correction", "execution-error"],
-)
-def test_non_final_result_iteration_resets_consecutive_counter(middle_kind: str) -> None:
-    @dataclass
-    class FailingTool(Tool):
-        name = "failing"
-        description = "Fail during execution."
-
-        async def __call__(self) -> None:
-            raise ValueError("execution failure")
-
-    if middle_kind == "success":
-        middle = ToolUsePart(id="call-middle", name="typed", inputs={"count": 1})
-    elif middle_kind == "tool-correction":
-        middle = ToolUsePart(id="call-middle", name="typed", inputs={"count": "bad"})
-    else:
-        middle = ToolUsePart(id="call-middle", name="failing", inputs={})
-
-    provider = ScriptedProvider(
-        [
-            [_final_call("call-one", {})],
-            [middle],
-            [_final_call("call-three", {})],
-            [_final_call("call-four", {})],
-            [],
-        ]
-    )
+def test_legacy_final_result_retry_kwargs_map_to_shared_budget() -> None:
+    provider = ScriptedProvider([[_final_call("call-invalid", {})], []])
     executor = AgentExecutor(
         provider="openai",
         llm=provider,
-        tools=[TypedTool(), FailingTool()],
         output_type=StructuredResult,
     )
 
-    _, _, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_final_result_retries=10,
-            max_consecutive_final_result_retries=1,
-            max_model_retries=10,
+    with pytest.warns(DeprecationWarning, match="max_final_result_retries"):
+        events, messages, error = asyncio.run(
+            _collect_until_exception(
+                executor,
+                ModelRetryExhaustedError,
+                max_final_result_retries=0,
+                max_consecutive_final_result_retries=3,
+            )
         )
+
+    assert len(provider.calls) == 1
+    assert error.attempts == 1
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-invalid"
+    ]
+    _assert_paired_final_result(messages, "call-invalid")
+
+
+def test_legacy_model_and_final_result_kwargs_share_one_mapped_budget() -> None:
+    provider = ScriptedProvider(
+        [
+            [ToolUsePart(id="call-tool", name="typed", inputs={"count": "bad"})],
+            [_final_call("call-final", {})],
+            [],
+        ]
     )
-
-    assert len(provider.calls) == 4
-    assert error.attempts == 2
-
-
-@pytest.mark.parametrize(
-    "tool_call",
-    [
-        ToolUsePart(id="call-tool", name="typed", inputs={"count": "bad"}),
-        ToolUsePart(id="call-missing", name="missing", inputs={}),
-    ],
-    ids=["tool-input-invalid", "tool-not-found"],
-)
-def test_tool_correction_does_not_consume_final_result_budget(
-    tool_call: ToolUsePart,
-) -> None:
-    provider = ScriptedProvider([[tool_call], []])
     executor = AgentExecutor(
         provider="openai",
         llm=provider,
@@ -465,44 +373,59 @@ def test_tool_correction_does_not_consume_final_result_budget(
         output_type=StructuredResult,
     )
 
-    events = asyncio.run(
-        _collect_events(
-            executor,
-            max_final_result_retries=0,
-            max_consecutive_final_result_retries=0,
+    with pytest.warns(DeprecationWarning, match="max_model_retries"):
+        events, _, error = asyncio.run(
+            _collect_until_exception(
+                executor,
+                ModelRetryExhaustedError,
+                max_model_retries=1,
+                max_final_result_retries=1,
+            )
         )
-    )
 
     assert len(provider.calls) == 2
-    assert len([event for event in events if isinstance(event, ToolResultEvent)]) == 1
+    assert error.attempts == 2
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-tool",
+        "call-final",
+    ]
 
 
-def test_final_result_correction_does_not_consume_model_budget() -> None:
-    invalid = _valid_result()
-    invalid.pop("name")
-    valid = _valid_result()
+def test_tool_and_final_result_corrections_share_one_budget() -> None:
     provider = ScriptedProvider(
         [
-            [_final_call("call-invalid", invalid)],
-            [_final_call("call-valid", valid)],
+            [ToolUsePart(id="call-tool", name="typed", inputs={"count": "bad"})],
+            [_final_call("call-final", {})],
+            [],
         ]
     )
     executor = AgentExecutor(
         provider="openai",
         llm=provider,
+        tools=[TypedTool()],
         output_type=StructuredResult,
     )
 
-    asyncio.run(
-        _collect_events(
+    events, messages, error = asyncio.run(
+        _collect_until_exception(
             executor,
-            max_model_retries=0,
-            max_consecutive_model_retries=0,
+            ModelRetryExhaustedError,
+            max_model_corrections=1,
         )
     )
 
     assert len(provider.calls) == 2
-    assert executor.last_output == StructuredResult.model_validate(valid)
+    assert error.attempts == 2
+    assert error.last_error is not None
+    assert error.last_error.error_code == "final_result_invalid"
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
+        "call-tool",
+        "call-final",
+    ]
+    assert [part.tool_use_id for part in _tool_results(messages)] == [
+        "call-tool",
+        "call-final",
+    ]
 
 
 def test_invalid_final_result_skips_sibling_tools() -> None:
@@ -536,7 +459,7 @@ def test_invalid_final_result_skips_sibling_tools() -> None:
     events = asyncio.run(
         _collect_events(
             executor,
-            max_final_result_retries=1,
+            max_model_corrections=1,
         )
     )
 
@@ -554,43 +477,6 @@ def test_invalid_final_result_skips_sibling_tools() -> None:
     assert second_turn_results[1].parts[0].text == (
         "{'skipped': True, 'reason': 'final_result_invalid'}"
     )
-
-
-def test_structured_output_turn_resets_phase4_consecutive_budget() -> None:
-    invalid = _valid_result()
-    invalid.pop("name")
-    provider = ScriptedProvider(
-        [
-            [ToolUsePart(id="call-tool-one", name="typed", inputs={"count": "bad"})],
-            [_final_call("call-final-invalid", invalid)],
-            [ToolUsePart(id="call-tool-two", name="typed", inputs={"count": "also-bad"})],
-            [],
-        ]
-    )
-    executor = AgentExecutor(
-        provider="openai",
-        llm=provider,
-        tools=[TypedTool()],
-        output_type=StructuredResult,
-    )
-
-    events = asyncio.run(
-        _collect_events(
-            executor,
-            max_consecutive_model_retries=1,
-            max_model_retries=10,
-            max_final_result_retries=10,
-            max_consecutive_final_result_retries=10,
-        )
-    )
-
-    assert len(provider.calls) == 4
-    assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-tool-one",
-        "call-final-invalid",
-        "call-tool-two",
-    ]
-    _assert_paired_final_result(provider.calls[2], "call-final-invalid")
 
 
 def test_structured_output_respects_silent_max_iterations_cap() -> None:
@@ -611,8 +497,7 @@ def test_structured_output_respects_silent_max_iterations_cap() -> None:
         _collect_events(
             executor,
             max_iterations=2,
-            max_final_result_retries=10,
-            max_consecutive_final_result_retries=10,
+            max_model_corrections=10,
         )
     )
 

@@ -12,6 +12,7 @@ import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
 from uuid import uuid4
+import warnings
 
 from pydantic import BaseModel, ValidationError
 
@@ -57,6 +58,47 @@ from .types import (
 )
 
 OUTPUT_TOOL_NAME = "final_result"
+_DEFAULT_MAX_MODEL_CORRECTIONS = 3
+
+
+def _resolve_max_model_corrections(
+    max_model_corrections: int | None,
+    *,
+    max_model_retries: int | None = None,
+    max_consecutive_model_retries: int | None = None,
+    max_final_result_retries: int | None = None,
+    max_consecutive_final_result_retries: int | None = None,
+) -> int:
+    """Map public correction kwargs onto one run-level budget.
+
+    Legacy limits are not restored as separate counters. Any explicitly
+    provided legacy values collapse to ``min(...)`` unless
+    ``max_model_corrections`` is set, in which case that value wins.
+    """
+    legacy = {
+        name: value
+        for name, value in (
+            ("max_model_retries", max_model_retries),
+            ("max_consecutive_model_retries", max_consecutive_model_retries),
+            ("max_final_result_retries", max_final_result_retries),
+            ("max_consecutive_final_result_retries", max_consecutive_final_result_retries),
+        )
+        if value is not None
+    }
+    if legacy:
+        names = ", ".join(legacy)
+        warnings.warn(
+            f"{names} is deprecated; use max_model_corrections. "
+            "Legacy correction limits map to a single run-level "
+            "max_model_corrections budget.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if max_model_corrections is not None:
+        return max_model_corrections
+    if legacy:
+        return min(legacy.values())
+    return _DEFAULT_MAX_MODEL_CORRECTIONS
 
 
 def _tool_error_details(
@@ -461,12 +503,28 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
-        max_model_retries: int = 3,
-        max_consecutive_model_retries: int = 3,
-        max_final_result_retries: int = 3,
-        max_consecutive_final_result_retries: int = 3,
+        max_model_corrections: int | None = None,
+        *,
+        max_model_retries: int | None = None,
+        max_consecutive_model_retries: int | None = None,
+        max_final_result_retries: int | None = None,
+        max_consecutive_final_result_retries: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Run the agent under a run-scoped correlation context."""
+        """Run the agent under a run-scoped correlation context.
+
+        ``max_model_corrections`` is the canonical run-level model-correction
+        budget. The legacy ``max_model_retries``,
+        ``max_consecutive_model_retries``, ``max_final_result_retries``, and
+        ``max_consecutive_final_result_retries`` kwargs are deprecated and map
+        onto that same budget; they do not restore separate counters.
+        """
+        resolved_max_model_corrections = _resolve_max_model_corrections(
+            max_model_corrections,
+            max_model_retries=max_model_retries,
+            max_consecutive_model_retries=max_consecutive_model_retries,
+            max_final_result_retries=max_final_result_retries,
+            max_consecutive_final_result_retries=max_consecutive_final_result_retries,
+        )
         run_id = uuid4().hex
         token = run_id_var.set(run_id)
         logger.debug(
@@ -482,10 +540,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 reasoning_effort=reasoning_effort,
                 max_tokens=max_tokens,
                 approved_tool_calls=approved_tool_calls,
-                max_model_retries=max_model_retries,
-                max_consecutive_model_retries=max_consecutive_model_retries,
-                max_final_result_retries=max_final_result_retries,
-                max_consecutive_final_result_retries=max_consecutive_final_result_retries,
+                max_model_corrections=resolved_max_model_corrections,
             ):
                 yield event
         except ProviderError as exception:
@@ -513,10 +568,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
         approved_tool_calls: set[str] | None = None,
-        max_model_retries: int = 3,
-        max_consecutive_model_retries: int = 3,
-        max_final_result_retries: int = 3,
-        max_consecutive_final_result_retries: int = 3,
+        max_model_corrections: int = 3,
     ) -> AsyncIterator[StreamEvent]:
         """Run agent with streaming, yielding all events including tool stream events.
 
@@ -537,13 +589,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
                 is raised.
-            max_model_retries: Maximum model-correction turns permitted per run.
-            max_consecutive_model_retries: Maximum consecutive model-correction
-                turns permitted.
-            max_final_result_retries: Maximum structured-output correction turns
-                permitted per run.
-            max_consecutive_final_result_retries: Maximum consecutive
-                structured-output correction turns permitted.
+            max_model_corrections: Maximum model-correction turns permitted per
+                run, shared by tool-call and final-result corrections.
 
         Yields:
             StreamEvent: LLM streaming events
@@ -558,12 +605,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)
         approved = approved_tool_calls or set()
-        consecutive_model_corrections = 0
-        run_model_corrections = 0
+        model_corrections = 0
         last_correction_error: ToolErrorDetails | None = None
-        consecutive_final_result_corrections = 0
-        run_final_result_corrections = 0
-        last_final_result_error: ToolErrorDetails | None = None
 
         for _ in range(max_iterations):
             tool_calls: list[ToolUsePart] = []
@@ -633,21 +676,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         yield result_event
                         yield end_event
 
-                        consecutive_final_result_corrections += 1
-                        run_final_result_corrections += 1
-                        last_final_result_error = call_result.error_details
-                        if (
-                            consecutive_final_result_corrections
-                            > max_consecutive_final_result_retries
-                        ):
+                        model_corrections += 1
+                        last_correction_error = call_result.error_details
+                        if model_corrections > max_model_corrections:
                             raise ModelRetryExhaustedError(
-                                consecutive_final_result_corrections,
-                                last_error=last_final_result_error,
-                            ) from exception
-                        if run_final_result_corrections > max_final_result_retries:
-                            raise ModelRetryExhaustedError(
-                                run_final_result_corrections,
-                                last_error=last_final_result_error,
+                                model_corrections,
+                                last_error=last_correction_error,
                             ) from exception
                         for sibling in tool_calls:
                             if sibling is tc:
@@ -683,10 +717,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         return
 
             if final_result_invalid:
-                consecutive_model_corrections = 0
                 continue
-
-            consecutive_final_result_corrections = 0
 
             # Categorize tool calls
             streaming_calls: list[ToolUsePart] = []
@@ -910,21 +941,13 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     terminal_completed = True
 
             if batch_has_model_correction:
-                consecutive_model_corrections += 1
-                run_model_corrections += 1
+                model_corrections += 1
                 last_correction_error = batch_last_correction_error
-                if consecutive_model_corrections > max_consecutive_model_retries:
+                if model_corrections > max_model_corrections:
                     raise ModelRetryExhaustedError(
-                        consecutive_model_corrections,
+                        model_corrections,
                         last_error=last_correction_error,
                     )
-                if run_model_corrections > max_model_retries:
-                    raise ModelRetryExhaustedError(
-                        run_model_corrections,
-                        last_error=last_correction_error,
-                    )
-            else:
-                consecutive_model_corrections = 0
 
             if terminal_completed:
                 return
