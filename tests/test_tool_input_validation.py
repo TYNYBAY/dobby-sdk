@@ -299,7 +299,9 @@ def test_terminal_tool_inputs_are_validated_before_execution() -> None:
     assert len([event for event in events if isinstance(event, StreamEndEvent)]) == 2
 
 
-def test_model_retry_from_streaming_and_terminal_bodies_requests_correction() -> None:
+def test_streaming_model_retry_skips_terminal_body() -> None:
+    terminal_calls = 0
+
     @dataclass
     class StreamingTool(Tool):
         name = "body_streaming"
@@ -317,6 +319,8 @@ def test_model_retry_from_streaming_and_terminal_bodies_requests_correction() ->
         terminal = True
 
         async def __call__(self, value: int) -> int:
+            nonlocal terminal_calls
+            terminal_calls += 1
             raise ModelRetry("terminal body failure", code=ErrorCode.TOOL_INPUT_INVALID)
 
     results = asyncio.run(
@@ -334,10 +338,10 @@ def test_model_retry_from_streaming_and_terminal_bodies_requests_correction() ->
         "call-terminal-body",
     ]
     assert all(result.is_error for result in results)
-    assert all(str(result.result).startswith("[tool_input_invalid]") for result in results)
     assert "streaming body failure" in str(results[0].result)
-    assert "terminal body failure" in str(results[1].result)
+    assert results[1].result == {"skipped": True, "reason": "model_correction"}
     assert results[1].is_terminal is False
+    assert terminal_calls == 0
 
 
 def test_exception_inside_executed_tool_is_not_input_validation_error() -> None:

@@ -412,6 +412,8 @@ def test_terminal_validation_correction_exhausts_after_result() -> None:
 def test_successful_terminal_waits_for_mixed_batch_correction_gate(
     correction_kind: str,
 ) -> None:
+    terminal_calls = 0
+
     @dataclass
     class StreamingTool(Tool):
         name = "streaming"
@@ -428,6 +430,8 @@ def test_successful_terminal_waits_for_mixed_batch_correction_gate(
         terminal = True
 
         async def __call__(self) -> str:
+            nonlocal terminal_calls
+            terminal_calls += 1
             return "done"
 
     correction_name = "typed" if correction_kind == "regular" else "streaming"
@@ -450,24 +454,20 @@ def test_successful_terminal_waits_for_mixed_batch_correction_gate(
         tools=[TypedTool(), StreamingTool(), TerminalTool()],
     )
 
-    events, messages, error = asyncio.run(
-        _collect_until_exception(
-            executor,
-            ModelRetryExhaustedError,
-            max_model_retries=0,
-        )
-    )
+    events = asyncio.run(_collect_events(executor, max_model_retries=1))
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
-    assert len(provider.calls) == 1
-    assert error.attempts == 1
+    assert len(provider.calls) == 2
+    assert terminal_calls == 0
     assert [result.tool_use_id for result in results] == [
         "call-correction",
         "call-terminal",
     ]
     assert results[0].is_error is True
-    assert results[1].is_terminal is True
-    assert [part.tool_use_id for part in _tool_results(messages)] == [
+    assert results[1].result == {"skipped": True, "reason": "model_correction"}
+    assert results[1].is_error is True
+    assert results[1].is_terminal is False
+    assert [part.tool_use_id for part in _tool_results(provider.calls[1])] == [
         "call-correction",
         "call-terminal",
     ]

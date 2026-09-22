@@ -845,8 +845,12 @@ class TestToolErrorHandling:
         assert results[sibling_index].result == {"status": "done"}
         assert result_parts[sibling_index].is_error is False
 
-    def test_sequential_approval_assembles_earlier_success_before_propagating(self) -> None:
-        """Sequential approval keeps earlier results and does not invoke later tools."""
+    @pytest.mark.parametrize("control_flow", ["approval", "cancellation"])
+    def test_sequential_control_flow_assembles_all_unexecuted_calls(
+        self,
+        control_flow: str,
+    ) -> None:
+        """Sequential control flow emits placeholders without invoking later tools."""
         execution_order = []
 
         @dataclass
@@ -860,15 +864,17 @@ class TestToolErrorHandling:
                 return {"status": "done"}
 
         @dataclass
-        class ApprovalSequentialTool(Tool):
-            name = "approval_sequential_tool"
-            description = "Requires approval after an earlier call"
-            requires_approval = True
+        class ControlFlowSequentialTool(Tool):
+            name = "control_flow_sequential_tool"
+            description = "Stops execution after an earlier call"
+            requires_approval = control_flow == "approval"
             sequential = True
 
             async def __call__(self) -> dict:
                 execution_order.append(self.name)
-                return {"approved": True}
+                if control_flow == "cancellation":
+                    raise asyncio.CancelledError
+                return {"should_not_run": True}
 
         @dataclass
         class LaterSequentialTool(Tool):
@@ -880,32 +886,72 @@ class TestToolErrorHandling:
                 execution_order.append(self.name)
                 return {"late": True}
 
+        @dataclass
+        class LaterStreamingTool(Tool):
+            name = "later_streaming_tool"
+            description = "Must not stream after control flow"
+            stream_output = True
+
+            async def __call__(self):
+                execution_order.append(self.name)
+                yield {"late": True}
+
+        @dataclass
+        class LaterTerminalTool(Tool):
+            name = "later_terminal_tool"
+            description = "Must not run after control flow"
+            terminal = True
+
+            async def __call__(self) -> dict:
+                execution_order.append(self.name)
+                return {"late": True}
+
         async def run():
             tool_calls = [
                 ToolUsePart(id="tc1", name="successful_sequential_tool", inputs={}),
-                ToolUsePart(id="tc2", name="approval_sequential_tool", inputs={}),
+                ToolUsePart(id="tc2", name="control_flow_sequential_tool", inputs={}),
                 ToolUsePart(id="tc3", name="later_sequential_tool", inputs={}),
+                ToolUsePart(id="tc4", name="later_streaming_tool", inputs={}),
+                ToolUsePart(id="tc5", name="later_terminal_tool", inputs={}),
             ]
             executor = AgentExecutor(
                 provider="openai",
                 llm=_make_mock_provider(tool_calls),
                 tools=[
                     SuccessfulSequentialTool(),
-                    ApprovalSequentialTool(),
+                    ControlFlowSequentialTool(),
                     LaterSequentialTool(),
+                    LaterStreamingTool(),
+                    LaterTerminalTool(),
                 ],
             )
-            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
+            expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
+            return await _collect_batch_until_control_flow(executor, expected)
 
         results, messages, exception = asyncio.run(run())
         result_parts = _tool_result_parts(messages)
 
-        assert exception.tool_call_id == "tc2"
-        assert execution_order == ["successful_sequential_tool"]
-        assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
-        assert _tool_use_ids(messages) == ["tc1", "tc2"]
-        assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
+        if control_flow == "approval":
+            assert exception.tool_call_id == "tc2"
+        expected_execution_order = ["successful_sequential_tool"]
+        if control_flow == "cancellation":
+            expected_execution_order.append("control_flow_sequential_tool")
+        assert execution_order == expected_execution_order
+        assert [result.tool_use_id for result in results] == ["tc1", "tc2", "tc3", "tc4", "tc5"]
+        assert _tool_use_ids(messages) == ["tc1", "tc2", "tc3", "tc4", "tc5"]
+        assert [part.tool_use_id for part in result_parts] == [
+            "tc1",
+            "tc2",
+            "tc3",
+            "tc4",
+            "tc5",
+        ]
         assert results[0].is_error is False
         assert results[0].result == {"status": "done"}
         assert result_parts[0].is_error is False
-        _assert_unsuccessful_control_flow(results[1], result_parts[1], approval=True)
+        for result, result_part in zip(results[1:], result_parts[1:], strict=True):
+            _assert_unsuccessful_control_flow(
+                result,
+                result_part,
+                approval=control_flow == "approval",
+            )

@@ -182,6 +182,16 @@ def _control_flow_result(
     return ToolCallResult(tool_call.name, tool_call.id, result, True)
 
 
+def _unexecuted_result(tool_call: ToolUsePart, *, reason: str) -> ToolCallResult:
+    """Build a placeholder for a tool call intentionally skipped by the executor."""
+    return ToolCallResult(
+        tool_call.name,
+        tool_call.id,
+        {"skipped": True, "reason": reason},
+        True,
+    )
+
+
 class AgentExecutor[ContextT, OutputT: BaseModel]:
     """Manages tool registration, execution, and LLM interactions with streaming support.
 
@@ -639,6 +649,21 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 run_final_result_corrections,
                                 last_error=last_final_result_error,
                             ) from exception
+                        for sibling in tool_calls:
+                            if sibling is tc:
+                                continue
+                            sibling_result = _unexecuted_result(
+                                sibling,
+                                reason=ErrorCode.FINAL_RESULT_INVALID.value,
+                            )
+                            sibling_event, sibling_end = self._emit_tool_result(
+                                sibling,
+                                sibling_result.result,
+                                sibling_result.is_error,
+                                working_messages,
+                            )
+                            yield sibling_event
+                            yield sibling_end
                         final_result_invalid = True
                         break
                     else:
@@ -748,7 +773,8 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 yield end_event
 
             if control_flow is not None:
-                for remaining in streaming_calls + terminal_calls:
+                remaining_regular_calls = parallel_calls[len(results) :]
+                for remaining in remaining_regular_calls + streaming_calls + terminal_calls:
                     remaining_result = _control_flow_result(remaining, control_flow)
                     remaining_event, remaining_end = self._emit_tool_result(
                         remaining,
@@ -815,7 +841,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
             # Terminal tool exits the loop
             terminal_completed = False
-            if terminal_calls:
+            if terminal_calls and batch_has_model_correction:
+                for tc in terminal_calls:
+                    call_result = _unexecuted_result(tc, reason="model_correction")
+                    result_event, end_event = self._emit_tool_result(
+                        tc,
+                        call_result.result,
+                        call_result.is_error,
+                        working_messages,
+                    )
+                    yield result_event
+                    yield end_event
+            elif terminal_calls:
                 tc = terminal_calls[0]
                 result = None
                 is_error = False

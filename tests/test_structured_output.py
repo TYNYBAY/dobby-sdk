@@ -522,7 +522,8 @@ def test_invalid_final_result_skips_sibling_tools() -> None:
             [
                 _final_call("call-invalid", {}),
                 ToolUsePart(id="call-sibling", name="sibling", inputs={}),
-            ]
+            ],
+            [],
         ]
     )
     executor = AgentExecutor(
@@ -532,19 +533,27 @@ def test_invalid_final_result_skips_sibling_tools() -> None:
         output_type=StructuredResult,
     )
 
-    events, messages, _ = asyncio.run(
-        _collect_until_exception(
+    events = asyncio.run(
+        _collect_events(
             executor,
-            ModelRetryExhaustedError,
-            max_final_result_retries=0,
+            max_final_result_retries=1,
         )
     )
 
     assert sibling_called is False
+    assert len(provider.calls) == 2
     assert [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)] == [
-        "call-invalid"
+        "call-invalid",
+        "call-sibling",
     ]
-    _assert_paired_final_result(messages, "call-invalid")
+    second_turn_use_ids = _tool_use_ids(provider.calls[1])
+    second_turn_results = _tool_results(provider.calls[1])
+    assert second_turn_use_ids == ["call-invalid", "call-sibling"]
+    assert [part.tool_use_id for part in second_turn_results] == second_turn_use_ids
+    assert second_turn_results[1].is_error is True
+    assert second_turn_results[1].parts[0].text == (
+        "{'skipped': True, 'reason': 'final_result_invalid'}"
+    )
 
 
 def test_structured_output_turn_resets_phase4_consecutive_budget() -> None:
