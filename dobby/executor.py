@@ -475,6 +475,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
         ``max_model_corrections`` is the run-level model-correction budget
         shared by tool-call and final-result corrections.
+
+        Raises:
+            ApprovalRequired: When a tool with requires_approval=True is called
+                and its tool_call_id is not in approved_tool_calls.
+            ModelRetryExhaustedError: When the run-wide model-correction budget
+                is exhausted.
         """
         resolved_max_model_corrections = _resolve_max_model_corrections(max_model_corrections)
         self.last_output = None
@@ -553,7 +559,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
         Raises:
             ApprovalRequired: When a tool with requires_approval=True is called
-                and its tool_call_id is not in approved_tool_calls
+                and its tool_call_id is not in approved_tool_calls.
+            ModelRetryExhaustedError: When the run-wide model-correction budget
+                is exhausted.
         """
         tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)

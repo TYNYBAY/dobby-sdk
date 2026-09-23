@@ -17,7 +17,6 @@ class ErrorCode(StrEnum):
     TOOL_EXECUTION_ERROR = "tool_execution_error"
     FINAL_RESULT_INVALID = "final_result_invalid"
     MODEL_RETRY_EXHAUSTED = "model_retry_exhausted"
-    AGENT_ITERATION_LIMIT = "agent_iteration_limit"
 
 
 _MODEL_RETRY_CODES = frozenset(
@@ -29,12 +28,7 @@ _MODEL_RETRY_CODES = frozenset(
     }
 )
 _TOOL_FAILURE_CODES = frozenset({ErrorCode.TOOL_FAILURE})
-_EXHAUSTION_CODES = frozenset(
-    {
-        ErrorCode.MODEL_RETRY_EXHAUSTED,
-        ErrorCode.AGENT_ITERATION_LIMIT,
-    }
-)
+_EXHAUSTION_CODES = frozenset({ErrorCode.MODEL_RETRY_EXHAUSTED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,17 +133,6 @@ class ModelRetryExhaustedError(AgentExhaustionError):
             code=ErrorCode.MODEL_RETRY_EXHAUSTED,
             attempts=attempts,
             last_error=last_error,
-        )
-
-
-class AgentIterationLimitError(AgentExhaustionError):
-    """Raised when an agent reaches its configured iteration limit."""
-
-    def __init__(self, attempts: int) -> None:
-        super().__init__(
-            f"Agent iteration limit reached after {attempts} iterations",
-            code=ErrorCode.AGENT_ITERATION_LIMIT,
-            attempts=attempts,
         )
 
 

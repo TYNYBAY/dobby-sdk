@@ -68,9 +68,14 @@ async for event in executor.run_stream(
     max_iterations=10,           # Max tool call loops
     reasoning_effort="medium",   # For o1/o3 models
     approved_tool_calls=set(),   # Pre-approved tool call IDs
+    max_model_corrections=3,     # Run-wide model-correction budget
 ):
     ...
 ```
+
+`max_model_corrections` is a single run-wide budget (default `3`) shared by tool-call correction and final-result correction. When it is exhausted, `run_stream()` raises `ModelRetryExhaustedError`.
+
+Tool errors in `ToolResultEvent.result` and conversation history are classified strings of the form `[error_code] message`, not `{"error": ...}`. Host-side `error_details` on the event still holds the exception diagnostics and traceback.
 
 ---
 

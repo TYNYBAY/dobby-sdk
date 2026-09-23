@@ -2,7 +2,6 @@
 
 from .tool import (
     AgentExhaustionError as AgentExhaustionError,
-    AgentIterationLimitError as AgentIterationLimitError,
     ApprovalRequired as ApprovalRequired,
     ErrorCode as ErrorCode,
     ErrorDecision as ErrorDecision,

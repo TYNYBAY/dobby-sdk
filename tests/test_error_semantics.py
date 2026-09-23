@@ -6,7 +6,6 @@ import pytest
 
 from dobby.exceptions import (
     AgentExhaustionError,
-    AgentIterationLimitError,
     ApprovalRequired,
     ErrorCode,
     ErrorDecision,
@@ -38,7 +37,6 @@ def test_error_codes_are_stable_and_unique() -> None:
         "tool_execution_error",
         "final_result_invalid",
         "model_retry_exhausted",
-        "agent_iteration_limit",
     }
     assert len(ErrorCode) == len({code.value for code in ErrorCode})
 
@@ -143,7 +141,6 @@ def test_context_specific_codes_preserve_retry_semantics(
         ErrorCode.TOOL_FAILURE,
         ErrorCode.TOOL_EXECUTION_ERROR,
         ErrorCode.MODEL_RETRY_EXHAUSTED,
-        ErrorCode.AGENT_ITERATION_LIMIT,
     ],
 )
 def test_model_retry_rejects_non_retryable_codes(code: ErrorCode) -> None:
@@ -160,7 +157,6 @@ def test_model_retry_rejects_non_retryable_codes(code: ErrorCode) -> None:
         ErrorCode.TOOL_EXECUTION_ERROR,
         ErrorCode.FINAL_RESULT_INVALID,
         ErrorCode.MODEL_RETRY_EXHAUSTED,
-        ErrorCode.AGENT_ITERATION_LIMIT,
     ],
 )
 def test_tool_failure_rejects_retry_and_host_codes(code: ErrorCode) -> None:
@@ -254,20 +250,3 @@ def test_model_retry_exhaustion_preserves_last_diagnostic() -> None:
         "[model_retry_exhausted] Model retry budget exhausted after 2 attempts"
     )
     assert details.traceback not in format_model_error(decision)
-
-
-def test_agent_iteration_limit_has_stable_host_metadata() -> None:
-    error = AgentIterationLimitError(10)
-    decision = classify_tool_error(error)
-
-    assert isinstance(error, AgentExhaustionError)
-    assert error.code is ErrorCode.AGENT_ITERATION_LIMIT
-    assert error.attempts == 10
-    assert error.last_error is None
-    assert str(error) == "Agent iteration limit reached after 10 iterations"
-    assert decision is not None
-    assert decision.code is ErrorCode.AGENT_ITERATION_LIMIT
-    assert decision.retry_model is False
-    assert format_model_error(decision) == (
-        "[agent_iteration_limit] Agent iteration limit reached after 10 iterations"
-    )
