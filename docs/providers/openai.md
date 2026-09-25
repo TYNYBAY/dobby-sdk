@@ -114,6 +114,8 @@ async for event in await provider.chat(
 | `StreamEndEvent` | Stream finished, includes `parts`, `usage` |
 | `StreamErrorEvent` | Error occurred |
 
+SDK exceptions raised **mid-stream** (while reading chunks) use the same translation as a failed `chat()` call: rate limits, timeouts, connection failures, and 5xx map to `RateLimitError`, `APITimeoutError`, `APIConnectionError`, and `InternalServerError`; every other provider error is raised as `ProviderError` (the type provider adapters alias as `DobbyProviderError`). Those failures are not counted as Dobby tool retries or model corrections. Provider-level Tenacity may still retry the mapped retryable types. That retry is independent of tool retry and `max_model_corrections`.
+
 ---
 
 ## Message Conversion

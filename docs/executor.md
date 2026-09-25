@@ -75,7 +75,11 @@ async for event in executor.run_stream(
 
 `max_model_corrections` is a single run-wide budget (default `3`) shared by tool-call correction and final-result correction. When it is exhausted, `run_stream()` raises `ModelRetryExhaustedError`.
 
-Tool errors in `ToolResultEvent.result` and conversation history are classified strings of the form `[error_code] message`, not `{"error": ...}`. Host-side `error_details` on the event still holds the exception diagnostics and traceback.
+Tool errors in `ToolResultEvent.result` and conversation history are classified strings of the form `[error_code] message`, not `{"error": ...}`. Host-side `error_details` (`ToolErrorDetails`) still holds exception diagnostics, including the **full exception traceback**. Do not send `error_details` (especially `traceback`) to untrusted clients such as browsers.
+
+Approval and cancellation are host control flow, not classified model errors. The executor still emits a `ToolResultEvent` with `is_error=True` and a placeholder result (`{"approval_required": True}` or `{"cancelled": True}`) so history does not look like the tool succeeded, then re-raises `ApprovalRequired` or `asyncio.CancelledError`. Remaining unexecuted calls in that batch get the same placeholder dict. Already-running parallel calls may still complete successfully.
+
+`dobby.exceptions` also exports the classification helpers the executor uses: `classify_tool_error`, `format_model_error`, and `ErrorDecision`. `classify_tool_error(exception)` returns an `ErrorDecision` (`code`, `model_message`, `retry_model`) or `None` for approval, cancellation, and other non-error control flow. `format_model_error(decision)` produces the `[error_code] message` string sent to the model.
 
 ---
 
@@ -207,3 +211,5 @@ async for event in executor.run_stream(
             # Pause and ask user for approval
             pass
 ```
+
+If the tool is not in `approved_tool_calls`, the executor yields a `ToolResultEvent` with `is_error=True` and `result={"approval_required": True}` for that call, then raises `ApprovalRequired`. Remaining unexecuted calls get the same `{"approval_required": True}` placeholder (`is_error=True`). Already-running parallel calls may still complete successfully. Cancellation uses the same `is_error=True` event shape with `result={"cancelled": True}` for the cancelled call and remaining unexecuted calls.

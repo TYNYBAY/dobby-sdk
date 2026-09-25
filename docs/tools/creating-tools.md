@@ -28,10 +28,37 @@ class SearchTool(Tool):
 |-----------|------|---------|-------------|
 | `name` | `str` | Class name | Tool name sent to LLM |
 | `description` | `str` | Required | What the tool does |
-| `max_retries` | `int` | 1 | Retry attempts on failure |
+| `max_retries` | `int` | 1 | Extra attempts after the first invocation. `1` means two invocations; `0` means one. Has no effect unless `retryable_exceptions` is set |
+| `retryable_exceptions` | `tuple[type[BaseException], ...]` | `()` | Exception types that may be retried. Empty disables host-side retry |
 | `requires_approval` | `bool` | False | Needs human approval |
 | `stream_output` | `bool` | False | Yields streaming events |
 | `terminal` | `bool` | False | Exits agent loop when called |
+
+---
+
+## Host-Side Retry
+
+Host-side retry re-invokes the **same** tool call after a transient failure. It is separate from model correction (`max_model_corrections`) and from provider/LLM retry.
+
+Retries run only when `retryable_exceptions` is a non-empty tuple. With the default empty tuple, the tool is invoked once even if `max_retries` is positive.
+
+```python
+@dataclass
+class FetchUrlTool(Tool):
+    name = "fetch_url"
+    description = "Fetch a URL"
+    max_retries = 2  # up to 3 invocations
+    retryable_exceptions = (TimeoutError,)
+
+    async def __call__(self, url: Annotated[str, "URL to fetch"]) -> str:
+        return await fetch(url)
+```
+
+`ModelRetry`, `ToolFailure`, and `ApprovalRequired` are never retried.
+
+Streaming tools retry only when the failure happens **before the first yield**. After the tool has yielded, the exception is re-raised even if its type is listed in `retryable_exceptions`.
+
+> **Side effects.** A retry repeats the tool body, including any writes, charges, or other effects. Only list exceptions for operations that are safe to execute more than once.
 
 ---
 
@@ -177,6 +204,8 @@ async for event in executor.run_stream(
             # Show approval UI
             pass
 ```
+
+Pending approval and cancellation still emit a `ToolResultEvent` with `is_error=True` (placeholder `{"approval_required": True}` or `{"cancelled": True}`) before the executor re-raises. See [AgentExecutor](../executor.md).
 
 ---
 
