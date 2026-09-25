@@ -29,6 +29,7 @@ else:
         """
 
         def __class_getitem__(cls, item):
+            """Wrap ``item`` in ``Annotated`` with the injection marker."""
             return Annotated[item, _InjectedMarker()]
 
 

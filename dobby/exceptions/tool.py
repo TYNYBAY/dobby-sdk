@@ -84,7 +84,7 @@ class ApprovalRequired(Exception):
     tool_args: dict[str, Any]
 
     def __str__(self) -> str:
-        """Describe the pending tool approval."""
+        """Return a human-readable approval-required message."""
         return f"Tool '{self.tool_name}' requires approval (call_id: {self.tool_call_id})"
 
 

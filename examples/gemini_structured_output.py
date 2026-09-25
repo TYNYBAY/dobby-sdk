@@ -72,10 +72,7 @@ async def main() -> None:
             UserMessagePart(
                 parts=[
                     TextPart(
-                        text=(
-                            "Extract this resume into the final_result tool.\n\n"
-                            + RESUME_TEXT
-                        )
+                        text=("Extract this resume into the final_result tool.\n\n" + RESUME_TEXT)
                     )
                 ]
             )

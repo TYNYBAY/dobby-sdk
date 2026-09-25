@@ -77,9 +77,10 @@ async def run_agent(query: str) -> None:
 
     # Initialize Gemini provider
     from dobby.providers.gemini import GeminiProvider
+
     provider = GeminiProvider(
-         # api_key="...", # Uses env var GEMINI_API_KEY
-         model="gemini-2.5-flash",
+        # api_key="...", # Uses env var GEMINI_API_KEY
+        model="gemini-2.5-flash",
     )
 
     search_tool = TavilySearchTool(api_key=tavily_key)

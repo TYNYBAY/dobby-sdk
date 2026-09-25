@@ -39,9 +39,7 @@ class GetWeatherTool(Tool):
     name = "get_weather"
     description = "Get current weather for a city. Returns temperature and conditions."
 
-    async def __call__(
-        self, city: Annotated[str, "City name, e.g. 'London'"]
-    ) -> dict[str, Any]:
+    async def __call__(self, city: Annotated[str, "City name, e.g. 'London'"]) -> dict[str, Any]:
         await asyncio.sleep(1)
         return {"city": city, "temp_c": 18, "condition": "partly cloudy"}
 
@@ -86,9 +84,7 @@ class GetWeatherSequentialTool(Tool):
     description = "Get current weather for a city. Returns temperature and conditions."
     sequential = True
 
-    async def __call__(
-        self, city: Annotated[str, "City name, e.g. 'London'"]
-    ) -> dict[str, Any]:
+    async def __call__(self, city: Annotated[str, "City name, e.g. 'London'"]) -> dict[str, Any]:
         await asyncio.sleep(1)
         return {"city": city, "temp_c": 18, "condition": "partly cloudy"}
 

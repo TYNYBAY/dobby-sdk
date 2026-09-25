@@ -599,7 +599,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             context: Context to inject into tools (e.g., RunToolContext)
             max_iterations: Maximum tool calling iterations
             reasoning_effort: Optional reasoning effort override
-            max_tokens: Optional maximum number of model output tokens.
+            max_tokens: Optional cap on output tokens per LLM call
             approved_tool_calls: Set of tool_call_ids that have been approved
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
