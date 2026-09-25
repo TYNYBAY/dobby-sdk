@@ -91,4 +91,3 @@ class ToolParameter(BaseModel):
             schema["format"] = self.format
 
         return schema
-

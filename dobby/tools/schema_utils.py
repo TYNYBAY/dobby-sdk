@@ -60,6 +60,7 @@ def extract_pydantic_properties(model_class: type[BaseModel]) -> dict[str, ToolP
 
     return properties
 
+
 # TODO: i feel that this method can be optmized, check this
 def json_schema_to_tool_parameter(
     field_name: str, field_schema: dict, defs: dict | None = None

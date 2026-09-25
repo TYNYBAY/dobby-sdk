@@ -100,7 +100,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 output_type.model_json_schema().get("description")
                 or f"Return the final structured result as {output_type.__name__}"
             )
-            output_tool = Tool.from_model(output_type, name=OUTPUT_TOOL_NAME, description=description)
+            output_tool = Tool.from_model(
+                output_type, name=OUTPUT_TOOL_NAME, description=description
+            )
             self._tools[output_tool.name] = output_tool
 
         if tools:
@@ -247,6 +249,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             context: Context to inject into tools (e.g., RunToolContext)
             max_iterations: Maximum tool calling iterations
             reasoning_effort: Optional reasoning effort override
+            max_tokens: Optional cap on output tokens per LLM call
             approved_tool_calls: Set of tool_call_ids that have been approved
                 for tools with requires_approval=True. If a tool requires
                 approval and its call_id is not in this set, ApprovalRequired
@@ -330,9 +333,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
             # Any sequential tool in the batch forces the entire batch to run
             # sequentially to preserve execution-order guarantees
-            force_sequential = any(
-                self._tools[tc.name].sequential for tc in parallel_calls
-            )
+            force_sequential = any(self._tools[tc.name].sequential for tc in parallel_calls)
 
             # Execute non-streaming tools (parallel or sequential)
             results: list[ToolCallResult | BaseException] = []
@@ -346,9 +347,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 else:
                     results = await asyncio.gather(
                         *[
-                            self._execute_tool_call(
-                                tc.name, tc.id, tc.inputs, context, approved
-                            )
+                            self._execute_tool_call(tc.name, tc.id, tc.inputs, context, approved)
                             for tc in parallel_calls
                         ],
                         return_exceptions=True,
@@ -359,11 +358,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     raise call_result
                 if isinstance(call_result, BaseException):
                     call_result = ToolCallResult(
-                        tc.name, tc.id, {"error": str(call_result)}, True,
+                        tc.name,
+                        tc.id,
+                        {"error": str(call_result)},
+                        True,
                     )
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, call_result.result, call_result.is_error, working_messages,
+                    tc,
+                    call_result.result,
+                    call_result.is_error,
+                    working_messages,
                 )
                 yield result_event
                 yield end_event
@@ -386,7 +391,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     is_error = True
 
                 result_event, end_event = self._emit_tool_result(
-                    tc, result, is_error, working_messages,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
                 )
                 yield result_event
                 yield end_event
@@ -409,7 +417,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     result = {"error": str(e)}
                     is_error = True
                 result_event, _ = self._emit_tool_result(
-                    tc, result, is_error, working_messages, is_terminal=True,
+                    tc,
+                    result,
+                    is_error,
+                    working_messages,
+                    is_terminal=True,
                 )
                 yield result_event
                 return

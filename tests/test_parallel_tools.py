@@ -1,8 +1,8 @@
 """Tests for parallel tool execution in AgentExecutor."""
 
 import asyncio
-import time
 from dataclasses import dataclass
+import time
 from typing import Annotated
 from unittest.mock import AsyncMock
 
@@ -14,7 +14,6 @@ from dobby.types import (
     ToolUsePart,
     Usage,
 )
-
 
 # --- Helpers ---
 
@@ -262,9 +261,7 @@ class TestSequentialFallback:
 
         results, elapsed = asyncio.run(run())
         assert len(results) == 3
-        assert elapsed >= 2.5, (
-            f"Took {elapsed:.2f}s, expected >=2.5s for sequential execution"
-        )
+        assert elapsed >= 2.5, f"Took {elapsed:.2f}s, expected >=2.5s for sequential execution"
 
 
 class TestToolErrorHandling:
