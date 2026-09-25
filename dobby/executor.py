@@ -16,6 +16,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ValidationError
 
 from ._context import (
+    _tool_correlation,
     correlation_fields,
     run_id_var,
     tool_attempt_var,
@@ -37,11 +38,12 @@ from .exceptions.tool import UNEXPECTED_TOOL_ERROR_MESSAGE
 from .providers.base import Provider, ProviderError
 from .providers.vertexai.converters import to_vertexai_tool
 from .tools.retry import (
+    ToolRetryPolicy,
     is_retryable_tool_exception,
     max_tool_invocations,
     retry_backoff_seconds,
 )
-from .tools.tool import Tool
+from .tools.tool import Tool, _format_pydantic_validation_issues
 from .types import (
     AssistantMessagePart,
     MessagePart,
@@ -191,11 +193,7 @@ def _model_retry_result(
 
 def _final_result_validation_message(exception: ValidationError) -> str:
     """Build field-level final-result validation feedback."""
-    issues = []
-    for error in exception.errors(include_input=False, include_url=False):
-        location = ".".join(str(part) for part in error["loc"])
-        issues.append(f"{location}: {error['msg']}" if location else error["msg"])
-    return "Invalid final result: " + "; ".join(issues)
+    return "Invalid final result: " + _format_pydantic_validation_issues(exception)
 
 
 def _control_flow_result(
@@ -347,6 +345,26 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return await tool(**kwargs)
         return tool(**kwargs)
 
+    async def _sleep_tool_retry(
+        self,
+        tool: Tool,
+        policy: ToolRetryPolicy,
+        exception: Exception,
+        attempt: int,
+        max_attempts: int,
+    ) -> None:
+        """Log a retryable tool failure and wait before the next attempt."""
+        delay = retry_backoff_seconds(policy, failed_attempt=attempt)
+        fields = correlation_fields()
+        logger.warning(
+            f"Retrying tool layer=tool run_id={run_id_var.get()} "
+            f"tool_name={tool.name} tool_call_id={tool_call_id_var.get()} "
+            f"attempt={attempt}/{max_attempts} in {delay:.1f}s "
+            f"after {type(exception).__name__}: {exception}",
+            extra={**fields, "layer": "tool", "exception_type": type(exception).__name__},
+        )
+        await asyncio.sleep(delay)
+
     async def _invoke_tool(
         self,
         tool: Tool,
@@ -379,16 +397,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             except Exception as exception:
                 if attempt >= max_attempts or not is_retryable_tool_exception(exception, policy):
                     raise
-                delay = retry_backoff_seconds(policy, failed_attempt=attempt)
-                fields = correlation_fields()
-                logger.warning(
-                    f"Retrying tool layer=tool run_id={run_id_var.get()} "
-                    f"tool_name={tool.name} tool_call_id={tool_call_id_var.get()} "
-                    f"attempt={attempt}/{max_attempts} in {delay:.1f}s "
-                    f"after {type(exception).__name__}: {exception}",
-                    extra={**fields, "layer": "tool", "exception_type": type(exception).__name__},
-                )
-                await asyncio.sleep(delay)
+                await self._sleep_tool_retry(tool, policy, exception, attempt, max_attempts)
 
     async def _stream_tool(
         self,
@@ -422,16 +431,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     or not is_retryable_tool_exception(exception, policy)
                 ):
                     raise
-                delay = retry_backoff_seconds(policy, failed_attempt=attempt)
-                fields = correlation_fields()
-                logger.warning(
-                    f"Retrying tool layer=tool run_id={run_id_var.get()} "
-                    f"tool_name={tool.name} tool_call_id={tool_call_id_var.get()} "
-                    f"attempt={attempt}/{max_attempts} in {delay:.1f}s "
-                    f"after {type(exception).__name__}: {exception}",
-                    extra={**fields, "layer": "tool", "exception_type": type(exception).__name__},
-                )
-                await asyncio.sleep(delay)
+                await self._sleep_tool_retry(tool, policy, exception, attempt, max_attempts)
 
     def _emit_tool_result(
         self,
@@ -483,6 +483,25 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 tool_use_id=tool_call.id,
                 tool_name=tool_call.name,
             ),
+        )
+
+    def _emit_call_result(
+        self,
+        tool_call: ToolUsePart,
+        call_result: ToolCallResult,
+        working_messages: list[MessagePart],
+    ) -> tuple[ToolResultEvent, ToolUseEndEvent]:
+        """Build result and end events from an already-assembled tool-call result.
+
+        Always returns both events. The successful-terminal path must not use
+        this helper because it may omit ``ToolUseEndEvent``.
+        """
+        return self._emit_tool_result(
+            tool_call,
+            call_result.result,
+            call_result.is_error,
+            working_messages,
+            error_details=call_result.error_details,
         )
 
     async def run_stream(
@@ -672,12 +691,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                     reason=ErrorCode.FINAL_RESULT_INVALID.value,
                                 )
                             )
-                            sibling_event, sibling_end = self._emit_tool_result(
+                            sibling_event, sibling_end = self._emit_call_result(
                                 sibling,
-                                sibling_result.result,
-                                sibling_result.is_error,
+                                sibling_result,
                                 working_messages,
-                                error_details=sibling_result.error_details,
                             )
                             yield sibling_event
                             yield sibling_end
@@ -786,12 +803,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     batch_has_model_correction = True
                     batch_last_correction_error = call_result.error_details
 
-                result_event, end_event = self._emit_tool_result(
+                result_event, end_event = self._emit_call_result(
                     tc,
-                    call_result.result,
-                    call_result.is_error,
+                    call_result,
                     working_messages,
-                    error_details=call_result.error_details,
                 )
                 yield result_event
                 yield end_event
@@ -800,10 +815,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 remaining_regular_calls = parallel_calls[len(results) :]
                 for remaining in remaining_regular_calls + streaming_calls + terminal_calls:
                     remaining_result = _control_flow_result(remaining, control_flow)
-                    remaining_event, remaining_end = self._emit_tool_result(
+                    remaining_event, remaining_end = self._emit_call_result(
                         remaining,
-                        remaining_result.result,
-                        remaining_result.is_error,
+                        remaining_result,
                         working_messages,
                     )
                     yield remaining_event
@@ -817,10 +831,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         remaining,
                         reason="model_correction",
                     )
-                    remaining_event, remaining_end = self._emit_tool_result(
+                    remaining_event, remaining_end = self._emit_call_result(
                         remaining,
-                        remaining_result.result,
-                        remaining_result.is_error,
+                        remaining_result,
                         working_messages,
                     )
                     yield remaining_event
@@ -850,10 +863,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 result = event_or_result
                     except (ApprovalRequired, asyncio.CancelledError) as exception:
                         call_result = _control_flow_result(tc, exception)
-                        result_event, end_event = self._emit_tool_result(
+                        result_event, end_event = self._emit_call_result(
                             tc,
-                            call_result.result,
-                            call_result.is_error,
+                            call_result,
                             working_messages,
                         )
                         yield result_event
@@ -861,10 +873,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         unexecuted = streaming_calls[index + 1 :] + terminal_calls
                         for remaining in unexecuted:
                             remaining_result = _control_flow_result(remaining, exception)
-                            remaining_event, remaining_end = self._emit_tool_result(
+                            remaining_event, remaining_end = self._emit_call_result(
                                 remaining,
-                                remaining_result.result,
-                                remaining_result.is_error,
+                                remaining_result,
                                 working_messages,
                             )
                             yield remaining_event
@@ -887,10 +898,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 remaining,
                                 reason="model_correction",
                             )
-                            remaining_event, remaining_end = self._emit_tool_result(
+                            remaining_event, remaining_end = self._emit_call_result(
                                 remaining,
-                                remaining_result.result,
-                                remaining_result.is_error,
+                                remaining_result,
                                 working_messages,
                             )
                             yield remaining_event
@@ -922,20 +932,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                     result = event_or_result
                         except (ApprovalRequired, asyncio.CancelledError) as exception:
                             call_result = _control_flow_result(tc, exception)
-                            result_event, end_event = self._emit_tool_result(
+                            result_event, end_event = self._emit_call_result(
                                 tc,
-                                call_result.result,
-                                call_result.is_error,
+                                call_result,
                                 working_messages,
                             )
                             yield result_event
                             yield end_event
                             for remaining in terminal_calls[1:]:
                                 remaining_result = _control_flow_result(remaining, exception)
-                                remaining_event, remaining_end = self._emit_tool_result(
+                                remaining_event, remaining_end = self._emit_call_result(
                                     remaining,
-                                    remaining_result.result,
-                                    remaining_result.is_error,
+                                    remaining_result,
                                     working_messages,
                                 )
                                 yield remaining_event
@@ -961,10 +969,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 remaining,
                                 reason=skip_reason,
                             )
-                            remaining_event, remaining_end = self._emit_tool_result(
+                            remaining_event, remaining_end = self._emit_call_result(
                                 remaining,
-                                remaining_result.result,
-                                remaining_result.is_error,
+                                remaining_result,
                                 working_messages,
                             )
                             yield remaining_event
@@ -991,11 +998,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         approved_tool_calls: set[str],
     ) -> ToolCallResult:
         """Execute a tool call with call-scoped correlation context."""
-        name_token = tool_name_var.set(tool_name)
-        call_token = tool_call_id_var.set(tool_call_id)
-        attempt_token = tool_attempt_var.set(None)
-        max_attempts_token = tool_max_attempts_var.set(None)
-        try:
+        with _tool_correlation(tool_name, tool_call_id):
             return await self._execute_tool_call_impl(
                 tool_name,
                 tool_call_id,
@@ -1003,11 +1006,6 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 context,
                 approved_tool_calls,
             )
-        finally:
-            tool_max_attempts_var.reset(max_attempts_token)
-            tool_attempt_var.reset(attempt_token)
-            tool_call_id_var.reset(call_token)
-            tool_name_var.reset(name_token)
 
     async def _execute_tool_call_impl(
         self,
@@ -1086,35 +1084,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         max_attempts: int | None = None
         try:
             while True:
-                name_token = tool_name_var.set(tool_name)
-                call_token = tool_call_id_var.set(tool_call_id)
-                attempt_token = tool_attempt_var.set(attempt)
-                max_attempts_token = tool_max_attempts_var.set(max_attempts)
-                try:
+                with _tool_correlation(tool_name, tool_call_id, attempt, max_attempts):
                     try:
                         event = await anext(stream)
                     except StopAsyncIteration:
                         return
-                finally:
-                    attempt = tool_attempt_var.get()
-                    max_attempts = tool_max_attempts_var.get()
-                    tool_max_attempts_var.reset(max_attempts_token)
-                    tool_attempt_var.reset(attempt_token)
-                    tool_call_id_var.reset(call_token)
-                    tool_name_var.reset(name_token)
+                    finally:
+                        attempt = tool_attempt_var.get()
+                        max_attempts = tool_max_attempts_var.get()
                 yield event
         finally:
-            name_token = tool_name_var.set(tool_name)
-            call_token = tool_call_id_var.set(tool_call_id)
-            attempt_token = tool_attempt_var.set(attempt)
-            max_attempts_token = tool_max_attempts_var.set(max_attempts)
-            try:
+            with _tool_correlation(tool_name, tool_call_id, attempt, max_attempts):
                 await stream.aclose()
-            finally:
-                tool_max_attempts_var.reset(max_attempts_token)
-                tool_attempt_var.reset(attempt_token)
-                tool_call_id_var.reset(call_token)
-                tool_name_var.reset(name_token)
 
     async def _execute_tool_stream_impl(
         self,

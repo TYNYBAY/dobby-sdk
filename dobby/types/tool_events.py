@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from ..exceptions.error_code import ErrorCode
+
 
 class ToolStreamEvent(BaseModel):
     """Event emitted by streaming tools during execution.
@@ -20,7 +22,7 @@ class ToolErrorDetails(BaseModel):
     exception_module: str
     message: str
     traceback: str
-    error_code: str | None = None
+    error_code: ErrorCode | None = None
     run_id: str | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None

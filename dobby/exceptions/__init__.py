@@ -1,9 +1,9 @@
 """Exceptions for the dobby SDK."""
 
+from .error_code import ErrorCode as ErrorCode
 from .tool import (
     AgentExhaustionError as AgentExhaustionError,
     ApprovalRequired as ApprovalRequired,
-    ErrorCode as ErrorCode,
     ErrorDecision as ErrorDecision,
     ModelRetry as ModelRetry,
     ModelRetryExhaustedError as ModelRetryExhaustedError,

@@ -37,6 +37,15 @@ from .retry import ToolRetryPolicy
 from .schema_utils import process_tool_definition
 
 
+def _format_pydantic_validation_issues(exception: ValidationError) -> str:
+    """Join Pydantic validation errors into a field-level issue string."""
+    issues = []
+    for error in exception.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in error["loc"])
+        issues.append(f"{location}: {error['msg']}" if location else error["msg"])
+    return "; ".join(issues)
+
+
 @dataclass
 class Tool:
     """Base class for all tools. Subclass and implement __call__.
@@ -272,11 +281,7 @@ class Tool:
                 validated_inputs.update(validated.model_extra)
             return validated_inputs
         except ValidationError as exception:
-            issues = []
-            for error in exception.errors(include_input=False, include_url=False):
-                location = ".".join(str(part) for part in error["loc"])
-                issues.append(f"{location}: {error['msg']}" if location else error["msg"])
-            message = "Invalid tool arguments: " + "; ".join(issues)
+            message = "Invalid tool arguments: " + _format_pydantic_validation_issues(exception)
             raise ModelRetry(message, code=ErrorCode.TOOL_INPUT_INVALID) from exception
 
     def to_openai_format(self) -> FunctionToolParam:
