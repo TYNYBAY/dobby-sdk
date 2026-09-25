@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from ..exceptions.error_code import ErrorCode
+
 
 class ToolStreamEvent(BaseModel):
     """Event emitted by streaming tools during execution.
@@ -13,6 +15,21 @@ class ToolStreamEvent(BaseModel):
     data: Any
 
 
+class ToolErrorDetails(BaseModel):
+    """Structured diagnostics for an exception raised during tool execution."""
+
+    exception_type: str
+    exception_module: str
+    message: str
+    traceback: str
+    error_code: ErrorCode | None = None
+    run_id: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    attempt: int | None = None
+    max_attempts: int | None = None
+
+
 class ToolResultEvent(BaseModel):
     """Result from tool execution."""
 
@@ -21,6 +38,7 @@ class ToolResultEvent(BaseModel):
     name: str
     result: Any
     is_error: bool = False
+    error_details: ToolErrorDetails | None = None
     is_terminal: bool = False
     """If True, this tool execution exits the agent loop."""
 

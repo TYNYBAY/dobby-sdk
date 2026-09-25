@@ -5,8 +5,8 @@ It defines the common interface for chat completions with streaming support.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Iterable
-from typing import Any, Literal, overload
+from collections.abc import AsyncIterator, Callable, Iterable
+from typing import Any, Literal, NoReturn, overload
 
 from ..types import MessagePart, StreamEndEvent, StreamEvent
 
@@ -102,6 +102,23 @@ RETRYABLE_ERRORS: tuple[type[ProviderError], ...] = (
     APITimeoutError,
     InternalServerError,
 )
+
+async def _iter_translated[T](
+    stream: AsyncIterator[T],
+    translate: Callable[[Exception], NoReturn],
+) -> AsyncIterator[T]:
+    """Yield items from ``stream``, translating mid-stream SDK exceptions.
+
+    Does not close ``stream``. ``CancelledError`` is not caught.
+    """
+    stream_iter = stream.__aiter__()
+    while True:
+        try:
+            yield await stream_iter.__anext__()
+        except StopAsyncIteration:
+            return
+        except Exception as e:
+            translate(e)
 
 
 class Provider[ClientT](ABC):

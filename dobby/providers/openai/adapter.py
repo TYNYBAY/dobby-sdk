@@ -45,6 +45,7 @@ from ..base import (
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
     ToolCallTruncatedError,
+    _iter_translated,
 )
 from .converters import OpenAIContentPart, content_part_to_openai
 
@@ -492,7 +493,7 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
         accumulated_reasoning: str = ""
         function_calls: list[ToolUseEvent] = []
 
-        async for event in response_stream:
+        async for event in _iter_translated(response_stream, self._translate_error):
             match event.type:
                 case "response.created":
                     response_id = event.response.id

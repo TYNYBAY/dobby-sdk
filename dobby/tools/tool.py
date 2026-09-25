@@ -28,11 +28,22 @@ from typing import Any, ClassVar, get_type_hints
 
 from google.genai import types as genai_types
 from openai.types.responses import FunctionToolParam
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
+from ..exceptions import ErrorCode, ModelRetry
 from .base import ToolParameter
 from .injected import is_injected
+from .retry import ToolRetryPolicy
 from .schema_utils import process_tool_definition
+
+
+def _format_pydantic_validation_issues(exception: ValidationError) -> str:
+    """Join Pydantic validation errors into a field-level issue string."""
+    issues = []
+    for error in exception.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in error["loc"])
+        issues.append(f"{location}: {error['msg']}" if location else error["msg"])
+    return "; ".join(issues)
 
 
 @dataclass
@@ -46,7 +57,10 @@ class Tool:
     Class Attributes (define in subclass as class variables, NOT fields):
         name: Tool name (defaults to class name if not set)
         description: Tool description for the LLM
-        max_retries: Maximum retry attempts on failure (default: 1)
+        max_retries: Extra retry attempts after a retryable invocation
+            failure (default: 1). ``0`` means one invocation only.
+        retryable_exceptions: Exception types that may be retried (default: ()).
+            Empty means no host-side retry.
         requires_approval: Whether tool needs human approval before execution (default: False)
         stream_output: Whether tool yields streaming events (default: False)
         terminal: Whether tool exits the agent loop (default: False)
@@ -69,6 +83,7 @@ class Tool:
     name: ClassVar[str] = ""  # Falls back to class name if None
     description: ClassVar[str]  # Required! No default
     max_retries: ClassVar[int] = 1
+    retryable_exceptions: ClassVar[tuple[type[BaseException], ...]] = ()
     requires_approval: ClassVar[bool] = False
     stream_output: ClassVar[bool] = False
     terminal: ClassVar[bool] = False
@@ -171,6 +186,13 @@ class Tool:
         tool._model = model
         return tool
 
+    def retry_policy(self) -> ToolRetryPolicy:
+        """Return the host-side retry policy for this tool."""
+        return ToolRetryPolicy(
+            max_retries=self.max_retries,
+            retryable_exceptions=self.retryable_exceptions,
+        )
+
     def __call__(self, *args, **kwargs) -> Any:
         """Execute the tool. Override in subclass.
 
@@ -182,6 +204,85 @@ class Tool:
             Tool result to send back to LLM
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement __call__ method")
+
+    def validate_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Validate model-provided inputs against the live tool signature.
+
+        Injected parameters remain runtime-only and are excluded from the
+        model-provided input object.
+
+        Args:
+            inputs: Arguments supplied by the model.
+
+        Returns:
+            Validated and converted keyword arguments for the tool.
+
+        Raises:
+            ModelRetry: If the supplied arguments do not match the tool signature.
+        """
+        try:
+            if self._model is not None:
+                validated_model = self._model.model_validate(inputs, extra="forbid")
+                return {
+                    name: getattr(validated_model, name)
+                    for name in type(validated_model).model_fields
+                }
+
+            signature = inspect.signature(self.__call__)
+            type_hints = get_type_hints(self.__call__, include_extras=True)
+            fields: dict[str, tuple[Any, Any]] = {}
+            injected_names: set[str] = set()
+            accepts_extra = False
+
+            for name, parameter in signature.parameters.items():
+                if name == "self" or parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                    continue
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    accepts_extra = True
+                    continue
+
+                annotation = type_hints.get(name, Any)
+                injected, _ = is_injected(annotation)
+                if injected:
+                    injected_names.add(name)
+                    continue
+
+                default = (
+                    ... if parameter.default is inspect.Parameter.empty else parameter.default
+                )
+                fields[name] = (annotation, default)
+
+            supplied_injected = injected_names.intersection(inputs)
+            if supplied_injected:
+                issues = "; ".join(
+                    f"{name}: Runtime-injected parameters cannot be supplied by the model"
+                    for name in sorted(supplied_injected)
+                )
+                raise ModelRetry(
+                    f"Invalid tool arguments: {issues}",
+                    code=ErrorCode.TOOL_INPUT_INVALID,
+                )
+
+            input_model = create_model(
+                f"{type(self).__name__}Inputs",
+                __config__=ConfigDict(
+                    arbitrary_types_allowed=True,
+                    extra="allow" if accepts_extra else "forbid",
+                ),
+                **fields,
+            )
+            validated = input_model.model_validate(inputs)
+            validated_inputs = {
+                name: getattr(validated, name)
+                for name in fields
+                if name in validated.model_fields_set
+            }
+            if validated.model_extra:
+                validated_inputs.update(validated.model_extra)
+            return validated_inputs
+        except ValidationError as exception:
+            message = "Invalid tool arguments: " + _format_pydantic_validation_issues(exception)
+            raise ModelRetry(message, code=ErrorCode.TOOL_INPUT_INVALID) from exception
 
     def to_openai_format(self) -> FunctionToolParam:
         """Get tool definition in OpenAI format."""

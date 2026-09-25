@@ -3,6 +3,64 @@
 from dataclasses import dataclass
 from typing import Any
 
+from ..types.tool_events import ToolErrorDetails
+from .error_code import ErrorCode
+
+_MODEL_RETRY_CODES = frozenset(
+    {
+        ErrorCode.TOOL_RETRY,
+        ErrorCode.TOOL_NOT_FOUND,
+        ErrorCode.TOOL_INPUT_INVALID,
+        ErrorCode.FINAL_RESULT_INVALID,
+    }
+)
+_TOOL_FAILURE_CODES = frozenset({ErrorCode.TOOL_FAILURE})
+_EXHAUSTION_CODES = frozenset({ErrorCode.MODEL_RETRY_EXHAUSTED})
+UNEXPECTED_TOOL_ERROR_MESSAGE = "The tool failed unexpectedly."
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorDecision:
+    """Model-facing disposition of a classified tool error."""
+
+    code: ErrorCode
+    model_message: str
+
+    @property
+    def retry_model(self) -> bool:
+        """Whether this error permits another model correction attempt."""
+        return self.code in _MODEL_RETRY_CODES
+
+
+class ModelRetry(Exception):
+    """Request model correction using an intentionally model-facing message."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: ErrorCode = ErrorCode.TOOL_RETRY,
+    ) -> None:
+        if code not in _MODEL_RETRY_CODES:
+            raise ValueError(f"{code.value!r} is not a model-retry error code")
+        self.code = code
+        super().__init__(message)
+
+
+class ToolFailure(Exception):
+    """Report a non-retryable tool failure with a model-facing message."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: ErrorCode = ErrorCode.TOOL_FAILURE,
+    ) -> None:
+        if code not in _TOOL_FAILURE_CODES:
+            raise ValueError(f"{code.value!r} is not a tool-failure error code")
+        self.code = code
+        super().__init__(message)
+
 
 @dataclass
 class ApprovalRequired(Exception):
@@ -18,7 +76,7 @@ class ApprovalRequired(Exception):
     Attributes:
         tool_call_id: Unique identifier for this tool call
         tool_name: Name of the tool that requires approval
-        tool_args: Arguments that would be passed to the tool
+        tool_args: Original model-supplied arguments awaiting approval
     """
 
     tool_call_id: str
@@ -28,3 +86,63 @@ class ApprovalRequired(Exception):
     def __str__(self) -> str:
         """Return a human-readable approval-required message."""
         return f"Tool '{self.tool_name}' requires approval (call_id: {self.tool_call_id})"
+
+
+class AgentExhaustionError(Exception):
+    """Base class for host-facing agent exhaustion errors."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: ErrorCode,
+        attempts: int,
+        last_error: ToolErrorDetails | None = None,
+    ) -> None:
+        if code not in _EXHAUSTION_CODES:
+            raise ValueError(f"{code.value!r} is not an exhaustion error code")
+        self.code = code
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(message)
+
+
+class ModelRetryExhaustedError(AgentExhaustionError):
+    """Raised when the model-correction budget is exhausted."""
+
+    def __init__(
+        self,
+        attempts: int,
+        *,
+        last_error: ToolErrorDetails | None = None,
+    ) -> None:
+        super().__init__(
+            f"Model retry budget exhausted after {attempts} attempts",
+            code=ErrorCode.MODEL_RETRY_EXHAUSTED,
+            attempts=attempts,
+            last_error=last_error,
+        )
+
+
+def classify_tool_error(exception: BaseException) -> ErrorDecision | None:
+    """Classify a tool exception for model-facing emission.
+
+    Returns ``None`` for approval, cancellation, and other non-error control flow.
+    """
+    if isinstance(exception, ApprovalRequired) or not isinstance(exception, Exception):
+        return None
+    if isinstance(exception, ModelRetry):
+        return ErrorDecision(code=exception.code, model_message=str(exception))
+    if isinstance(exception, ToolFailure):
+        return ErrorDecision(code=exception.code, model_message=str(exception))
+    if isinstance(exception, AgentExhaustionError):
+        return ErrorDecision(code=exception.code, model_message=str(exception))
+    return ErrorDecision(
+        code=ErrorCode.TOOL_EXECUTION_ERROR,
+        model_message=UNEXPECTED_TOOL_ERROR_MESSAGE,
+    )
+
+
+def format_model_error(decision: ErrorDecision) -> str:
+    """Format a classified error as ``[code] message``."""
+    return f"[{decision.code.value}] {decision.model_message}"

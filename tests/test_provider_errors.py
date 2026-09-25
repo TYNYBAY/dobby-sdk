@@ -1,10 +1,15 @@
 """Tests for unified provider error handling."""
 
 import asyncio
-from unittest.mock import MagicMock
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from tenacity import retry_if_exception_type, stop_after_attempt, wait_none
 
+from dobby._context import run_id_var
+from dobby.providers._retry import create_retry_config as _create_retry_config
 from dobby.providers.base import (
     RETRYABLE_ERRORS,
     APIConnectionError,
@@ -13,6 +18,19 @@ from dobby.providers.base import (
     ProviderError,
     RateLimitError,
 )
+
+
+def _zero_delay_retry_config(**kwargs):
+    """Use production retry callbacks with zero test backoff."""
+    kwargs.update(
+        min_seconds=0,
+        max_seconds=0,
+        stop_after_delay_seconds=None,
+    )
+    return _create_retry_config(
+        **kwargs,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Base error class tests
@@ -445,6 +463,165 @@ class TestRetryWithUnifiedErrors:
             with pytest.raises(RateLimitError):
                 await provider.do_call()
             assert call_count == 2
+
+        asyncio.run(run())
+
+    @staticmethod
+    def _fast_retry_config(**kwargs):
+        """Build a zero-delay equivalent of the production retry config."""
+        return {
+            "reraise": True,
+            "stop": stop_after_attempt(kwargs["max_retries"]),
+            "wait": wait_none(),
+            "retry": retry_if_exception_type(tuple(kwargs["errors"])),
+            "before_sleep": lambda retry_state: None,
+        }
+
+    def test_async_generator_retries_failure_before_first_yield(self) -> None:
+        from dobby.providers._retry import with_retries
+
+        calls = 0
+
+        class FakeProvider:
+            name = "fake"
+            max_retries = 2
+
+            @with_retries
+            async def stream(self):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RateLimitError("retry me", provider="fake")
+                yield "ok"
+
+        async def run() -> list[str]:
+            return [item async for item in FakeProvider().stream()]
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=self._fast_retry_config,
+        ):
+            assert asyncio.run(run()) == ["ok"]
+        assert calls == 2
+
+    def test_async_generator_does_not_retry_after_first_yield(self) -> None:
+        from dobby.providers._retry import with_retries
+
+        calls = 0
+
+        class FakeProvider:
+            name = "fake"
+            max_retries = 2
+
+            @with_retries
+            async def stream(self):
+                nonlocal calls
+                calls += 1
+                yield "first"
+                raise RateLimitError("mid-stream", provider="fake")
+
+        async def run() -> None:
+            stream = FakeProvider().stream()
+            assert await anext(stream) == "first"
+            with pytest.raises(RateLimitError, match="mid-stream"):
+                await anext(stream)
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=self._fast_retry_config,
+        ):
+            asyncio.run(run())
+        assert calls == 1
+
+    def test_provider_retry_log_has_layer_correlation_and_attempt(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from dobby.providers._retry import with_retries
+
+        calls = 0
+
+        class FakeProvider:
+            name = "fake"
+            max_retries = 2
+
+            @with_retries
+            async def do_call(self) -> str:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RateLimitError("retry me", provider="fake")
+                return "ok"
+
+        token = run_id_var.set("run-provider")
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger="dobby"),
+                patch(
+                    "dobby.providers._retry.create_retry_config",
+                    wraps=_zero_delay_retry_config,
+                ),
+            ):
+                assert asyncio.run(FakeProvider().do_call()) == "ok"
+        finally:
+            run_id_var.reset(token)
+
+        record = next(record for record in caplog.records if record.message.startswith("Retrying"))
+        assert record.layer == "provider"
+        assert record.run_id == "run-provider"
+        assert record.provider == "fake"
+        assert record.method == "do_call"
+        assert record.attempt == 1
+        assert record.max_attempts == 2
+
+
+class TestMidStreamErrorTranslation:
+    """Provider stream iteration failures use the unified error abstraction."""
+
+    def test_openai_mid_stream_error_is_translated(self) -> None:
+        helper = TestOpenAIErrorTranslation()
+        provider = helper._make_provider()
+        provider.max_retries = 0
+        native = helper._make_openai_error(__import__("openai").APIConnectionError)
+
+        async def native_stream():
+            yield SimpleNamespace(type="future.event")
+            raise native
+
+        provider._client.responses.create = AsyncMock(return_value=native_stream())
+
+        async def run() -> None:
+            stream = provider._stream_chat_completion([], 0.0, "gpt-4")
+            with pytest.raises(APIConnectionError) as exc_info:
+                async for _ in stream:
+                    pass
+            assert exc_info.value.__cause__ is native
+
+        asyncio.run(run())
+
+    def test_gemini_mid_stream_error_is_translated(self) -> None:
+        helper = TestGeminiErrorTranslation()
+        provider = helper._make_provider()
+        provider.max_retries = 0
+        native = helper._make_gemini_server_error(503)
+
+        async def native_stream():
+            yield SimpleNamespace(
+                prompt_feedback=None,
+                usage_metadata=None,
+                candidates=[],
+            )
+            raise native
+
+        provider._client.aio.models.generate_content_stream = AsyncMock(
+            return_value=native_stream()
+        )
+
+        async def run() -> None:
+            stream = provider._stream_chat_completion([], MagicMock(), "gemini-2.5-flash")
+            with pytest.raises(InternalServerError) as exc_info:
+                async for _ in stream:
+                    pass
+            assert exc_info.value.__cause__ is native
 
         asyncio.run(run())
 
