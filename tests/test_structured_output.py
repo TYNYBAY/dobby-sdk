@@ -417,6 +417,60 @@ def test_invalid_final_result_skips_sibling_tools() -> None:
     )
 
 
+def test_exhausted_invalid_final_result_emits_siblings_in_call_order() -> None:
+    sibling_calls = 0
+
+    @dataclass
+    class SiblingTool(Tool):
+        name = "sibling"
+        description = "Must not execute beside final_result."
+
+        async def __call__(self) -> None:
+            nonlocal sibling_calls
+            sibling_calls += 1
+
+    provider = ScriptedProvider(
+        [
+            [
+                ToolUsePart(id="call-before", name="sibling", inputs={}),
+                _final_call("call-invalid", {}),
+                ToolUsePart(id="call-after", name="sibling", inputs={}),
+            ]
+        ]
+    )
+    executor = AgentExecutor(
+        provider="openai",
+        llm=provider,
+        tools=[SiblingTool()],
+        output_type=StructuredResult,
+    )
+
+    events, messages, error = asyncio.run(
+        _collect_until_exception(
+            executor,
+            ModelRetryExhaustedError,
+            max_model_corrections=0,
+        )
+    )
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    expected_ids = ["call-before", "call-invalid", "call-after"]
+
+    assert error.attempts == 1
+    assert sibling_calls == 0
+    assert [result.tool_use_id for result in results] == expected_ids
+    assert _tool_use_ids(messages) == expected_ids
+    assert [part.tool_use_id for part in _tool_results(messages)] == expected_ids
+    assert results[0].result == {
+        "skipped": True,
+        "reason": "final_result_invalid",
+    }
+    assert str(results[1].result).startswith("[final_result_invalid]")
+    assert results[2].result == {
+        "skipped": True,
+        "reason": "final_result_invalid",
+    }
+
+
 def test_structured_output_respects_silent_max_iterations_cap() -> None:
     provider = ScriptedProvider(
         [

@@ -361,8 +361,8 @@ class TestSequentialFallback:
 class TestToolErrorHandling:
     """Test that errors in parallel tools are handled correctly."""
 
-    def test_regular_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
-        """Host traceback stays on error_details; the model gets the exception text."""
+    def test_regular_tool_error_keeps_host_diagnostics_and_fixed_model_message(self) -> None:
+        """Host traceback stays on error_details; the model gets a fixed message."""
 
         @dataclass
         class FailingTool(Tool):
@@ -413,12 +413,12 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] diagnostic failure"
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
-    def test_streaming_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
-        """Streaming exceptions retain host diagnostics and emit the exception text."""
+    def test_streaming_tool_error_keeps_host_diagnostics_and_fixed_model_message(self) -> None:
+        """Streaming exceptions retain host diagnostics and emit a fixed message."""
 
         @dataclass
         class FailingStreamingTool(Tool):
@@ -462,12 +462,12 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] streaming diagnostic failure"
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
-    def test_terminal_tool_error_keeps_host_diagnostics_and_exception_message(self) -> None:
-        """Terminal exceptions retain host diagnostics and emit the exception text."""
+    def test_terminal_tool_error_keeps_host_diagnostics_and_fixed_model_message(self) -> None:
+        """Terminal exceptions retain host diagnostics and emit a fixed message."""
 
         @dataclass
         class FailingTerminalTool(Tool):
@@ -510,7 +510,7 @@ class TestToolErrorHandling:
         ]
         assert len(tool_result_parts) == 1
         model_text = tool_result_parts[0].parts[0].text
-        assert model_text == "[tool_execution_error] terminal diagnostic failure"
+        assert model_text == "[tool_execution_error] The tool failed unexpectedly."
         assert result.error_details.traceback not in model_text
         assert "Traceback (most recent call last)" not in model_text
 
@@ -616,7 +616,7 @@ class TestToolErrorHandling:
         assert result_parts[0].is_error is False
         assert err_result.is_error is True
         assert result_parts[1].is_error is True
-        assert str(err_result.result) == "[tool_execution_error] intentional failure"
+        assert str(err_result.result) == ("[tool_execution_error] The tool failed unexpectedly.")
 
     def test_retrying_tool_does_not_change_sibling_result_order(self) -> None:
         """A retrying parallel tool does not reorder or re-run its sibling."""
@@ -787,10 +787,10 @@ class TestToolErrorHandling:
         ],
         ids=["cancellation-first", "cancellation-last"],
     )
-    def test_parallel_cancellation_assembles_results_in_call_order(
+    def test_parallel_tool_raised_cancellation_is_classified_in_call_order(
         self, tool_order: tuple[str, str]
     ) -> None:
-        """Cancellation propagates only after every ordered result is assembled."""
+        """A tool-raised CancelledError is an error, not host cancellation."""
         completed = False
 
         @dataclass
@@ -822,31 +822,30 @@ class TestToolErrorHandling:
                 llm=_make_mock_provider(tool_calls),
                 tools=[CancellingTool(), CompletingTool()],
             )
-            return await _collect_batch_until_control_flow(executor, asyncio.CancelledError)
+            return await _collect_results_and_emitted_messages(executor)
 
-        results, messages, exception = asyncio.run(run())
+        results, messages = asyncio.run(run())
         result_parts = _tool_result_parts(messages)
         cancel_index = tool_order.index("cancelling_tool")
 
-        assert isinstance(exception, asyncio.CancelledError)
         assert completed is True
         assert [result.tool_use_id for result in results] == ["tc1", "tc2"]
         assert _tool_use_ids(messages) == ["tc1", "tc2"]
         assert [part.tool_use_id for part in result_parts] == ["tc1", "tc2"]
-        _assert_unsuccessful_control_flow(
-            results[cancel_index], result_parts[cancel_index], approval=False
+        assert results[cancel_index].result == (
+            "[tool_execution_error] The tool failed unexpectedly."
         )
+        assert results[cancel_index].is_error is True
+        assert results[cancel_index].error_details is not None
+        assert results[cancel_index].error_details.exception_type == "CancelledError"
+        assert result_parts[cancel_index].is_error is True
         sibling_index = 1 - cancel_index
         assert results[sibling_index].is_error is False
         assert results[sibling_index].result == {"status": "done"}
         assert result_parts[sibling_index].is_error is False
 
-    @pytest.mark.parametrize("control_flow", ["approval", "cancellation"])
-    def test_sequential_control_flow_assembles_all_unexecuted_calls(
-        self,
-        control_flow: str,
-    ) -> None:
-        """Sequential control flow emits placeholders without invoking later tools."""
+    def test_sequential_approval_assembles_all_unexecuted_calls(self) -> None:
+        """Sequential approval emits placeholders without invoking later tools."""
         execution_order = []
 
         @dataclass
@@ -863,13 +862,11 @@ class TestToolErrorHandling:
         class ControlFlowSequentialTool(Tool):
             name = "control_flow_sequential_tool"
             description = "Stops execution after an earlier call"
-            requires_approval = control_flow == "approval"
+            requires_approval = True
             sequential = True
 
             async def __call__(self) -> dict:
                 execution_order.append(self.name)
-                if control_flow == "cancellation":
-                    raise asyncio.CancelledError
                 return {"should_not_run": True}
 
         @dataclass
@@ -921,17 +918,13 @@ class TestToolErrorHandling:
                     LaterTerminalTool(),
                 ],
             )
-            expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
-            return await _collect_batch_until_control_flow(executor, expected)
+            return await _collect_batch_until_control_flow(executor, ApprovalRequired)
 
         results, messages, exception = asyncio.run(run())
         result_parts = _tool_result_parts(messages)
 
-        if control_flow == "approval":
-            assert exception.tool_call_id == "tc2"
+        assert exception.tool_call_id == "tc2"
         expected_execution_order = ["successful_sequential_tool"]
-        if control_flow == "cancellation":
-            expected_execution_order.append("control_flow_sequential_tool")
         assert execution_order == expected_execution_order
         assert [result.tool_use_id for result in results] == ["tc1", "tc2", "tc3", "tc4", "tc5"]
         assert _tool_use_ids(messages) == ["tc1", "tc2", "tc3", "tc4", "tc5"]
@@ -949,5 +942,5 @@ class TestToolErrorHandling:
             _assert_unsuccessful_control_flow(
                 result,
                 result_part,
-                approval=control_flow == "approval",
+                approval=True,
             )

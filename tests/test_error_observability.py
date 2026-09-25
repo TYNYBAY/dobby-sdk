@@ -10,6 +10,13 @@ import pytest
 from tenacity import retry_if_exception_type, stop_after_attempt, wait_none
 
 from dobby import AgentExecutor
+from dobby._context import (
+    run_id_var,
+    tool_attempt_var,
+    tool_call_id_var,
+    tool_max_attempts_var,
+    tool_name_var,
+)
 from dobby.exceptions import ModelRetry, ToolFailure
 from dobby.providers import ProviderError, RateLimitError
 from dobby.providers._retry import with_retries
@@ -18,6 +25,7 @@ from dobby.types import (
     StreamEndEvent,
     ToolResultEvent,
     ToolResultPart,
+    ToolStreamEvent,
     ToolUsePart,
     Usage,
     UserMessagePart,
@@ -106,7 +114,7 @@ def test_unexpected_error_has_correlated_host_metadata(
     assert error_records[0].tool_call_id == "call-broken"
 
     history_text = _history_results(provider)[0].parts[0].text
-    assert history_text == "[tool_execution_error] secret diagnostic"
+    assert history_text == "[tool_execution_error] The tool failed unexpectedly."
     assert details.run_id not in history_text
     assert "attempt" not in history_text
     assert "Traceback" not in history_text
@@ -148,6 +156,40 @@ def test_parallel_same_name_calls_share_run_id_and_keep_attempts_independent(
     assert all(record.max_attempts == 2 for record in retry_records)
     assert [result.result for result in _results(events)] == ["left", "right"]
     assert provider.calls == 2
+
+
+def test_run_stream_can_be_closed_from_a_different_task_after_break() -> None:
+    @dataclass
+    class StreamingTool(Tool):
+        name = "streaming"
+        description = "Yield one progress event."
+        stream_output = True
+
+        async def __call__(self):
+            yield ToolStreamEvent(type="progress", data="started")
+            yield "done"
+
+    provider = _RecordingProvider([ToolUsePart(id="call-streaming", name="streaming", inputs={})])
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[StreamingTool()])
+
+    async def run() -> None:
+        stream = executor.run_stream(messages=[])
+
+        async def consume_until_tool_event() -> None:
+            async for event in stream:
+                if isinstance(event, ToolStreamEvent):
+                    break
+
+        await asyncio.create_task(consume_until_tool_event())
+        await asyncio.create_task(stream.aclose())
+
+        assert run_id_var.get() is None
+        assert tool_name_var.get() is None
+        assert tool_call_id_var.get() is None
+        assert tool_attempt_var.get() is None
+        assert tool_max_attempts_var.get() is None
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

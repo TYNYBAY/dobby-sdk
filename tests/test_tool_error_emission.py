@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from dobby import AgentExecutor
-from dobby.exceptions import ApprovalRequired, ToolFailure
+from dobby.exceptions import ApprovalRequired, ModelRetryExhaustedError, ToolFailure
 from dobby.tools import Tool
 from dobby.types import (
     StreamEndEvent,
@@ -103,7 +103,7 @@ def test_unexpected_error_is_classified_and_keeps_host_diagnostics() -> None:
 
     assert len(results) == 1
     assert results[0].is_error is True
-    assert results[0].result == "[tool_execution_error] secret diagnostic"
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.message == "secret diagnostic"
     assert "secret diagnostic" in results[0].error_details.traceback
@@ -134,6 +134,30 @@ def test_tool_failure_is_classified_without_model_correction() -> None:
     assert results[0].error_details.exception_type == "ToolFailure"
 
 
+def test_tool_raised_agent_exhaustion_is_classified() -> None:
+    @dataclass
+    class ExhaustedTool(Tool):
+        name = "exhausted"
+        description = "Raise a host exhaustion error."
+
+        async def __call__(self) -> None:
+            raise ModelRetryExhaustedError(2)
+
+    events, _ = asyncio.run(
+        _collect_events(
+            [ExhaustedTool()],
+            [ToolUsePart(id="call-exhausted", name="exhausted", inputs={})],
+        )
+    )
+    result = next(event for event in events if isinstance(event, ToolResultEvent))
+
+    assert result.result == (
+        "[model_retry_exhausted] Model retry budget exhausted after 2 attempts"
+    )
+    assert result.error_details is not None
+    assert result.error_details.exception_type == "ModelRetryExhaustedError"
+
+
 def test_phase6_exhausted_error_uses_last_exception_and_is_classified() -> None:
     calls = 0
 
@@ -159,7 +183,7 @@ def test_phase6_exhausted_error_uses_last_exception_and_is_classified() -> None:
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert calls == 2
-    assert results[0].result == "[tool_execution_error] timeout 2"
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.message == "timeout 2"
 
@@ -196,7 +220,7 @@ def test_parallel_sibling_keeps_success_and_classified_error_order() -> None:
     assert results[0].is_error is False
     assert results[0].result == "ok"
     assert results[1].is_error is True
-    assert results[1].result == "[tool_execution_error] boom"
+    assert results[1].result == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_streaming_after_yield_failure_is_classified_without_retry() -> None:
@@ -228,9 +252,33 @@ def test_streaming_after_yield_failure_is_classified_without_retry() -> None:
     assert calls == 1
     assert sleep.await_count == 0
     assert [event.data for event in stream_events] == ["started"]
-    assert results[0].result == "[tool_execution_error] after yield"
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.message == "after yield"
+
+
+def test_streaming_tool_raised_cancelled_error_is_classified() -> None:
+    @dataclass
+    class StreamingTool(Tool):
+        name = "streaming"
+        description = "Raise CancelledError from the tool body."
+        stream_output = True
+
+        async def __call__(self):
+            yield ToolStreamEvent(type="progress", data="started")
+            raise asyncio.CancelledError
+
+    events, _ = asyncio.run(
+        _collect_events(
+            [StreamingTool()],
+            [ToolUsePart(id="call-streaming", name="streaming", inputs={})],
+        )
+    )
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
+    assert results[0].error_details is not None
+    assert results[0].error_details.exception_type == "CancelledError"
 
 
 def test_terminal_unexpected_error_is_classified_and_still_terminal() -> None:
@@ -252,7 +300,7 @@ def test_terminal_unexpected_error_is_classified_and_still_terminal() -> None:
     results = [event for event in events if isinstance(event, ToolResultEvent)]
 
     assert len(results) == 1
-    assert results[0].result == "[tool_execution_error] terminal boom"
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].is_terminal is True
     assert results[0].error_details is not None
     assert results[0].error_details.message == "terminal boom"
@@ -299,30 +347,17 @@ def test_streaming_then_later_terminal_assemble_control_flow() -> None:
     assert all(result.error_details is None for result in results)
 
 
-@pytest.mark.parametrize(
-    ("later_kind", "control_flow"),
-    [
-        ("streaming", "approval"),
-        ("streaming", "cancellation"),
-        ("terminal", "approval"),
-        ("terminal", "cancellation"),
-    ],
-)
-def test_regular_control_flow_assembles_later_unexecuted_tools(
-    later_kind: str,
-    control_flow: str,
-) -> None:
+@pytest.mark.parametrize("later_kind", ["streaming", "terminal"])
+def test_regular_approval_assembles_later_unexecuted_tools(later_kind: str) -> None:
     later_ran = False
 
     @dataclass
     class RegularTool(Tool):
         name = "regular"
         description = "Host control flow."
-        requires_approval = control_flow == "approval"
+        requires_approval = True
 
         async def __call__(self) -> str:
-            if control_flow == "cancellation":
-                raise asyncio.CancelledError
             return "should not run"
 
     @dataclass
@@ -348,7 +383,6 @@ def test_regular_control_flow_assembles_later_unexecuted_tools(
             return "should not run"
 
     later_tool = StreamingLaterTool() if later_kind == "streaming" else TerminalLaterTool()
-    expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
     events, messages, error = asyncio.run(
         _collect_until_exception(
             [RegularTool(), later_tool],
@@ -356,16 +390,13 @@ def test_regular_control_flow_assembles_later_unexecuted_tools(
                 ToolUsePart(id="call-regular", name="regular", inputs={}),
                 ToolUsePart(id=f"call-{later_kind}", name=later_kind, inputs={}),
             ],
-            expected,
+            ApprovalRequired,
         )
     )
     results = [event for event in events if isinstance(event, ToolResultEvent)]
     parts = _tool_result_parts(messages)
-    expected_result = (
-        {"approval_required": True} if control_flow == "approval" else {"cancelled": True}
-    )
 
-    assert isinstance(error, expected)
+    assert isinstance(error, ApprovalRequired)
     assert later_ran is False
     assert [result.tool_use_id for result in results] == [
         "call-regular",
@@ -375,44 +406,40 @@ def test_regular_control_flow_assembles_later_unexecuted_tools(
         "call-regular",
         f"call-{later_kind}",
     ]
-    assert [result.result for result in results] == [expected_result, expected_result]
+    assert [result.result for result in results] == [
+        {"approval_required": True},
+        {"approval_required": True},
+    ]
     assert all(result.is_error is True for result in results)
     assert all(result.error_details is None for result in results)
     assert all("[tool_execution_error]" not in part.parts[0].text for part in parts)
     assert all("[tool_retry]" not in part.parts[0].text for part in parts)
 
 
-@pytest.mark.parametrize("control_flow", ["approval", "cancellation"])
-def test_streaming_control_flow_is_unclassified(control_flow: str) -> None:
+def test_streaming_approval_is_unclassified() -> None:
     @dataclass
     class StreamingTool(Tool):
         name = "streaming"
         description = "Host control flow."
-        requires_approval = control_flow == "approval"
+        requires_approval = True
         stream_output = True
 
         async def __call__(self):
-            if control_flow == "cancellation":
-                raise asyncio.CancelledError
             yield ToolStreamEvent(type="progress", data="started")
 
-    expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
     events, messages, error = asyncio.run(
         _collect_until_exception(
             [StreamingTool()],
             [ToolUsePart(id="call-streaming", name="streaming", inputs={})],
-            expected,
+            ApprovalRequired,
         )
     )
     results = [event for event in events if isinstance(event, ToolResultEvent)]
     parts = _tool_result_parts(messages)
-    expected_result = (
-        {"approval_required": True} if control_flow == "approval" else {"cancelled": True}
-    )
 
-    assert isinstance(error, expected)
+    assert isinstance(error, ApprovalRequired)
     assert len(results) == 1
-    assert results[0].result == expected_result
+    assert results[0].result == {"approval_required": True}
     assert results[0].error_details is None
     assert "[tool_execution_error]" not in parts[0].parts[0].text
     assert "[tool_retry]" not in parts[0].parts[0].text

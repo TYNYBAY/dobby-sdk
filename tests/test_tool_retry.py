@@ -96,7 +96,7 @@ def test_default_policy_does_not_retry_value_error() -> None:
     assert calls == 1
     assert len(results) == 1
     assert results[0].is_error is True
-    assert str(results[0].result) == "[tool_execution_error] not retryable by default"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
     assert FailingTool().retry_policy() == ToolRetryPolicy(
         max_retries=1,
         retryable_exceptions=(),
@@ -162,7 +162,7 @@ def test_retry_exhaustion_uses_last_error() -> None:
     assert calls == 2
     assert len(results) == 1
     assert results[0].is_error is True
-    assert str(results[0].result) == "[tool_execution_error] last timeout"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.exception_type == "TimeoutError"
     assert results[0].error_details.message == "last timeout"
@@ -194,7 +194,7 @@ def test_max_retries_zero_gives_exactly_one_call() -> None:
     assert calls == 1
     assert sleep.await_count == 0
     assert results[0].is_error is True
-    assert str(results[0].result) == "[tool_execution_error] still fail"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_non_listed_exception_does_not_retry() -> None:
@@ -221,7 +221,7 @@ def test_non_listed_exception_does_not_retry() -> None:
 
     assert calls == 1
     assert sleep.await_count == 0
-    assert str(results[0].result) == "[tool_execution_error] not listed"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_model_retry_from_tool_body_does_not_retry() -> None:
@@ -307,7 +307,7 @@ def test_approval_required_is_raised_and_not_retried() -> None:
     assert exc_info.value.tool_call_id == "call-approval"
 
 
-def test_cancelled_error_propagates_and_is_not_retried() -> None:
+def test_tool_raised_cancelled_error_is_classified_and_not_retried() -> None:
     calls = 0
 
     @dataclass
@@ -321,18 +321,47 @@ def test_cancelled_error_propagates_and_is_not_retried() -> None:
             calls += 1
             raise asyncio.CancelledError
 
-    async def run() -> None:
-        await _collect_results(
+    async def run():
+        return await _collect_results(
             [CancelTool()],
             [ToolUsePart(id="call-cancel", name="cancel", inputs={})],
         )
 
     with patch("dobby.executor.asyncio.sleep", new_callable=AsyncMock) as sleep:
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(run())
+        results, _, _ = asyncio.run(run())
 
     assert calls == 1
     assert sleep.await_count == 0
+    assert results[0].result == "[tool_execution_error] The tool failed unexpectedly."
+    assert results[0].error_details is not None
+    assert results[0].error_details.exception_type == "CancelledError"
+
+
+def test_host_task_cancellation_still_propagates() -> None:
+    started = asyncio.Event()
+
+    @dataclass
+    class BlockingTool(Tool):
+        name = "blocking"
+        description = "Wait until the host cancels the task."
+
+        async def __call__(self) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            _collect_results(
+                [BlockingTool()],
+                [ToolUsePart(id="call-blocking", name="blocking", inputs={})],
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
 
 
 def test_invalid_inputs_are_validated_once_and_never_invoked() -> None:
@@ -391,7 +420,7 @@ def test_retry_attempts_do_not_consume_model_correction_budget() -> None:
     assert provider.chat_calls() == 2
     assert len(results) == 1
     assert results[0].is_error is True
-    assert str(results[0].result) == "[tool_execution_error] timeout 2"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_backoff_sleep_occurs_only_between_retry_attempts() -> None:
@@ -488,7 +517,7 @@ def test_streaming_yield_then_failure_does_not_retry() -> None:
     assert sleep.await_count == 0
     assert [event.data for event in stream_events] == ["started"]
     assert results[0].is_error is True
-    assert str(results[0].result) == "[tool_execution_error] after yield"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.exception_type == "TimeoutError"
     assert results[0].error_details.message == "after yield"

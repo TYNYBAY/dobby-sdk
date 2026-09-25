@@ -33,6 +33,7 @@ from .exceptions import (
     classify_tool_error,
     format_model_error,
 )
+from .exceptions.tool import UNEXPECTED_TOOL_ERROR_MESSAGE
 from .providers.base import Provider, ProviderError
 from .providers.vertexai.converters import to_vertexai_tool
 from .tools.retry import (
@@ -68,7 +69,7 @@ def _resolve_max_model_corrections(max_model_corrections: int | None) -> int:
 
 
 def _tool_error_details(
-    exception: Exception,
+    exception: BaseException,
     *,
     error_code: ErrorCode | None = None,
     tool_name: str | None = None,
@@ -90,7 +91,7 @@ def _tool_error_details(
     )
 
 
-def _log_tool_exception(exception: Exception) -> None:
+def _log_tool_exception(exception: BaseException) -> None:
     """Log a tool exception according to its semantic classification."""
     fields = correlation_fields()
     context = " ".join(f"{key}={value}" for key, value in fields.items())
@@ -116,6 +117,12 @@ def _log_tool_exception(exception: Exception) -> None:
         )
 
 
+def _current_task_is_cancelling() -> bool:
+    """Return whether asyncio is actively cancelling the current task."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 class ToolCallResult(NamedTuple):
     """Result from executing a single tool call."""
 
@@ -125,6 +132,24 @@ class ToolCallResult(NamedTuple):
     is_error: bool
     error_details: ToolErrorDetails | None = None
     retry_model: bool = False
+
+
+def _unexpected_tool_result(
+    tool_name: str,
+    tool_call_id: str,
+    exception: BaseException,
+) -> ToolCallResult:
+    """Build a generic model-facing result while retaining host diagnostics."""
+    return ToolCallResult(
+        tool_name,
+        tool_call_id,
+        f"[{ErrorCode.TOOL_EXECUTION_ERROR.value}] {UNEXPECTED_TOOL_ERROR_MESSAGE}",
+        True,
+        _tool_error_details(
+            exception,
+            error_code=ErrorCode.TOOL_EXECUTION_ERROR,
+        ),
+    )
 
 
 def _classified_tool_result(
@@ -485,38 +510,50 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         resolved_max_model_corrections = _resolve_max_model_corrections(max_model_corrections)
         self.last_output = None
         run_id = uuid4().hex
-        token = run_id_var.set(run_id)
         logger.debug(
             f"Starting agent run run_id={run_id}",
             extra={"run_id": run_id, "layer": "executor"},
         )
+        stream = self._run_stream(
+            messages=messages,
+            system_prompt=system_prompt,
+            context=context,
+            max_iterations=max_iterations,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
+            approved_tool_calls=approved_tool_calls,
+            max_model_corrections=resolved_max_model_corrections,
+        )
         try:
-            async for event in self._run_stream(
-                messages=messages,
-                system_prompt=system_prompt,
-                context=context,
-                max_iterations=max_iterations,
-                reasoning_effort=reasoning_effort,
-                max_tokens=max_tokens,
-                approved_tool_calls=approved_tool_calls,
-                max_model_corrections=resolved_max_model_corrections,
-            ):
+            while True:
+                token = run_id_var.set(run_id)
+                try:
+                    try:
+                        event = await anext(stream)
+                    except StopAsyncIteration:
+                        return
+                    except ProviderError as exception:
+                        logger.error(
+                            f"Provider call failed layer=provider run_id={run_id} "
+                            f"provider={exception.provider or self.llm.name} "
+                            f"exception_type={type(exception).__name__}: {exception}",
+                            extra={
+                                "layer": "provider",
+                                "run_id": run_id,
+                                "provider": exception.provider or self.llm.name,
+                                "exception_type": type(exception).__name__,
+                            },
+                        )
+                        raise
+                finally:
+                    run_id_var.reset(token)
                 yield event
-        except ProviderError as exception:
-            logger.error(
-                f"Provider call failed layer=provider run_id={run_id} "
-                f"provider={exception.provider or self.llm.name} "
-                f"exception_type={type(exception).__name__}: {exception}",
-                extra={
-                    "layer": "provider",
-                    "run_id": run_id,
-                    "provider": exception.provider or self.llm.name,
-                    "exception_type": type(exception).__name__,
-                },
-            )
-            raise
         finally:
-            run_id_var.reset(token)
+            token = run_id_var.set(run_id)
+            try:
+                await stream.aclose()
+            finally:
+                run_id_var.reset(token)
 
     async def _run_stream(
         self,
@@ -626,15 +663,24 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 "error_code": ErrorCode.FINAL_RESULT_INVALID.value,
                             },
                         )
-                        result_event, end_event = self._emit_tool_result(
-                            tc,
-                            call_result.result,
-                            call_result.is_error,
-                            working_messages,
-                            error_details=call_result.error_details,
-                        )
-                        yield result_event
-                        yield end_event
+                        for sibling in tool_calls:
+                            sibling_result = (
+                                call_result
+                                if sibling is tc
+                                else _unexecuted_result(
+                                    sibling,
+                                    reason=ErrorCode.FINAL_RESULT_INVALID.value,
+                                )
+                            )
+                            sibling_event, sibling_end = self._emit_tool_result(
+                                sibling,
+                                sibling_result.result,
+                                sibling_result.is_error,
+                                working_messages,
+                                error_details=sibling_result.error_details,
+                            )
+                            yield sibling_event
+                            yield sibling_end
 
                         model_corrections += 1
                         last_correction_error = call_result.error_details
@@ -643,21 +689,6 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 model_corrections,
                                 last_error=last_correction_error,
                             ) from exception
-                        for sibling in tool_calls:
-                            if sibling is tc:
-                                continue
-                            sibling_result = _unexecuted_result(
-                                sibling,
-                                reason=ErrorCode.FINAL_RESULT_INVALID.value,
-                            )
-                            sibling_event, sibling_end = self._emit_tool_result(
-                                sibling,
-                                sibling_result.result,
-                                sibling_result.is_error,
-                                working_messages,
-                            )
-                            yield sibling_event
-                            yield sibling_end
                         final_result_invalid = True
                         break
                     else:
@@ -1019,13 +1050,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return _model_retry_result(tool_name, tool_call_id, exception)
 
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
+            raise ApprovalRequired(tool_call_id, tool_name, inputs)
 
         try:
             result = await self._invoke_tool(tool, validated_inputs, context)
             return ToolCallResult(tool_name, tool_call_id, result, False)
         except ApprovalRequired:
             raise
+        except asyncio.CancelledError as exception:
+            if _current_task_is_cancelling():
+                raise
+            _log_tool_exception(exception)
+            return _unexpected_tool_result(tool_name, tool_call_id, exception)
         except Exception as exception:
             _log_tool_exception(exception)
             return _classified_tool_result(tool_name, tool_call_id, exception)
@@ -1039,24 +1075,46 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         approved_tool_calls: set[str],
     ) -> AsyncIterator[ToolStreamEvent | ToolCallResult | Any]:
         """Execute a streaming tool with call-scoped correlation context."""
-        name_token = tool_name_var.set(tool_name)
-        call_token = tool_call_id_var.set(tool_call_id)
-        attempt_token = tool_attempt_var.set(None)
-        max_attempts_token = tool_max_attempts_var.set(None)
+        stream = self._execute_tool_stream_impl(
+            tool_name,
+            tool_call_id,
+            inputs,
+            context,
+            approved_tool_calls,
+        )
+        attempt: int | None = None
+        max_attempts: int | None = None
         try:
-            async for event in self._execute_tool_stream_impl(
-                tool_name,
-                tool_call_id,
-                inputs,
-                context,
-                approved_tool_calls,
-            ):
+            while True:
+                name_token = tool_name_var.set(tool_name)
+                call_token = tool_call_id_var.set(tool_call_id)
+                attempt_token = tool_attempt_var.set(attempt)
+                max_attempts_token = tool_max_attempts_var.set(max_attempts)
+                try:
+                    try:
+                        event = await anext(stream)
+                    except StopAsyncIteration:
+                        return
+                finally:
+                    attempt = tool_attempt_var.get()
+                    max_attempts = tool_max_attempts_var.get()
+                    tool_max_attempts_var.reset(max_attempts_token)
+                    tool_attempt_var.reset(attempt_token)
+                    tool_call_id_var.reset(call_token)
+                    tool_name_var.reset(name_token)
                 yield event
         finally:
-            tool_max_attempts_var.reset(max_attempts_token)
-            tool_attempt_var.reset(attempt_token)
-            tool_call_id_var.reset(call_token)
-            tool_name_var.reset(name_token)
+            name_token = tool_name_var.set(tool_name)
+            call_token = tool_call_id_var.set(tool_call_id)
+            attempt_token = tool_attempt_var.set(attempt)
+            max_attempts_token = tool_max_attempts_var.set(max_attempts)
+            try:
+                await stream.aclose()
+            finally:
+                tool_max_attempts_var.reset(max_attempts_token)
+                tool_attempt_var.reset(attempt_token)
+                tool_call_id_var.reset(call_token)
+                tool_name_var.reset(name_token)
 
     async def _execute_tool_stream_impl(
         self,
@@ -1097,7 +1155,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return
 
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, validated_inputs)
+            raise ApprovalRequired(tool_call_id, tool_name, inputs)
 
         try:
             if tool.stream_output:
@@ -1109,6 +1167,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 yield result
         except ApprovalRequired:
             raise
+        except asyncio.CancelledError as exception:
+            if _current_task_is_cancelling():
+                raise
+            _log_tool_exception(exception)
+            yield _unexpected_tool_result(tool_name, tool_call_id, exception)
         except Exception as exception:
             _log_tool_exception(exception)
             yield _classified_tool_result(tool_name, tool_call_id, exception)

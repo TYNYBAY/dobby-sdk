@@ -164,7 +164,7 @@ def test_tool_failure_rejects_retry_and_host_codes(code: ErrorCode) -> None:
         ToolFailure("Do not retry this.", code=code)
 
 
-def test_unexpected_tool_error_uses_exception_message() -> None:
+def test_unexpected_tool_error_uses_fixed_model_message() -> None:
     decision = classify_tool_error(RuntimeError("database password is secret"))
 
     assert decision is not None
@@ -172,8 +172,9 @@ def test_unexpected_tool_error_uses_exception_message() -> None:
 
     assert decision.code is ErrorCode.TOOL_EXECUTION_ERROR
     assert decision.retry_model is False
-    assert decision.model_message == "database password is secret"
-    assert model_text == "[tool_execution_error] database password is secret"
+    assert decision.model_message == "The tool failed unexpectedly."
+    assert model_text == "[tool_execution_error] The tool failed unexpectedly."
+    assert "database password" not in model_text
 
 
 @pytest.mark.parametrize(
@@ -191,7 +192,7 @@ def test_provider_errors_do_not_enter_model_retry_semantics(
     assert decision is not None
     assert decision.code is ErrorCode.TOOL_EXECUTION_ERROR
     assert decision.retry_model is False
-    assert format_model_error(decision) == f"[tool_execution_error] {provider_error}"
+    assert format_model_error(decision) == ("[tool_execution_error] The tool failed unexpectedly.")
 
 
 def test_model_error_formatter_uses_only_decision_fields() -> None:

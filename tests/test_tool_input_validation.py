@@ -2,14 +2,18 @@
 
 import asyncio
 from dataclasses import dataclass
+from datetime import date
+from enum import Enum
+import json
 from typing import Annotated
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 from pydantic import BaseModel
 import pytest
 
 from dobby import AgentExecutor
-from dobby.exceptions import ErrorCode, ModelRetry
+from dobby.exceptions import ApprovalRequired, ErrorCode, ModelRetry
 from dobby.tools import Injected, Tool
 from dobby.types import StreamEndEvent, ToolResultEvent, ToolStreamEvent, ToolUsePart, Usage
 
@@ -240,6 +244,75 @@ def test_validation_happens_before_approval() -> None:
     assert str(results[0].result).startswith("[tool_input_invalid]")
 
 
+def test_approval_preserves_raw_inputs_while_invocation_uses_validated_values() -> None:
+    class Mode(Enum):
+        FAST = "fast"
+
+    class NestedInput(BaseModel):
+        value: int
+
+    received = []
+
+    @dataclass
+    class ApprovalTool(Tool):
+        name = "approval"
+        description = "Require approval for typed inputs."
+        requires_approval = True
+
+        async def __call__(
+            self,
+            due_date: date,
+            mode: Mode,
+            request_id: UUID,
+            nested: NestedInput,
+        ) -> str:
+            received.append((due_date, mode, request_id, nested))
+            return "approved"
+
+    raw_inputs = {
+        "due_date": "2026-09-23",
+        "mode": "fast",
+        "request_id": "12345678-1234-5678-1234-567812345678",
+        "nested": {"value": "7"},
+    }
+    tool_call = ToolUsePart(id="call-approval", name="approval", inputs=raw_inputs)
+    tool = ApprovalTool()
+    executor = AgentExecutor(
+        provider="openai",
+        llm=_make_mock_provider([tool_call]),
+        tools=[tool],
+    )
+
+    async def run_unapproved() -> None:
+        async for _ in executor.run_stream(messages=[]):
+            pass
+
+    with pytest.raises(ApprovalRequired) as exc_info:
+        asyncio.run(run_unapproved())
+
+    assert exc_info.value.tool_args == raw_inputs
+    assert json.loads(json.dumps(exc_info.value.tool_args)) == raw_inputs
+    assert received == []
+
+    results = asyncio.run(
+        _collect_results(
+            [tool],
+            [tool_call],
+            approved_tool_calls={"call-approval"},
+        )
+    )
+
+    assert results[0].result == "approved"
+    assert received == [
+        (
+            date(2026, 9, 23),
+            Mode.FAST,
+            UUID("12345678-1234-5678-1234-567812345678"),
+            NestedInput(value=7),
+        )
+    ]
+
+
 def test_streaming_tool_inputs_are_validated_before_execution() -> None:
     called = False
 
@@ -363,6 +436,6 @@ def test_exception_inside_executed_tool_is_not_input_validation_error() -> None:
     assert len(results) == 1
     assert results[0].is_error is True
     assert "[tool_input_invalid]" not in str(results[0].result)
-    assert str(results[0].result) == "[tool_execution_error] failure inside tool: 1"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
     assert results[0].error_details is not None
     assert results[0].error_details.message == "failure inside tool: 1"

@@ -214,7 +214,7 @@ def test_execution_errors_do_not_consume_correction_budget() -> None:
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
-    assert str(results[0].result) == "[tool_execution_error] failure"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_body_model_retry_consumes_correction_budget() -> None:
@@ -271,7 +271,7 @@ def test_retry_exhausted_execution_error_does_not_consume_correction_budget() ->
     assert len(results) == 1
     assert results[0].is_error is True
     assert results[0].error_details is not None
-    assert str(results[0].result) == "[tool_execution_error] transient"
+    assert str(results[0].result) == "[tool_execution_error] The tool failed unexpectedly."
 
 
 def test_streaming_validation_correction_exhausts_after_result() -> None:
@@ -400,22 +400,19 @@ def test_successful_terminal_waits_for_mixed_batch_correction_gate(
     ]
 
 
-@pytest.mark.parametrize("control_flow", ["approval", "cancellation"])
-def test_host_control_flow_does_not_become_model_retry_exhaustion(control_flow: str) -> None:
+def test_approval_does_not_become_model_retry_exhaustion() -> None:
     @dataclass
     class ControlFlowTool(Tool):
         name = "control"
         description = "Raise host control flow."
-        requires_approval = control_flow == "approval"
+        requires_approval = True
 
         async def __call__(self) -> None:
-            if control_flow == "cancellation":
-                raise asyncio.CancelledError
+            return None
 
     provider = ScriptedProvider([[ToolUsePart(id="call-control", name="control", inputs={})]])
     executor = AgentExecutor(provider="openai", llm=provider, tools=[ControlFlowTool()])
 
-    expected = ApprovalRequired if control_flow == "approval" else asyncio.CancelledError
     control_results = []
 
     def capture_control_flow_result(tool_call, exception):
@@ -428,10 +425,10 @@ def test_host_control_flow_does_not_become_model_retry_exhaustion(control_flow: 
         side_effect=capture_control_flow_result,
     ):
         events, messages, error = asyncio.run(
-            _collect_until_exception(executor, expected, max_model_corrections=0)
+            _collect_until_exception(executor, ApprovalRequired, max_model_corrections=0)
         )
 
-    assert isinstance(error, expected)
+    assert isinstance(error, ApprovalRequired)
     assert len(provider.calls) == 1
     assert len(control_results) == 1
     assert control_results[0].retry_model is False

@@ -29,6 +29,7 @@ _MODEL_RETRY_CODES = frozenset(
 )
 _TOOL_FAILURE_CODES = frozenset({ErrorCode.TOOL_FAILURE})
 _EXHAUSTION_CODES = frozenset({ErrorCode.MODEL_RETRY_EXHAUSTED})
+UNEXPECTED_TOOL_ERROR_MESSAGE = "The tool failed unexpectedly."
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +89,7 @@ class ApprovalRequired(Exception):
     Attributes:
         tool_call_id: Unique identifier for this tool call
         tool_name: Name of the tool that requires approval
-        tool_args: Arguments that would be passed to the tool
+        tool_args: Original model-supplied arguments awaiting approval
     """
 
     tool_call_id: str
@@ -151,7 +152,7 @@ def classify_tool_error(exception: BaseException) -> ErrorDecision | None:
         return ErrorDecision(code=exception.code, model_message=str(exception))
     return ErrorDecision(
         code=ErrorCode.TOOL_EXECUTION_ERROR,
-        model_message=str(exception),
+        model_message=UNEXPECTED_TOOL_ERROR_MESSAGE,
     )
 
 
