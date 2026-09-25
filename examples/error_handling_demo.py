@@ -591,7 +591,8 @@ async def scenario_unexpected_exception(logger: logging.Logger) -> None:
             "Model called lookup_account",
             "Tool raised RuntimeError (not listed, not ModelRetry/ToolFailure)",
             "Executor classified it as tool_execution_error",
-            "Model gets the exception message; host/logs keep the traceback",
+            "Model received [tool_execution_error] The tool failed unexpectedly.",
+            "Host error_details keep the original exception message and traceback",
         ]
     )
     _print_block("MODEL", _model_lines(run))
