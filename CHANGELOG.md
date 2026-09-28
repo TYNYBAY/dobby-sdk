@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`max_model_corrections` on `AgentExecutor.run_stream()`.** One run-wide model-correction budget, default `3`, shared by tool-call correction and final-result correction. Exhausting it raises `ModelRetryExhaustedError`.
+- Host-side `error_details` on tool result events: exception type, message, traceback, and related diagnostics. The model-facing payload does not include the traceback.
+
+### Breaking
+- **Tool error results and history no longer use `{"error": ...}`.** Classified failures are now a string of the form `[error_code] message` (for example `[tool_execution_error] The tool failed unexpectedly.`). Hosts that indexed `event.result["error"]` will raise `TypeError`.
+- **`run_stream()` can raise `ModelRetryExhaustedError`.** With the default budget of 3, a fourth correction batch raises instead of continuing until `max_iterations`. `max_iterations` is unchanged: it remains a silent cap.
+
 ## [0.2.17] - 2026-07-20
 
 Vertex AI now has one route into this SDK: `VertexAIProvider`, against Vertex's

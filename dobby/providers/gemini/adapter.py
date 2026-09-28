@@ -38,6 +38,7 @@ from ..base import (
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
     ToolCallTruncatedError,
+    _iter_translated,
 )
 from .converters import to_gemini_messages
 
@@ -378,7 +379,7 @@ class GeminiProvider(Provider[genai.Client]):
         except Exception as e:
             self._translate_error(e)
 
-        async for chunk in stream_response:
+        async for chunk in _iter_translated(stream_response, self._translate_error):
             # Emit stream start on first chunk
             if not stream_started:
                 yield StreamStartEvent(

@@ -42,6 +42,7 @@ from ..base import (
     Provider,
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
+    _iter_translated,
 )
 from .converters import AnthropicContentBlock, content_part_to_anthropic
 
@@ -514,17 +515,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         # Opaque encrypted reasoning blocks, preserved verbatim for round-trip.
         redacted_thinking_data: list[str] = []
 
-        # Iterate manually so mid-stream transport errors route through the same
-        # unified error translation as the initial request.
-        stream_iter = stream.__aiter__()
-        while True:
-            try:
-                event = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                self._translate_error(e)
-
+        async for event in _iter_translated(stream, self._translate_error):
             match event.type:
                 case "message_start":
                     response_id = event.message.id

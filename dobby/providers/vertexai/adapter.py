@@ -45,6 +45,7 @@ from ..base import (
     Provider,
     ProviderError as DobbyProviderError,
     RateLimitError as DobbyRateLimitError,
+    _iter_translated,
 )
 from .converters import to_vertexai_messages
 
@@ -805,18 +806,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
         accumulated_arguments_length = 0
 
-        # Iterate manually so mid-stream transport errors route through the same
-        # unified error translation as the initial request (mirrors
-        # AnthropicProvider._stream_chat_completion's manual __anext__ pattern).
-        stream_iter = stream.__aiter__()
-        while True:
-            try:
-                chunk = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                self._translate_error(e)
-
+        async for chunk in _iter_translated(stream, self._translate_error):
             if not stream_started:
                 yield StreamStartEvent(
                     id=getattr(chunk, "id", None) or f"vertexai_{model}",

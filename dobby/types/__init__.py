@@ -42,6 +42,7 @@ from .text_part import TextPart as TextPart
 
 # Tool events
 from .tool_events import (
+    ToolErrorDetails as ToolErrorDetails,
     ToolResultEvent as ToolResultEvent,
     ToolStreamEvent as ToolStreamEvent,
     ToolUseEndEvent as ToolUseEndEvent,
