@@ -103,6 +103,7 @@ RETRYABLE_ERRORS: tuple[type[ProviderError], ...] = (
     InternalServerError,
 )
 
+
 async def _iter_translated[T](
     stream: AsyncIterator[T],
     translate: Callable[[Exception], NoReturn],

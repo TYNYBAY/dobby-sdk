@@ -496,11 +496,7 @@ async def scenario_invalid_input_correction(logger: logging.Logger) -> None:
             f"tool body invocations={len(tool.invocations)} args={tool.invocations!r}",
             "Only the corrected call entered the tool body.",
             f"Host ToolRetryPolicy retry logs={len(retry_logs)} (expected 0).",
-            *(
-                _host_lines_from_result(results[0])
-                if results
-                else ["No result events."]
-            ),
+            *(_host_lines_from_result(results[0]) if results else ["No result events."]),
         ],
     )
     _print_block("LOGS", _log_lines(run))
@@ -552,11 +548,7 @@ async def scenario_model_retry_correction(logger: logging.Logger) -> None:
             f"Host ToolRetryPolicy retry logs={len(retry_logs)} (expected 0).",
             "ModelRetry is never retried by ToolRetryPolicy (see tools.retry._NEVER_RETRY).",
             f"model-correction warning logs={len(warning_logs)}",
-            *(
-                _host_lines_from_result(results[0])
-                if results
-                else ["No result events."]
-            ),
+            *(_host_lines_from_result(results[0]) if results else ["No result events."]),
         ],
     )
     _print_block("LOGS", _log_lines(run))
@@ -677,9 +669,7 @@ async def scenario_approval_control_flow(logger: logging.Logger) -> None:
             "Approval is host control flow, not a classified tool error.",
             f"Later terminal tool ran: {bool(hang_up.invocations)}",
             "Later tool placeholder assembled: "
-            + (
-                str(any(event.name == "hang_up" for event in results))
-            ),
+            + (str(any(event.name == "hang_up" for event in results))),
             f"ApprovalRequired reached the host: {isinstance(error, ApprovalRequired)}",
         ],
     )

@@ -7,8 +7,8 @@ This module provides the AgentExecutor class which handles:
 """
 
 import asyncio
-import copy
 from collections.abc import AsyncIterator, Callable
+import copy
 import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
