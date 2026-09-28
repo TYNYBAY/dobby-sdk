@@ -364,6 +364,62 @@ def test_host_task_cancellation_still_propagates() -> None:
     asyncio.run(run())
 
 
+def test_host_cancellation_propagates_when_consumer_stops_after_placeholder() -> None:
+    """Host CancelledError must still propagate if the consumer stops early."""
+    started = asyncio.Event()
+    later_calls = 0
+
+    @dataclass
+    class BlockingTool(Tool):
+        name = "blocking"
+        description = "Wait until the host cancels the task."
+        sequential = True
+
+        async def __call__(self) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+    @dataclass
+    class LaterTool(Tool):
+        name = "later"
+        description = "Must not run after cancellation."
+        sequential = True
+
+        async def __call__(self) -> str:
+            nonlocal later_calls
+            later_calls += 1
+            return "should not run"
+
+    async def run() -> None:
+        executor = AgentExecutor(
+            provider="openai",
+            llm=_make_mock_provider(
+                [
+                    ToolUsePart(id="call-blocking", name="blocking", inputs={}),
+                    ToolUsePart(id="call-later", name="later", inputs={}),
+                ]
+            ),
+            tools=[BlockingTool(), LaterTool()],
+        )
+        stream = executor.run_stream(messages=[])
+
+        async def consume_until_placeholder() -> None:
+            async for event in stream:
+                if isinstance(event, ToolResultEvent) and event.result == {"cancelled": True}:
+                    break
+            await stream.aclose()
+
+        task = asyncio.create_task(consume_until_placeholder())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert later_calls == 0
+
+    asyncio.run(run())
+
+
 def test_invalid_inputs_are_validated_once_and_never_invoked() -> None:
     calls = 0
 

@@ -42,3 +42,5 @@ def test_error_handling_demo_runs_without_api_keys(
     assert "No API keys required." in output
     assert "SCENARIO 1" in output
     assert "SCENARIO 6" in output
+    assert "[tool_execution_error] The tool failed unexpectedly." in output
+    assert "Exception message present in MODEL text: False" in output

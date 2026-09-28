@@ -1,7 +1,8 @@
 """Tests for Anthropic provider: error translation, message conversion, and converters."""
 
 import asyncio
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -165,6 +166,30 @@ class TestAnthropicErrorTranslation:
         provider = AnthropicProvider.__new__(AnthropicProvider)
         provider.base_url = None
         assert provider.name == "anthropic"
+
+    def test_mid_stream_error_is_translated(self) -> None:
+        """An SDK error raised after streaming has started uses the unified error type."""
+        import anthropic
+
+        provider = self._make_provider()
+        provider.max_retries = 0
+        native = self._make_anthropic_error(anthropic.APIConnectionError)
+
+        async def native_stream():
+            yield SimpleNamespace(type="ping")
+            raise native
+
+        provider._client.messages.create = AsyncMock(return_value=native_stream())
+
+        async def run() -> None:
+            stream = provider._stream_chat_completion([], "claude-sonnet-4-20250514")
+            with pytest.raises(APIConnectionError) as exc_info:
+                async for _ in stream:
+                    pass
+            assert exc_info.value.provider == "anthropic"
+            assert exc_info.value.__cause__ is native
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------

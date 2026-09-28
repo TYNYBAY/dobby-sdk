@@ -77,7 +77,9 @@ async for event in executor.run_stream(
 
 Tool errors in `ToolResultEvent.result` and conversation history are classified strings of the form `[error_code] message`, not `{"error": ...}`. Host-side `error_details` (`ToolErrorDetails`) still holds exception diagnostics, including the **full exception traceback**. Do not send `error_details` (especially `traceback`) to untrusted clients such as browsers.
 
-Approval and cancellation are host control flow, not classified model errors. The executor still emits a `ToolResultEvent` with `is_error=True` and a placeholder result (`{"approval_required": True}` or `{"cancelled": True}`) so history does not look like the tool succeeded, then re-raises `ApprovalRequired` or `asyncio.CancelledError`. Remaining unexecuted calls in that batch get the same placeholder dict. Already-running parallel calls may still complete successfully.
+Approval is host control flow, not a classified model error. The executor still emits a `ToolResultEvent` with `is_error=True` and `result={"approval_required": True}` so history does not look like the tool succeeded, then re-raises `ApprovalRequired`. Remaining unexecuted calls in that batch get the same placeholder dict. Already-running parallel calls may still complete successfully.
+
+Host cancellation re-raises `asyncio.CancelledError`. Cancelling a parallel batch does not emit per-call `{"cancelled": True}` events: `CancelledError` escapes the batch `gather` before placeholders are assembled. Sequential, streaming, and terminal cancellation also re-raise without yielding cancellation placeholders, so a consumer that stops after an event cannot swallow the cancellation.
 
 `dobby.exceptions` also exports the classification helpers the executor uses: `classify_tool_error`, `format_model_error`, and `ErrorDecision`. `classify_tool_error(exception)` returns an `ErrorDecision` (`code`, `model_message`, `retry_model`) or `None` for approval, cancellation, and other non-error control flow. `format_model_error(decision)` produces the `[error_code] message` string sent to the model.
 
@@ -212,4 +214,6 @@ async for event in executor.run_stream(
             pass
 ```
 
-If the tool is not in `approved_tool_calls`, the executor yields a `ToolResultEvent` with `is_error=True` and `result={"approval_required": True}` for that call, then raises `ApprovalRequired`. Remaining unexecuted calls get the same `{"approval_required": True}` placeholder (`is_error=True`). Already-running parallel calls may still complete successfully. Cancellation uses the same `is_error=True` event shape with `result={"cancelled": True}` for the cancelled call and remaining unexecuted calls.
+If the tool is not in `approved_tool_calls`, the executor yields a `ToolResultEvent` with `is_error=True` and `result={"approval_required": True}` for that call, then raises `ApprovalRequired`. Remaining unexecuted calls get the same `{"approval_required": True}` placeholder (`is_error=True`). Already-running parallel calls may still complete successfully.
+
+Host cancellation re-raises `asyncio.CancelledError` and does not yield `{"cancelled": True}` placeholder events. A cancelled parallel batch in particular emits no per-call placeholders.

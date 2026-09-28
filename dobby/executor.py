@@ -7,7 +7,8 @@ This module provides the AgentExecutor class which handles:
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+import copy
+from collections.abc import AsyncIterator, Callable
 import inspect
 import traceback
 from typing import Any, Literal, NamedTuple
@@ -43,7 +44,7 @@ from .tools.retry import (
     max_tool_invocations,
     retry_backoff_seconds,
 )
-from .tools.tool import Tool, _format_pydantic_validation_issues
+from .tools.tool import Tool, format_pydantic_validation_issues
 from .types import (
     AssistantMessagePart,
     MessagePart,
@@ -193,7 +194,7 @@ def _model_retry_result(
 
 def _final_result_validation_message(exception: ValidationError) -> str:
     """Build field-level final-result validation feedback."""
-    return "Invalid final result: " + _format_pydantic_validation_issues(exception)
+    return "Invalid final result: " + format_pydantic_validation_issues(exception)
 
 
 def _control_flow_result(
@@ -504,6 +505,30 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             error_details=call_result.error_details,
         )
 
+    async def _emit_placeholders(
+        self,
+        calls: list[ToolUsePart],
+        build_result: Callable[[ToolUsePart], ToolCallResult],
+        working_messages: list[MessagePart],
+        *,
+        yield_events: bool = True,
+    ) -> AsyncIterator[StreamEvent]:
+        """Record placeholder results and yield their result and end events.
+
+        Host cancellation passes ``yield_events=False`` so the placeholders are
+        still assembled, but ``CancelledError`` is re-raised without a yield the
+        consumer can stop on.
+        """
+        for call in calls:
+            result_event, end_event = self._emit_call_result(
+                call,
+                build_result(call),
+                working_messages,
+            )
+            if yield_events:
+                yield result_event
+                yield end_event
+
     async def run_stream(
         self,
         messages: list[MessagePart],
@@ -682,22 +707,19 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 "error_code": ErrorCode.FINAL_RESULT_INVALID.value,
                             },
                         )
-                        for sibling in tool_calls:
-                            sibling_result = (
-                                call_result
-                                if sibling is tc
+                        async for event in self._emit_placeholders(
+                            tool_calls,
+                            lambda sibling, current=tc, invalid=call_result: (
+                                invalid
+                                if sibling is current
                                 else _unexecuted_result(
                                     sibling,
                                     reason=ErrorCode.FINAL_RESULT_INVALID.value,
                                 )
-                            )
-                            sibling_event, sibling_end = self._emit_call_result(
-                                sibling,
-                                sibling_result,
-                                working_messages,
-                            )
-                            yield sibling_event
-                            yield sibling_end
+                            ),
+                            working_messages,
+                        ):
+                            yield event
 
                         model_corrections += 1
                         last_correction_error = call_result.error_details
@@ -790,6 +812,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             assembled_calls = parallel_calls[: len(results)]
             control_flow: ApprovalRequired | asyncio.CancelledError | None = None
             for tc, call_result in zip(assembled_calls, results, strict=True):
+                is_cancellation = isinstance(call_result, asyncio.CancelledError)
                 if isinstance(call_result, (ApprovalRequired, asyncio.CancelledError)):
                     if control_flow is None:
                         control_flow = call_result
@@ -808,36 +831,32 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     call_result,
                     working_messages,
                 )
+                if is_cancellation:
+                    continue
                 yield result_event
                 yield end_event
 
             if control_flow is not None:
-                remaining_regular_calls = parallel_calls[len(results) :]
-                for remaining in remaining_regular_calls + streaming_calls + terminal_calls:
-                    remaining_result = _control_flow_result(remaining, control_flow)
-                    remaining_event, remaining_end = self._emit_call_result(
-                        remaining,
-                        remaining_result,
-                        working_messages,
-                    )
-                    yield remaining_event
-                    yield remaining_end
-                raise control_flow
+                pending_control_flow = control_flow
+                async for event in self._emit_placeholders(
+                    parallel_calls[len(results) :] + streaming_calls + terminal_calls,
+                    lambda remaining, flow=pending_control_flow: _control_flow_result(
+                        remaining, flow
+                    ),
+                    working_messages,
+                    yield_events=not isinstance(pending_control_flow, asyncio.CancelledError),
+                ):
+                    yield event
+                raise pending_control_flow
 
             terminal_completed = False
             if batch_has_model_correction:
-                for remaining in parallel_calls[len(results) :] + streaming_calls + terminal_calls:
-                    remaining_result = _unexecuted_result(
-                        remaining,
-                        reason="model_correction",
-                    )
-                    remaining_event, remaining_end = self._emit_call_result(
-                        remaining,
-                        remaining_result,
-                        working_messages,
-                    )
-                    yield remaining_event
-                    yield remaining_end
+                async for event in self._emit_placeholders(
+                    parallel_calls[len(results) :] + streaming_calls + terminal_calls,
+                    lambda remaining: _unexecuted_result(remaining, reason="model_correction"),
+                    working_messages,
+                ):
+                    yield event
             else:
                 # Execute streaming tools sequentially
                 streaming_correction = False
@@ -862,24 +881,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             else:
                                 result = event_or_result
                     except (ApprovalRequired, asyncio.CancelledError) as exception:
-                        call_result = _control_flow_result(tc, exception)
-                        result_event, end_event = self._emit_call_result(
-                            tc,
-                            call_result,
+                        async for event in self._emit_placeholders(
+                            [tc, *streaming_calls[index + 1 :], *terminal_calls],
+                            lambda remaining, caught=exception: _control_flow_result(
+                                remaining, caught
+                            ),
                             working_messages,
-                        )
-                        yield result_event
-                        yield end_event
-                        unexecuted = streaming_calls[index + 1 :] + terminal_calls
-                        for remaining in unexecuted:
-                            remaining_result = _control_flow_result(remaining, exception)
-                            remaining_event, remaining_end = self._emit_call_result(
-                                remaining,
-                                remaining_result,
-                                working_messages,
-                            )
-                            yield remaining_event
-                            yield remaining_end
+                            yield_events=not isinstance(exception, asyncio.CancelledError),
+                        ):
+                            yield event
                         raise
 
                     result_event, end_event = self._emit_tool_result(
@@ -893,18 +903,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     yield end_event
 
                     if streaming_correction:
-                        for remaining in streaming_calls[index + 1 :] + terminal_calls:
-                            remaining_result = _unexecuted_result(
+                        async for event in self._emit_placeholders(
+                            streaming_calls[index + 1 :] + terminal_calls,
+                            lambda remaining: _unexecuted_result(
                                 remaining,
                                 reason="model_correction",
-                            )
-                            remaining_event, remaining_end = self._emit_call_result(
-                                remaining,
-                                remaining_result,
-                                working_messages,
-                            )
-                            yield remaining_event
-                            yield remaining_end
+                            ),
+                            working_messages,
+                        ):
+                            yield event
                         break
                 else:
                     # Terminal tool exits the loop
@@ -931,23 +938,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 else:
                                     result = event_or_result
                         except (ApprovalRequired, asyncio.CancelledError) as exception:
-                            call_result = _control_flow_result(tc, exception)
-                            result_event, end_event = self._emit_call_result(
-                                tc,
-                                call_result,
+                            async for event in self._emit_placeholders(
+                                [tc, *terminal_calls[1:]],
+                                lambda remaining, caught=exception: _control_flow_result(
+                                    remaining, caught
+                                ),
                                 working_messages,
-                            )
-                            yield result_event
-                            yield end_event
-                            for remaining in terminal_calls[1:]:
-                                remaining_result = _control_flow_result(remaining, exception)
-                                remaining_event, remaining_end = self._emit_call_result(
-                                    remaining,
-                                    remaining_result,
-                                    working_messages,
-                                )
-                                yield remaining_event
-                                yield remaining_end
+                                yield_events=not isinstance(exception, asyncio.CancelledError),
+                            ):
+                                yield event
                             raise
                         result_event, end_event = self._emit_tool_result(
                             tc,
@@ -964,18 +963,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             terminal_completed = True
 
                         skip_reason = "model_correction" if skip_terminal_exit else "terminal"
-                        for remaining in terminal_calls[1:]:
-                            remaining_result = _unexecuted_result(
-                                remaining,
-                                reason=skip_reason,
-                            )
-                            remaining_event, remaining_end = self._emit_call_result(
-                                remaining,
-                                remaining_result,
-                                working_messages,
-                            )
-                            yield remaining_event
-                            yield remaining_end
+                        async for event in self._emit_placeholders(
+                            terminal_calls[1:],
+                            lambda remaining, reason=skip_reason: _unexecuted_result(
+                                remaining, reason=reason
+                            ),
+                            working_messages,
+                        ):
+                            yield event
 
             if batch_has_model_correction:
                 model_corrections += 1
@@ -1048,7 +1043,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return _model_retry_result(tool_name, tool_call_id, exception)
 
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, inputs)
+            raise ApprovalRequired(tool_call_id, tool_name, copy.deepcopy(inputs))
 
         try:
             result = await self._invoke_tool(tool, validated_inputs, context)
@@ -1136,7 +1131,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             return
 
         if tool.requires_approval and tool_call_id not in approved_tool_calls:
-            raise ApprovalRequired(tool_call_id, tool_name, inputs)
+            raise ApprovalRequired(tool_call_id, tool_name, copy.deepcopy(inputs))
 
         try:
             if tool.stream_output:

@@ -944,3 +944,46 @@ class TestToolErrorHandling:
                 result_part,
                 approval=True,
             )
+
+    def test_parallel_base_exception_is_reraised(self) -> None:
+        """A non-Exception BaseException is propagated, not stored as a tool result."""
+
+        class HostSignal(BaseException):
+            """Stand-in for BaseException control flow such as KeyboardInterrupt."""
+
+        @dataclass
+        class SignalTool(Tool):
+            name = "signal_tool"
+            description = "Raises a BaseException."
+
+            async def __call__(self) -> None:
+                raise HostSignal("stop the run")
+
+        @dataclass
+        class SiblingTool(Tool):
+            name = "sibling_tool"
+            description = "Would otherwise return a normal result."
+
+            async def __call__(self) -> dict[str, str]:
+                return {"status": "ok"}
+
+        tool_calls = [
+            ToolUsePart(id="tc-signal", name="signal_tool", inputs={}),
+            ToolUsePart(id="tc-sibling", name="sibling_tool", inputs={}),
+        ]
+        executor = AgentExecutor(
+            provider="openai",
+            llm=_make_mock_provider(tool_calls),
+            tools=[SignalTool(), SiblingTool()],
+        )
+        seen: list[ToolResultEvent] = []
+
+        async def run() -> None:
+            async for event in executor.run_stream(messages=[], system_prompt=None):
+                if isinstance(event, ToolResultEvent):
+                    seen.append(event)
+
+        with pytest.raises(HostSignal, match="stop the run"):
+            asyncio.run(run())
+
+        assert [event.tool_use_id for event in seen] == []

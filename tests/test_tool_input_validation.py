@@ -313,6 +313,59 @@ def test_approval_preserves_raw_inputs_while_invocation_uses_validated_values() 
     ]
 
 
+@pytest.mark.parametrize("stream_output", [False, True], ids=["call", "stream"])
+def test_mutating_approval_tool_args_does_not_change_tool_use_inputs(stream_output: bool) -> None:
+    """ApprovalRequired.tool_args is a copy of the raw model inputs."""
+    raw_inputs = {"record_id": "123", "nested": {"flag": True}}
+
+    if stream_output:
+
+        @dataclass
+        class ApprovalTool(Tool):
+            name = "approval"
+            description = "Require approval before streaming."
+            requires_approval = True
+            stream_output = True
+
+            async def __call__(self, record_id: str, nested: dict) -> None:
+                yield record_id
+                yield nested
+
+    else:
+
+        @dataclass
+        class ApprovalTool(Tool):
+            name = "approval"
+            description = "Require approval before running."
+            requires_approval = True
+
+            async def __call__(self, record_id: str, nested: dict) -> str:
+                return record_id + str(nested)
+
+    tool_call = ToolUsePart(id="call-approval", name="approval", inputs=raw_inputs)
+    executor = AgentExecutor(
+        provider="openai",
+        llm=_make_mock_provider([tool_call]),
+        tools=[ApprovalTool()],
+    )
+
+    async def run() -> None:
+        async for _ in executor.run_stream(messages=[]):
+            pass
+
+    with pytest.raises(ApprovalRequired) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.tool_args == raw_inputs
+    assert exc_info.value.tool_args is not tool_call.inputs
+    assert json.loads(json.dumps(exc_info.value.tool_args)) == raw_inputs
+
+    exc_info.value.tool_args["record_id"] = "changed"
+    exc_info.value.tool_args["nested"]["flag"] = False
+    assert tool_call.inputs == {"record_id": "123", "nested": {"flag": True}}
+    assert raw_inputs == {"record_id": "123", "nested": {"flag": True}}
+
+
 def test_streaming_tool_inputs_are_validated_before_execution() -> None:
     called = False
 
