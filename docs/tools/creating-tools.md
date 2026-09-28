@@ -205,7 +205,7 @@ async for event in executor.run_stream(
             pass
 ```
 
-Pending approval and cancellation still emit a `ToolResultEvent` with `is_error=True` (placeholder `{"approval_required": True}` or `{"cancelled": True}`) before the executor re-raises. See [AgentExecutor](../executor.md).
+Pending approval emits a `ToolResultEvent` with `is_error=True` (placeholder `{"approval_required": True}`) before the executor raises `ApprovalRequired`. Host cancellation propagates as `asyncio.CancelledError` and does not yield cancellation placeholders. See [AgentExecutor](../executor.md).
 
 ---
 

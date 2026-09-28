@@ -59,7 +59,7 @@ The mapped types differ by provider:
 
 (`ProviderError` is aliased as `DobbyProviderError` in the adapters.)
 
-These failures do not consume Dobby tool-retry or model-correction budgets. Provider-level Tenacity may still retry applicable mapped errors (`RateLimitError`, `APITimeoutError`, `APIConnectionError`, `InternalServerError`). That retry is independent of tool retry and `max_model_corrections`.
+These failures do not consume Dobby tool-retry or model-correction budgets. Provider Tenacity retries applicable mapped errors (`RateLimitError`, `APITimeoutError`, `APIConnectionError`, `InternalServerError`) only before the first streamed event. An error after streaming has begun is translated and propagated, not retried by that wrapper. That retry is independent of tool retry and `max_model_corrections`.
 
 ## Next
 
