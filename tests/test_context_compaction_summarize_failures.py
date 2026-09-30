@@ -304,13 +304,8 @@ def test_summarize_empty_digest_must_not_destroy_span(parts: list[TextPart]) -> 
     )
 
     applied = asyncio.run(_run_summarize(messages, llm))
-    if applied is not None and _summary_count(messages) > 0:
-        pytest.fail(
-            "summarize_context replaced span with an empty <summary> instead of aborting; "
-            f"before={len(snapshot)} after={len(messages)} summaries={_summary_count(messages)}"
-        )
+    assert applied is None
     _assert_conversation_unchanged(snapshot, messages)
-    assert applied is None or _summary_count(messages) == 0
 
 
 @pytest.mark.parametrize(

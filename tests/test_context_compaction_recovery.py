@@ -573,7 +573,7 @@ def test_recovery_after_malformed_summarize_stream_then_healthy_turn() -> None:
 
 
 def test_recovery_after_empty_summary_then_healthy_turn() -> None:
-    """Empty digest in one run is a known defect within that run; caller list can compact on retry."""
+    """Empty digest is rejected; a later run with a healthy summarizer compacts successfully."""
     messages = _history()
     snapshot = copy.deepcopy(messages)
     captured: list[list[Any]] = []
@@ -595,12 +595,10 @@ def test_recovery_after_empty_summary_then_healthy_turn() -> None:
 
     events1 = asyncio.run(_collect_events(executor, messages, max_iterations=2))
     edits1 = [event for event in events1 if isinstance(event, ContextEditEvent)]
+    assert edits1 == []
     _assert_caller_unchanged(snapshot, messages)
     calls_after_empty = noop._calls  # type: ignore[attr-defined]
     assert calls_after_empty >= 1
-
-    if edits1:
-        assert edits1[0].applied_edits[0].summary_text.strip() == ""
 
     executor.llm = _llm_agent_then_summarize(
         summarize_end=StreamEndEvent(

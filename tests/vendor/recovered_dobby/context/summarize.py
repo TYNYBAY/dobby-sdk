@@ -81,6 +81,8 @@ async def summarize_context(
         tools=None,
     )
     summary_text = "".join(p.text for p in result.parts if isinstance(p, TextPart)).strip()
+    if not summary_text:
+        return None
 
     summary_msg = UserMessagePart(parts=[TextPart(text=f"<summary>{summary_text}</summary>")])
     replaced_originals = list(span)
