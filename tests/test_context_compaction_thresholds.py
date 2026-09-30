@@ -1,56 +1,25 @@
 # ruff: noqa: E402
 """Trigger and threshold tests for the recovered context-compaction implementation.
 
-The subject is the historical compaction package recovered in the
-``dobby-compaction-94b5a8f`` worktree. It is loaded under ``recovered_dobby``
-so the current tree's executor is left untouched. Responses are scripted.
+The subject is the in-tree snapshot of the historical compaction package
+(``94b5a8f``), imported as ``recovered_dobby`` so the current executor is
+left untouched. Responses are scripted.
 """
 
 # isort: off
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
 from decimal import Decimal, ROUND_CEILING
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
+from tests.compaction_subject import load_recovered
 
-def _recovered_root() -> Path:
-    """Return the worktree that holds the recovered compaction sources."""
-    repo = Path(__file__).resolve().parents[1]
-    pointer = repo / ".git" / "worktrees" / "dobby-compaction-94b5a8f" / "gitdir"
-    git_path = Path(pointer.read_text(encoding="utf-8").strip())
-    return git_path.parent
-
-
-def _load_recovered() -> Any:
-    """Import the recovered package without replacing the installed ``dobby``."""
-    name = "recovered_dobby"
-    loaded = sys.modules.get(name)
-    if loaded is not None:
-        return loaded
-    root = _recovered_root()
-    init = root / "dobby" / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        name,
-        init,
-        submodule_search_locations=[str(root / "dobby")],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load recovered compaction package from {init}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_RECOVERED = _load_recovered()
+load_recovered()
 
 from recovered_dobby import AgentExecutor, ContextEditEvent, ContextPolicy
 from recovered_dobby.context._tokens import estimate_input_tokens

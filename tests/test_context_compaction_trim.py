@@ -12,9 +12,6 @@ from the current executor, then rebuilt with the recovered message types so
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
-from pathlib import Path
 from typing import Annotated, Any
 from unittest.mock import AsyncMock
 
@@ -28,30 +25,9 @@ from dobby.types import ToolResultPart as CurrentToolResultPart
 from dobby.types import ToolUsePart as CurrentToolUsePart
 from dobby.types import Usage
 
+from tests.compaction_subject import load_recovered
 
-def _load_recovered() -> Any:
-    name = "recovered_dobby"
-    loaded = sys.modules.get(name)
-    if loaded is not None:
-        return loaded
-    repo = Path(__file__).resolve().parents[1]
-    pointer = repo / ".git" / "worktrees" / "dobby-compaction-94b5a8f" / "gitdir"
-    root = Path(pointer.read_text(encoding="utf-8").strip()).parent
-    init = root / "dobby" / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        name,
-        init,
-        submodule_search_locations=[str(root / "dobby")],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load recovered compaction package from {init}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_load_recovered()
+load_recovered()
 
 from recovered_dobby.context import edit_context
 from recovered_dobby.context.policy import ContextPolicy

@@ -10,43 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib.util
 import re
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.compaction_subject import load_recovered
 
-def _recovered_root() -> Path:
-    repo = Path(__file__).resolve().parents[1]
-    pointer = repo / ".git" / "worktrees" / "dobby-compaction-94b5a8f" / "gitdir"
-    return Path(pointer.read_text(encoding="utf-8").strip()).parent
-
-
-def _load_recovered() -> Any:
-    name = "recovered_dobby"
-    if name in sys.modules:
-        return sys.modules[name]
-    root = _recovered_root()
-    init = root / "dobby" / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        name,
-        init,
-        submodule_search_locations=[str(root / "dobby")],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load recovered compaction package from {init}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_load_recovered()
+load_recovered()
 
 from recovered_dobby import AgentExecutor, ContextEditEvent, ContextPolicy
 from recovered_dobby.context import SUMMARIZE_PROMPT, summarize_context

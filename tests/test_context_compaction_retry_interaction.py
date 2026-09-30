@@ -1,8 +1,8 @@
 # ruff: noqa: E402
 """Phase 10: compaction interaction with host-side tool retry and model correction.
 
-Host-side retry uses the current ``dobby`` executor; compaction uses the recovered
-``dobby-compaction-94b5a8f`` package. Integration runs patch the recovered executor
+Host-side retry uses the current ``dobby`` executor; compaction uses the in-tree
+``94b5a8f`` snapshot. Integration runs patch the recovered executor
 to delegate ``_invoke_tool`` to production retry logic (test-only bridge).
 """
 
@@ -11,11 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib.util
 import re
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
@@ -30,33 +27,9 @@ from dobby.types import ToolResultPart as CurrentToolResultPart
 from dobby.types import ToolUsePart as CurrentToolUsePart
 from dobby.types import Usage as CurrentUsage
 
+from tests.compaction_subject import load_recovered
 
-def _recovered_root() -> Path:
-    repo = Path(__file__).resolve().parents[1]
-    pointer = repo / ".git" / "worktrees" / "dobby-compaction-94b5a8f" / "gitdir"
-    return Path(pointer.read_text(encoding="utf-8").strip()).parent
-
-
-def _load_recovered() -> Any:
-    name = "recovered_dobby"
-    if name in sys.modules:
-        return sys.modules[name]
-    root = _recovered_root()
-    init = root / "dobby" / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        name,
-        init,
-        submodule_search_locations=[str(root / "dobby")],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load recovered compaction package from {init}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_load_recovered()
+load_recovered()
 
 from recovered_dobby import AgentExecutor, ContextEditEvent, ContextPolicy
 from recovered_dobby.context import edit_context, summarize_context
