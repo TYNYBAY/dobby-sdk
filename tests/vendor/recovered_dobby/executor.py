@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from ._logging import logger
 from .context import ContextPolicy, edit_context, summarize_context
-from .context._tokens import estimate_input_tokens
+from .context._tokens import compaction_trigger_basis, estimate_input_tokens
 from .exceptions import ApprovalRequired
 from .providers.base import Provider
 from .tools.tool import Tool
@@ -42,15 +42,24 @@ def _compaction_triggered(
     last_input_tokens: int | None,
     policy: ContextPolicy,
     last_compacted_at_tokens: int | None,
+    *,
+    outgoing_messages: list[MessagePart] | None = None,
 ) -> bool:
     """Whether compaction should fire before the next model call.
 
-    Fires once the previous turn's input tokens cross ``policy.trigger_tokens``.
-    The watermark suppresses re-firing write-back modes at the same token count.
+    Uses the greater of the previous turn's reported input tokens and a char
+    estimate of ``outgoing_messages`` (the list about to be sent, including
+    tool results appended since that turn). The watermark suppresses re-firing
+    summarize at the same combined count.
     """
-    if last_input_tokens is None or last_input_tokens < policy.trigger_tokens:
+    messages = outgoing_messages if outgoing_messages is not None else []
+    basis = compaction_trigger_basis(last_input_tokens, messages)
+    if basis is None:
         return False
-    if last_compacted_at_tokens is not None and last_input_tokens == last_compacted_at_tokens:
+    estimated = estimate_input_tokens(messages)
+    if basis < policy.trigger_tokens and estimated <= policy.context_window:
+        return False
+    if last_compacted_at_tokens is not None and basis == last_compacted_at_tokens:
         return False
     return True
 
@@ -296,7 +305,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
             # --- compaction hook (between turns, single-flight) ---
             if policy is not None and _compaction_triggered(
-                last_input_tokens, policy, last_compacted_at_tokens
+                last_input_tokens,
+                policy,
+                last_compacted_at_tokens,
+                outgoing_messages=working_messages,
             ):
                 applied: AppliedEdit | None = None
                 if policy.mode == "trim":
@@ -306,7 +318,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     applied = await summarize_context(working_messages, policy, self.llm)
                     send_messages = working_messages
                     if applied is not None:
-                        last_compacted_at_tokens = last_input_tokens
+                        last_compacted_at_tokens = compaction_trigger_basis(
+                            last_input_tokens, working_messages
+                        )
                 if applied is not None:
                     # Latch only on a real compaction, so a no-op auto-trigger does
                     # not suppress an explicit CompactContextTool call this turn.
@@ -479,7 +493,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     extra_instructions=tc.inputs.get("instructions"),
                 )
                 if applied is not None:
-                    last_compacted_at_tokens = last_input_tokens
+                    last_compacted_at_tokens = compaction_trigger_basis(
+                        last_input_tokens, working_messages
+                    )
                     yield ContextEditEvent(applied_edits=[applied])
 
             # Terminal tool exits the loop

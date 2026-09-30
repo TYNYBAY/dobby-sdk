@@ -530,3 +530,19 @@ def test_next_request_cannot_exceed_window_before_compaction(
         f"before compaction; previous input_tokens={previous} "
         f"production_trigger_tokens={policy.trigger_tokens} compacted={compacted}"
     )
+
+
+def test_huge_tool_result_alone_exceeding_window_triggers_compaction() -> None:
+    """A single tool round-trip can exceed the window even when prior usage was zero."""
+    policy = _require_policy(128_000, "0.80", keep_last_n=0)
+    tool = _huge_tool((128_000 + 10) * 4)
+    messages = [UserMessagePart(parts=[TextPart(text="seed")])]
+    turns = [
+        ([_tool_call("c1", name="huge")], _usage(0)),
+        ([], _usage(0)),
+    ]
+    events, captured, _executor = _drive(policy, turns, messages, tools=[tool])
+    assert len(captured) == 2
+    assert estimate_input_tokens(captured[0]) <= policy.context_window
+    assert _compacted(captured[1], policy.placeholder) or bool(_edits(events))
+    assert estimate_input_tokens(captured[1]) <= policy.context_window

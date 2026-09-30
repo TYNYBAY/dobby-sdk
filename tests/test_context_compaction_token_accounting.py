@@ -15,7 +15,7 @@ from tests.compaction_subject import load_recovered
 load_recovered()
 
 from recovered_dobby import AgentExecutor, ContextEditEvent, ContextPolicy
-from recovered_dobby.context._tokens import estimate_input_tokens
+from recovered_dobby.context._tokens import compaction_trigger_basis, estimate_input_tokens
 from recovered_dobby.executor import _compaction_triggered
 from recovered_dobby.tools import Tool
 from recovered_dobby.types import (
@@ -50,6 +50,44 @@ def _huge_tool(chars: int) -> Tool:
             return {"blob": "H" * chars}
 
     return _HugeTool()
+
+
+def _verbose_dict_tool(data_chars: int) -> Tool:
+    """Return a dict tool result; ``str(result)`` inflates char estimates vs raw text alone."""
+
+    class _VerboseDictTool(Tool):
+        name = "fetch"
+        description = "Return a structured payload."
+
+        def __call__(self) -> dict[str, object]:
+            return {
+                "data": "x" * data_chars,
+                "meta": {"source": "fixture", "padding": "p" * 256},
+            }
+
+    return _VerboseDictTool()
+
+
+def _estimate_after_verbose_tool_result(data_chars: int) -> int:
+    """Mirror ``AgentExecutor._emit_tool_result`` wire shape for sizing."""
+    result = {
+        "data": "x" * data_chars,
+        "meta": {"source": "fixture", "padding": "p" * 256},
+    }
+    messages = [
+        UserMessagePart(parts=[TextPart(text="hi")]),
+        AssistantMessagePart(parts=[ToolUsePart(id="c1", name="fetch", inputs={})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="c1",
+                    name="fetch",
+                    parts=[TextPart(text=str(result))],
+                )
+            ]
+        ),
+    ]
+    return estimate_input_tokens(messages)
 
 
 def _usage(input_tokens: int | None) -> Usage | None:
@@ -354,6 +392,161 @@ def test_usage_disappears_keeps_last_count_without_re_estimating() -> None:
 def test_character_estimate_is_chars_div_four() -> None:
     messages = [UserMessagePart(parts=[TextPart(text="abcd")])]
     assert estimate_input_tokens(messages) == 1
+
+
+def test_compaction_trigger_basis_prefers_outgoing_estimate() -> None:
+    policy = _policy()
+    trigger = policy.trigger_tokens
+    small = [UserMessagePart(parts=[TextPart(text="hi")])]
+    assert compaction_trigger_basis(trigger - 1, small) == trigger - 1
+    huge = [UserMessagePart(parts=[TextPart(text="H" * ((trigger + 1) * 4))])]
+    assert compaction_trigger_basis(trigger - 1, huge) >= trigger
+
+
+def test_compaction_triggered_fires_on_outgoing_context_after_huge_tool() -> None:
+    policy = _policy()
+    trigger = policy.trigger_tokens
+    small = [UserMessagePart(parts=[TextPart(text="hi")])]
+    assert _compaction_triggered(trigger - 1, policy, None, outgoing_messages=small) is False
+    outgoing = [
+        UserMessagePart(parts=[TextPart(text="hi")]),
+        AssistantMessagePart(parts=[ToolUsePart(id="c1", name="huge", inputs={})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="c1",
+                    name="huge",
+                    parts=[TextPart(text="H" * ((policy.context_window + 10) * 4))],
+                )
+            ]
+        ),
+    ]
+    assert _compaction_triggered(trigger - 1, policy, None, outgoing_messages=outgoing) is True
+
+
+def test_chars_four_inflation_below_trigger_does_not_compact_early() -> None:
+    """Regression: max(reported, estimate) must stay off trigger when estimate is inflated but sub-threshold."""
+    policy = _policy(window=128_000, pct=0.8)
+    trigger = policy.trigger_tokens
+    # Accurate provider count for the small first send (well below trigger_pct).
+    reported = 5_000
+    assert reported < trigger
+
+    target_estimate = trigger - 2_000
+    assert target_estimate < trigger
+    low, high = 0, (target_estimate + 1) * 4
+    data_chars = high
+    while low < high:
+        mid = (low + high) // 2
+        if _estimate_after_verbose_tool_result(mid) < target_estimate:
+            low = mid + 1
+        else:
+            high = mid
+    while _estimate_after_verbose_tool_result(data_chars) > target_estimate:
+        data_chars -= 1
+    outgoing_estimate = _estimate_after_verbose_tool_result(data_chars)
+    assert reported < outgoing_estimate < trigger, (
+        f"reported={reported} outgoing_estimate={outgoing_estimate} trigger={trigger}"
+    )
+    result = {
+        "data": "x" * data_chars,
+        "meta": {"source": "fixture", "padding": "p" * 256},
+    }
+    outgoing = [
+        UserMessagePart(parts=[TextPart(text="hi")]),
+        AssistantMessagePart(parts=[ToolUsePart(id="c1", name="fetch", inputs={})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="c1",
+                    name="fetch",
+                    parts=[TextPart(text=str(result))],
+                )
+            ]
+        ),
+    ]
+    assert _compaction_triggered(reported, policy, None, outgoing_messages=outgoing) is False
+
+    tool = _verbose_dict_tool(data_chars)
+    messages = [UserMessagePart(parts=[TextPart(text="hi")])]
+    turns = [
+        ([_tool_call("c1", name="fetch")], _usage(reported)),
+        ([], _usage(reported)),
+    ]
+    events, captured = _drive(policy, turns, messages, tools=[tool])
+    assert _edits(events) == []
+    assert not _trim_applied(captured[1])
+    assert estimate_input_tokens(captured[1]) == outgoing_estimate
+
+
+def test_outgoing_estimate_crossing_trigger_still_compacts_with_below_threshold_usage() -> None:
+    """When chars/4 on the outgoing list reaches trigger_tokens, compaction must run."""
+    policy = _policy(window=128_000, pct=0.8, keep_last_n=0)
+    trigger = policy.trigger_tokens
+    reported = trigger - 10_000
+    assert reported < trigger
+
+    target_estimate = trigger + 500
+    data_chars = (target_estimate + 1) * 4
+    while _estimate_after_verbose_tool_result(data_chars) < target_estimate:
+        data_chars += 256
+
+    outgoing_estimate = _estimate_after_verbose_tool_result(data_chars)
+    assert reported < trigger <= outgoing_estimate
+    outgoing = [
+        UserMessagePart(parts=[TextPart(text="hi")]),
+        AssistantMessagePart(parts=[ToolUsePart(id="c1", name="fetch", inputs={})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="c1",
+                    name="fetch",
+                    parts=[TextPart(text=str({"data": "x" * data_chars, "meta": {"source": "fixture", "padding": "p" * 256}}))],
+                )
+            ]
+        ),
+    ]
+    assert _compaction_triggered(reported, policy, None, outgoing_messages=outgoing) is True
+
+    tool = _verbose_dict_tool(data_chars)
+    messages = [UserMessagePart(parts=[TextPart(text="hi")])]
+    turns = [
+        ([_tool_call("c1", name="fetch")], _usage(reported)),
+        ([], _usage(reported)),
+    ]
+    events, captured = _drive(policy, turns, messages, tools=[tool])
+    assert len(_edits(events)) == 1
+    assert _trim_applied(captured[1])
+
+
+def test_huge_tool_after_below_threshold_usage_compacts_before_second_send() -> None:
+    """Regression: reported usage just under trigger_pct must still compact after a huge result."""
+    policy = _policy(window=128_000, pct=0.8, keep_last_n=0)
+    previous = policy.trigger_tokens - 1
+    tool = _huge_tool((policy.context_window + 10) * 4)
+    messages = [UserMessagePart(parts=[TextPart(text="hi")])]
+    turns = [
+        ([_tool_call("c1", name="huge")], _usage(previous)),
+        ([], _usage(previous)),
+    ]
+    events, captured = _drive(policy, turns, messages, tools=[tool])
+    assert len(_edits(events)) == 1
+    assert _trim_applied(captured[1])
+    assert estimate_input_tokens(captured[1]) <= policy.context_window
+
+
+def test_huge_tool_with_missing_usage_on_prior_turn_compacts_via_outgoing_estimate() -> None:
+    policy = _policy(window=128_000, pct=0.8, keep_last_n=0)
+    tool = _huge_tool((policy.context_window + 10) * 4)
+    messages = [UserMessagePart(parts=[TextPart(text="hi")])]
+    turns = [
+        ([_tool_call("c1", name="huge")], None),
+        ([], _usage(0)),
+    ]
+    events, captured = _drive(policy, turns, messages, tools=[tool])
+    assert len(_edits(events)) == 1
+    assert _trim_applied(captured[1])
+    assert estimate_input_tokens(captured[1]) <= policy.context_window
 
 
 @pytest.mark.parametrize(

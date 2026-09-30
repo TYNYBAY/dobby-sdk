@@ -40,3 +40,19 @@ def estimate_input_tokens(messages: list[MessagePart]) -> int:
     """
     chars = sum(len(part_to_text(part)) for msg in messages for part in msg.parts)
     return chars // 4
+
+
+def compaction_trigger_basis(
+    last_input_tokens: int | None,
+    outgoing_messages: list[MessagePart],
+) -> int | None:
+    """Token count used to decide whether to compact before the next model call.
+
+    Provider-reported input from the previous turn is combined with a char
+    estimate of the live outgoing message list so tool results appended after
+    that turn still count toward the trigger.
+    """
+    if last_input_tokens is None:
+        return None
+    estimated = estimate_input_tokens(outgoing_messages)
+    return max(last_input_tokens, estimated)
