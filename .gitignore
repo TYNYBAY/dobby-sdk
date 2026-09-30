@@ -12,3 +12,6 @@ wheels/
 .venv
 
 .env
+
+# Local investigation records (not part of the SDK)
+testing/
