@@ -16,7 +16,6 @@ from dobby import AgentExecutor as CurrentAgentExecutor
 from dobby.tools import Tool as CurrentTool
 from dobby.types import StreamEndEvent as CurrentStreamEndEvent
 from dobby.types import TextPart as CurrentTextPart
-from dobby.types import ToolResultEvent
 from dobby.types import ToolResultPart as CurrentToolResultPart
 from dobby.types import ToolUsePart as CurrentToolUsePart
 from dobby.types import Usage as CurrentUsage

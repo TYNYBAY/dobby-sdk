@@ -141,7 +141,7 @@ When context compaction is enabled (`ContextPolicy` on `AgentExecutor`), older t
 
 **Trim placeholder** — in `mode="trim"`, cleared tool results keep the same `ToolResultPart` shell but replace inner text with the policy placeholder (default `[Tool result cleared to save context.]`). The assistant `ToolUsePart` and `tool_use_id` are unchanged.
 
-**Summary turn** — in `mode="summarize"` (automatic or via `CompactContextTool`), replaced spans become a single user message:
+**Summary turn** — in `mode="summarize"` (automatic or via `CompactContextTool`), the clearable span becomes a single user message. That span runs from the first older tool round-trip through the last one and includes any messages between those round-trips:
 
 ```python
 UserMessagePart(parts=[TextPart(text="<summary>Concise digest of older tool interactions...</summary>")])

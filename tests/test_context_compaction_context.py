@@ -6,10 +6,10 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock
 
-import pytest
 from pydantic import ValidationError
+import pytest
 
-from dobby.context import ContextPolicy, SUMMARIZE_PROMPT, edit_context, summarize_context
+from dobby.context import SUMMARIZE_PROMPT, ContextPolicy, edit_context, summarize_context
 from dobby.types import (
     AssistantMessagePart,
     StreamEndEvent,

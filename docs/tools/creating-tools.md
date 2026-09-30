@@ -33,7 +33,7 @@ class SearchTool(Tool):
 | `requires_approval` | `bool` | False | Needs human approval |
 | `stream_output` | `bool` | False | Yields streaming events |
 | `terminal` | `bool` | False | Exits agent loop when called |
-| `edits_context` | `bool` | False | After a successful invocation, run summarize-mode compaction (requires `context_policy`) |
+| `edits_context` | `bool` | False | Summarize after the tool result when `context_policy` is set. A non-retryable error is skipped |
 
 ---
 
@@ -42,7 +42,9 @@ class SearchTool(Tool):
 Set `edits_context = True` on a tool when invoking it should compact conversation context. The executor:
 
 1. Runs the tool and yields the normal `ToolResultEvent` (result appended to the **working** message list).
-2. If `context_policy` is set and no compaction edit ran yet this turn, calls the summarize path independently of `ContextPolicy.mode` (not trim, even when automatic compaction is `"trim"`).
+2. If `context_policy` is set and no compaction edit ran yet this turn, calls the summarize path independently of `ContextPolicy.mode` (not trim, even when automatic compaction is `"trim"`). A non-retryable failure (`is_error=True` and `retry_model=False`) skips that step.
+
+Model correction still skips the rest of the batch. Approval and cancellation still propagate. A retryable failure is retried first; summarize runs only when that retry finishes without a non-retryable error.
 
 Custom `edits_context` tools may include an `instructions` input; the executor forwards it to the summarizer as `extra_instructions`. The built-in `CompactContextTool` is the standard agent-facing entry point.
 

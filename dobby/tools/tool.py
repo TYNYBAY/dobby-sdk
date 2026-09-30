@@ -94,8 +94,10 @@ class Tool:
     edits_context: ClassVar[bool] = False
     """If True, this tool compacts the conversation context when invoked.
 
-    The executor routes it through summarize after the tool result is recorded.
-    That step requires a ``context_policy``; otherwise only the tool result is kept.
+    After a successful result is recorded, the executor routes it through
+    summarize. A non-retryable error (``is_error`` and not ``retry_model``)
+    does not. That step requires a ``context_policy``; otherwise only the tool
+    result is kept.
     """
 
     # Auto-generated class variables (set by __init_subclass__)

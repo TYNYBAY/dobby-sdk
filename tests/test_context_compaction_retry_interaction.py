@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from dobby import AgentExecutor as CurrentAgentExecutor
 from dobby.tools import Tool as CurrentTool
 from dobby.types import StreamEndEvent as CurrentStreamEndEvent

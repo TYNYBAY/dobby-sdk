@@ -15,6 +15,7 @@ from dobby.context import ContextPolicy
 from dobby.context._tokens import compaction_trigger_basis, estimate_input_tokens
 from dobby.context.summarize import summarize_context
 from dobby.executor import _compaction_triggered
+from dobby.providers.base import ProviderError
 from dobby.providers.gemini.converters import to_gemini_messages
 from dobby.tools import Tool
 from dobby.types import (
@@ -105,8 +106,18 @@ def _result_texts(messages: list[Any]) -> list[str]:
 class _Scripted:
     """One agent turn per streaming chat; ``stream=False`` is the summarizer."""
 
-    def __init__(self, turns: list[tuple[list[Any], Usage | None]]) -> None:
+    name = "scripted"
+
+    def __init__(
+        self,
+        turns: list[tuple[list[Any], Usage | None]],
+        *,
+        summary_text: str = "digest-kept",
+        summary_error: Exception | None = None,
+    ) -> None:
         self.turns = turns
+        self.summary_text = summary_text
+        self.summary_error = summary_error
         self.agent_calls: list[list[Any]] = []
         self.summarize_calls: list[list[Any]] = []
         self._index = 0
@@ -114,9 +125,11 @@ class _Scripted:
     async def chat(self, messages: list[Any], **kwargs: Any) -> Any:
         if kwargs.get("stream") is False:
             self.summarize_calls.append(list(messages))
+            if self.summary_error is not None:
+                raise self.summary_error
             return StreamEndEvent(
                 model="summarizer",
-                parts=[TextPart(text="digest-kept")],
+                parts=[TextPart(text=self.summary_text)],
                 stop_reason="end_turn",
                 usage=_usage(0),
             )
@@ -188,8 +201,10 @@ def _drive(
     messages: list[Any],
     *,
     tools: list[Tool] | None = None,
+    summary_text: str = "digest-kept",
+    summary_error: Exception | None = None,
 ) -> tuple[list[Any], _Scripted]:
-    provider = _Scripted(turns)
+    provider = _Scripted(turns, summary_text=summary_text, summary_error=summary_error)
     executor = AgentExecutor(
         "openai",
         provider,  # type: ignore[arg-type]
@@ -328,6 +343,67 @@ def test_huge_tool_result_compacts_before_second_send() -> None:
     )
     assert _trim_applied(provider.agent_calls[1])
     assert estimate_input_tokens(provider.agent_calls[1]) <= policy.context_window
+    assert caller == snapshot
+
+
+def test_blank_summary_does_not_retry_until_context_grows() -> None:
+    """A whitespace digest watermarks the current basis and retries only after growth."""
+    policy = _policy(keep_last_n=1, mode="summarize")
+    trigger = policy.trigger_tokens
+    caller = _history(pairs=3)
+    snapshot = copy.deepcopy(caller)
+    events, provider = _drive(
+        policy,
+        [
+            ([ToolUsePart(id="t1", name="noop", inputs={})], _usage(trigger)),
+            ([ToolUsePart(id="t2", name="noop", inputs={})], _usage(trigger)),
+            ([ToolUsePart(id="t3", name="huge", inputs={})], _usage(trigger)),
+            ([], _usage(trigger)),
+        ],
+        caller,
+        tools=[_NoopTool(), _HugeTool()],
+        summary_text="  \n\t ",
+    )
+    # Turn 2 blanks and watermarks. Turn 3 is the same basis. The huge result
+    # makes turn 4's basis larger, so the summarizer runs once more.
+    assert len(provider.summarize_calls) == 2
+    assert not any(isinstance(event, ContextEditEvent) for event in events)
+    assert caller == snapshot
+    assert all("<summary>" not in text for text in _result_texts(provider.agent_calls))
+
+
+def test_summarize_provider_error_does_not_advance_watermark() -> None:
+    """A summarizer ProviderError aborts the run and is not a completed attempt."""
+    policy = _policy(keep_last_n=1, mode="summarize")
+    trigger = policy.trigger_tokens
+    caller = _history(pairs=3)
+    snapshot = copy.deepcopy(caller)
+    provider = _Scripted(
+        [
+            ([ToolUsePart(id="t1", name="noop", inputs={})], _usage(trigger)),
+            ([ToolUsePart(id="t2", name="noop", inputs={})], _usage(trigger)),
+            ([], _usage(trigger)),
+        ],
+        summary_error=ProviderError("summarizer down"),
+    )
+    executor = AgentExecutor(
+        "openai",
+        provider,  # type: ignore[arg-type]
+        tools=[_NoopTool()],
+        context_policy=policy,
+    )
+    events: list[Any] = []
+
+    async def run() -> None:
+        async for event in executor.run_stream(caller, max_iterations=3):
+            events.append(event)
+
+    with pytest.raises(ProviderError, match="summarizer down"):
+        asyncio.run(run())
+
+    assert len(provider.summarize_calls) == 1
+    assert len(provider.agent_calls) == 1
+    assert not any(isinstance(event, ContextEditEvent) for event in events)
     assert caller == snapshot
 
 

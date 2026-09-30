@@ -21,9 +21,10 @@ class CompactContextTool(Tool):
     the call returns the normal confirmation dict and does not summarize. When a
     policy is set, the executor records the tool result first, then runs
     summarize (never trim) with ``instructions`` and optional ``keep_last_n``
-    overriding the policy default. At most one compaction edit runs per agent
-    turn; an automatic compaction earlier in the same turn skips the summarize
-    step for ``compact_context``.
+    overriding the policy default. A non-retryable tool error does not
+    summarize. At most one compaction edit runs per agent turn; an automatic
+    compaction earlier in the same turn skips the summarize step for
+    ``compact_context``.
     """
 
     name = "compact_context"

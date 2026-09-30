@@ -298,6 +298,36 @@ def test_parallel_correction_skips_compact_tool() -> None:
     assert _edits(events) == []
 
 
+def test_non_retryable_edits_context_failure_does_not_summarize() -> None:
+    """``is_error`` without ``retry_model`` records the failure and skips summarize."""
+
+    @dataclass
+    class _FailingCompact(Tool):
+        name = "compact_context"
+        description = "Fail without asking the model to retry."
+        edits_context = True
+
+        def __call__(self, instructions: str, keep_last_n: int | None = None) -> dict[str, str]:
+            raise RuntimeError("compact failed")
+
+    caller = _history()
+    snapshot = copy.deepcopy(caller)
+    events, provider = _drive(
+        [([_compact_call()], _usage(0)), ([], _usage(0))],
+        caller,
+        [_FailingCompact()],
+        policy=_policy(keep_last_n=1),
+    )
+    results = _results(events)
+    assert len(results) == 1
+    assert results[0].is_error is True
+    assert results[0].name == "compact_context"
+    assert str(results[0].result).startswith("[tool_execution_error]")
+    assert provider.summarize_calls == []
+    assert _edits(events) == []
+    assert caller == snapshot
+
+
 def test_host_retry_runs_before_a_single_summarize() -> None:
     calls = 0
 

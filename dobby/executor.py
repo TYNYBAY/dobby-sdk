@@ -26,8 +26,9 @@ from ._context import (
     tool_name_var,
 )
 from ._logging import logger
-from .context import ContextPolicy, edit_context, summarize_context
+from .context import ContextPolicy, edit_context
 from .context._tokens import compaction_trigger_basis, estimate_input_tokens
+from .context.summarize import _summarize_attempt
 from .exceptions import (
     ApprovalRequired,
     ErrorCode,
@@ -724,10 +725,13 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     # Transient view. working_messages and the caller list stay intact.
                     send_messages, applied = edit_context(working_messages, policy)
                 else:
-                    # Summarize writes back into the working copy, computed once.
-                    applied = await summarize_context(working_messages, policy, self.llm)
+                    # Summarize writes a non-empty digest back into the working copy.
+                    # A finished call with no usable digest still advances the
+                    # watermark. ProviderError propagates and does not.
+                    attempt = await _summarize_attempt(working_messages, policy, self.llm)
+                    applied = attempt.applied
                     send_messages = working_messages
-                    if applied is not None:
+                    if applied is not None or attempt.blank_digest:
                         last_compacted_at_tokens = compaction_trigger_basis(
                             last_input_tokens, working_messages
                         )
@@ -1050,8 +1054,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             break
 
                         # Tool result is already on working_messages. Summarize only
-                        # when this turn has not already applied an edit.
+                        # when this turn has not already applied an edit and this
+                        # invocation did not finish as a non-retryable error.
                         if policy is None or compaction_in_progress:
+                            continue
+                        if call_result.is_error and not call_result.retry_model:
                             continue
                         compaction_in_progress = True
                         effective_policy = policy
@@ -1060,17 +1067,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             effective_policy = policy.model_copy(
                                 update={"keep_last_n": keep_override}
                             )
-                        applied = await summarize_context(
+                        attempt = await _summarize_attempt(
                             working_messages,
                             effective_policy,
                             self.llm,
                             extra_instructions=tc.inputs.get("instructions"),
                         )
-                        if applied is not None:
+                        if attempt.applied is not None or attempt.blank_digest:
                             last_compacted_at_tokens = compaction_trigger_basis(
                                 last_input_tokens, working_messages
                             )
-                            yield ContextEditEvent(applied_edits=[applied])
+                        if attempt.applied is not None:
+                            yield ContextEditEvent(applied_edits=[attempt.applied])
                     else:
                         # Terminal tool exits the loop
                         if terminal_calls:

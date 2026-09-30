@@ -126,13 +126,13 @@ At most **one** compaction edit is applied per agent turn. If automatic compacti
 | `mode` | Behavior on automatic trigger | Working list after edit |
 |--------|------------------------------|-------------------------|
 | `"trim"` | Builds a **transient** send view: older tool-result payloads become `placeholder` (default `[Tool result cleared to save context.]`), keeping assistant tool-use messages and `tool_use_id` pairing intact. | Unchanged (trim is recomputed each trigger). |
-| `"summarize"` | One non-streaming LLM call replaces older **complete** tool round-trips with a single user message `TextPart` wrapped in `<summary>...</summary>`. | Updated in the working copy; watermark prevents repeating at the same basis. |
+| `"summarize"` | One non-streaming LLM call replaces the clearable span — from the first older tool round-trip through the last, including any messages between them — with a single user message `TextPart` wrapped in `<summary>...</summary>`. | Updated in the working copy; the watermark blocks another summarize at the same combined basis, not for the whole growth episode. |
 
 **`keep_last_n`**: the most recent *N* complete tool round-trips (assistant tool-use immediately followed by user tool-result) stay verbatim. An in-flight tool use with no result yet is never a compaction candidate.
 
-**Empty summary**: if the summarizer returns only whitespace, no edit is applied, no `ContextEditEvent` is emitted, and message lists stay unchanged for that attempt.
+**Empty summary**: if the summarizer returns only whitespace, no edit is applied, no `ContextEditEvent` is emitted, and message lists stay unchanged. That completed attempt still advances the summarize watermark, so the same combined token basis does not call the summarizer again. Summarize runs again when the basis changes because the context grew.
 
-**Summarization failure**: if the compaction LLM call raises `ProviderError`, the run aborts with that error, no `ContextEditEvent` is emitted, and history is left intact (no partial summarize write-back).
+**Summarization failure**: if the compaction LLM call raises `ProviderError`, the run aborts with that error, no `ContextEditEvent` is emitted, the watermark is not advanced, and history is left intact (no partial summarize write-back).
 
 Agent-invoked compaction via `CompactContextTool` always uses the summarize path (never trim). See [Built-in Tools](./tools/built-in-tools.md#compact-context-tool).
 

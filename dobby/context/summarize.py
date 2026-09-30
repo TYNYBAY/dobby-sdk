@@ -1,9 +1,13 @@
 """LLM-backed summarize: replace an old span of turns with one ``<summary>`` turn.
 
 Unlike trim (deterministic, recomputed each turn), summarize issues one model
-call and writes the result *back* into the live message list so it is computed
-once per growth episode (gated by a watermark in the executor).
+call and writes a non-empty digest *back* into the live message list. The
+executor watermarks that edit, and also a completed attempt whose digest is
+empty, so the same combined token basis does not summarize again. A later
+change in that basis can summarize again. A provider failure is not watermarked.
 """
+
+from typing import NamedTuple
 
 from ..types import (
     AppliedEdit,
@@ -24,6 +28,19 @@ SUMMARIZE_PROMPT = (
 )
 
 
+class _SummarizeAttempt(NamedTuple):
+    """Outcome of one summarize pass.
+
+    ``blank_digest`` is true only when the model call finished and produced no
+    usable text. It stays false when nothing was eligible to summarize, when an
+    edit was written, and when ``llm.chat`` raises (the exception propagates
+    and this result is never returned).
+    """
+
+    applied: AppliedEdit | None
+    blank_digest: bool
+
+
 def _span_text(messages: list[MessagePart]) -> str:
     """Render a span of messages as plain role-tagged text for the summarizer."""
     lines = []
@@ -42,12 +59,16 @@ async def summarize_context(
 ) -> AppliedEdit | None:
     """Summarize the old span of ``messages`` in place, write-back style.
 
-    Selects the tool round-trips older than ``policy.keep_last_n`` (whole turns,
-    never the in-flight pair), summarizes that span with one non-streaming model
-    call reusing ``llm``, and **replaces** the span in the ``messages`` list with a
-    single new ``<summary>`` user turn. Only the list entries are mutated — fresh
-    dataclass instances are created, so the caller's part objects are never
-    touched. The replaced originals are stashed on the returned edit.
+    Selects tool round-trips older than ``policy.keep_last_n`` (never an
+    in-flight tool use). The clearable span runs from the first of those
+    tool-use messages through the last of their tool-result messages and
+    includes any messages in between. One non-streaming model call reusing
+    ``llm`` summarizes that span, then **replaces** it in ``messages`` with a
+    single new ``<summary>`` user turn. Only the list entries are mutated —
+    fresh dataclass instances are created, so the caller's part objects are
+    never touched. The replaced originals are stashed on the returned edit.
+    The executor, not this function, suppresses another attempt at the same
+    combined token basis.
 
     Args:
         messages: The live working message list (mutated in place).
@@ -58,11 +79,29 @@ async def summarize_context(
 
     Returns:
         An :class:`AppliedEdit` describing the summarize, or ``None`` when there
-        is nothing older than ``keep_last_n`` to summarize.
+        is nothing older than ``keep_last_n`` to summarize or the model returns
+        an empty digest. An empty digest does not mutate ``messages``. Errors
+        from ``llm.chat``, including :class:`~dobby.providers.base.ProviderError`,
+        propagate to the caller.
+    """
+    return (await _summarize_attempt(messages, policy, llm, extra_instructions=extra_instructions)).applied
+
+
+async def _summarize_attempt(
+    messages: list[MessagePart],
+    policy: ContextPolicy,
+    llm,
+    *,
+    extra_instructions: str | None = None,
+) -> _SummarizeAttempt:
+    """Shared implementation of :func:`summarize_context`.
+
+    The executor uses ``blank_digest`` to advance its watermark without
+    emitting a :class:`~dobby.types.tool_events.ContextEditEvent`.
     """
     pairs = _find_tool_pairs(messages)
     if len(pairs) <= policy.keep_last_n:
-        return None
+        return _SummarizeAttempt(None, False)
 
     clearable = pairs[: len(pairs) - policy.keep_last_n]
     span_start = clearable[0][0]  # first tool-use index
@@ -74,6 +113,7 @@ async def summarize_context(
         prompt = f"{SUMMARIZE_PROMPT}\n\nAdditional instructions: {extra_instructions}"
 
     # stream=False returns a single StreamEndEvent value to await.
+    # ProviderError and other chat failures propagate; they are not blank digests.
     result: StreamEndEvent = await llm.chat(
         [UserMessagePart(parts=[TextPart(text=_span_text(span))])],
         system_prompt=prompt,
@@ -82,15 +122,18 @@ async def summarize_context(
     )
     summary_text = "".join(p.text for p in result.parts if isinstance(p, TextPart)).strip()
     if not summary_text:
-        return None
+        return _SummarizeAttempt(None, True)
 
     summary_msg = UserMessagePart(parts=[TextPart(text=f"<summary>{summary_text}</summary>")])
     replaced_originals = list(span)
     messages[span_start : span_end + 1] = [summary_msg]
 
-    return AppliedEdit(
-        type="summarize",
-        cleared_tool_uses=len(clearable),
-        summary_text=summary_text,
-        replaced_originals=replaced_originals,
+    return _SummarizeAttempt(
+        AppliedEdit(
+            type="summarize",
+            cleared_tool_uses=len(clearable),
+            summary_text=summary_text,
+            replaced_originals=replaced_originals,
+        ),
+        False,
     )

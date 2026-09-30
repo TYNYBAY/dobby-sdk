@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from typing import Annotated, Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from dobby import AgentExecutor as CurrentAgentExecutor
 from dobby.exceptions import ModelRetryExhaustedError
 from dobby.tools import Tool as CurrentTool

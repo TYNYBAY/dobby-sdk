@@ -15,8 +15,6 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock
 
-import pytest
-
 from dobby import AgentExecutor as CurrentAgentExecutor
 from dobby.exceptions import ModelRetry
 from dobby.tools import Tool as CurrentTool

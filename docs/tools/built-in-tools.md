@@ -75,7 +75,7 @@ executor = AgentExecutor(
 )
 ```
 
-When a `context_policy` is set, `compact_context` always uses the summarize path, regardless of `ContextPolicy.mode`. Without `context_policy`, it still executes and returns its confirmation dict, but the executor does **not** summarize.
+When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes and returns its confirmation dict, but the executor does **not** summarize.
 
 ### Parameters
 
@@ -86,13 +86,13 @@ When a `context_policy` is set, `compact_context` always uses the summarize path
 
 ### Tool result
 
-On success the model sees:
+On a successful tool call the model sees:
 
 ```python
 {"status": "context_compacted", "detail": "Older tool history has been summarized into a digest above."}
 ```
 
-Hosts should also listen for `ContextEditEvent` on the stream when summarize actually applied.
+That confirmation is not proof that an edit was applied. `ContextEditEvent` is the authoritative signal that summarize changed the working copy.
 
 ---
 

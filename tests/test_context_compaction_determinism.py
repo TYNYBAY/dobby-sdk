@@ -121,7 +121,6 @@ def _introduced_facts(turns: int) -> frozenset[str]:
 def _structure_signature(messages: list[Any]) -> tuple[Any, ...]:
     rows: list[Any] = []
     for index, message in enumerate(messages):
-        role = message.role
         for part in message.parts:
             if isinstance(part, ToolUsePart):
                 rows.append(("use", index, part.id, part.name))
