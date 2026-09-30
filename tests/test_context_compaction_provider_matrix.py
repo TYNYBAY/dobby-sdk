@@ -685,7 +685,7 @@ def test_summarization_preserves_fact_in_digest(provider_case: ProviderCase) -> 
 
 @pytest.mark.parametrize("provider_case", PROVIDER_CASES, ids=_PROVIDER_IDS)
 def test_missing_usage_metadata_fallback(provider_case: ProviderCase) -> None:
-    """When the first turn omits usage, char estimate seeds the trigger on later turns."""
+    """Omitted usage still compacts when the outgoing transcript estimate crosses the trigger."""
     policy = _trim_policy(keep_last_n=1)
     huge = "H" * (_TRIGGER * 4 + 400)
     seed = [
@@ -727,12 +727,10 @@ def test_missing_usage_metadata_fallback(provider_case: ProviderCase) -> None:
         )
     )
     assert estimate_input_tokens(seed) >= _TRIGGER
-    if provider_case.id == "anthropic":
-        # Anthropic adapter always materializes Usage on message_stop (often zero counts),
-        # so the executor never falls back to char estimate when the stream omits counts.
-        assert not any(isinstance(e, ContextEditEvent) for e in events)
-    else:
-        assert any(isinstance(e, ContextEditEvent) for e in events)
+    # Anthropic materializes Usage(0) when the stream omits counts, so the executor
+    # records reported input rather than estimating at StreamEnd. Compaction still
+    # fires: max(reported, estimate(outgoing_messages)) crosses the trigger here.
+    assert any(isinstance(e, ContextEditEvent) for e in events)
 
 
 @pytest.mark.parametrize("provider_case", PROVIDER_CASES, ids=_PROVIDER_IDS)
