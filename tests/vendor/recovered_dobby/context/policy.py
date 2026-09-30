@@ -4,6 +4,7 @@ Defines :class:`ContextPolicy`, the opt-in config object that controls when and
 how the agentic loop reduces stale tool history before each model call.
 """
 
+from decimal import ROUND_CEILING, Decimal
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -22,14 +23,14 @@ class ContextPolicy(BaseModel):
 
     Attributes:
         context_window: Total context-window size, in tokens, for the model.
-        trigger_pct: Fraction of ``context_window`` that triggers compaction.
+        trigger_pct: Fraction of ``context_window`` that triggers compaction (0.5–1.0).
         keep_last_n: Number of most-recent tool turns kept verbatim.
         mode: ``"trim"`` (deterministic, no LLM) or ``"summarize"`` (one LLM call).
         placeholder: Text substituted for cleared tool-result payloads in trim mode.
     """
 
     context_window: int = Field(default=128_000, gt=0)
-    trigger_pct: float = Field(default=0.8, gt=0, le=1)
+    trigger_pct: float = Field(default=0.8, ge=0.5, le=1)
     keep_last_n: int = Field(default=3, ge=0)
     mode: Literal["trim", "summarize"] = "trim"
     placeholder: str = "[Tool result cleared to save context.]"
@@ -39,6 +40,7 @@ class ContextPolicy(BaseModel):
         """Input-token count at which compaction fires.
 
         Returns:
-            ``int(trigger_pct * context_window)``.
+            ``ceil(trigger_pct * context_window)`` using exact decimal arithmetic.
         """
-        return int(self.trigger_pct * self.context_window)
+        line = Decimal(str(self.trigger_pct)) * self.context_window
+        return int(line.to_integral_value(rounding=ROUND_CEILING))

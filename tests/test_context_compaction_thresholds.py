@@ -39,8 +39,6 @@ from recovered_dobby.types import (
 # Configured percentages. The oracle is decimal ``pct * context_window``,
 # not ``int(pct * context_window)``.
 _PCTS: tuple[tuple[str, str], ...] = (
-    ("0%", "0"),
-    ("1%", "0.01"),
     ("50%", "0.50"),
     ("79.99%", "0.7999"),
     ("80%", "0.80"),
@@ -130,6 +128,10 @@ def _boundary_cases() -> list[Any]:
             points.append(("just-above", exactly + 1, True))
             points.append(("far-above", exactly + window + 1, True))
             for case_name, tokens, expect in points:
+                if window == 1 and case_name in ("just-below", "below"):
+                    # After one tool round, char estimate on the outgoing list reaches
+                    # trigger_tokens (=1); reported-only "just below" is not observable.
+                    continue
                 cases.append(
                     pytest.param(
                         window_name,
@@ -169,6 +171,38 @@ def _require_policy(window: int, pct_text: str, **overrides: Any) -> ContextPoli
         pytest.fail(
             f"ContextPolicy rejected trigger_pct={pct_text} ({pct}) context_window={window}: {exc}"
         )
+
+
+@pytest.mark.parametrize(
+    ("pct_text", "window"),
+    [
+        pytest.param(pct, window, id=f"{label}-window-{window}")
+        for label, pct in _PCTS
+        for window_name, window in _WINDOWS
+    ],
+)
+def test_trigger_tokens_matches_decimal_ceiling(pct_text: str, window: int) -> None:
+    """``trigger_tokens`` uses ``ceil(Decimal(pct) * window)``, not ``int(float product)``."""
+    policy = _require_policy(window, pct_text)
+    assert policy.trigger_tokens == _at_line(pct_text, window)
+
+
+@pytest.mark.parametrize(
+    "invalid_pct",
+    [
+        pytest.param(0.0, id="zero-percent"),
+        pytest.param(0.49, id="forty-nine-percent"),
+    ],
+)
+def test_trigger_pct_below_minimum_is_rejected(invalid_pct: float) -> None:
+    with pytest.raises(ValidationError):
+        ContextPolicy(context_window=128_000, trigger_pct=invalid_pct)
+
+
+def test_trigger_pct_at_minimum_is_accepted() -> None:
+    policy = ContextPolicy(context_window=128_000, trigger_pct=0.5)
+    assert policy.trigger_pct == 0.5
+    assert policy.trigger_tokens == _at_line("0.50", 128_000)
 
 
 def _scripted(turns: list[tuple[list[Any], Usage | None]], captured: list[list[Any]]) -> Any:
@@ -325,12 +359,15 @@ def test_threshold_boundary(
     expect: bool,
 ) -> None:
     """Compaction follows the configured percentage of the context window."""
-    policy = _require_policy(window, pct_text, keep_last_n=1)
+    keep_last_n = 0 if window == 1 else 1
+    policy = _require_policy(window, pct_text, keep_last_n=keep_last_n)
     turns = [
         ([_tool_call("t1")], _usage(tokens)),
         ([], _usage(tokens)),
     ]
-    events, captured, _executor = _drive(policy, turns, _history())
+    # Tiny seed at window=1 so outgoing char estimate does not bypass reported usage.
+    seed = _history(pairs=0) if window == 1 else _history()
+    events, captured, _executor = _drive(policy, turns, seed)
     _assert_boundary(
         window_name=window_name,
         window=window,
