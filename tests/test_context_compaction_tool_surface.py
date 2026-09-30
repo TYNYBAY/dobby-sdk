@@ -183,7 +183,9 @@ def test_compact_tool_emits_summary_event_and_preserves_caller() -> None:
     assert edits[0].applied_edits[0].type == "summarize"
     assert edits[0].applied_edits[0].summary_text == "digest-kept"
     assert _results(events)[0].result["status"] == "context_compacted"
-    assert any("<summary>digest-kept</summary>" in str(message) for message in provider.agent_calls[1])
+    assert any(
+        "<summary>digest-kept</summary>" in str(message) for message in provider.agent_calls[1]
+    )
     assert caller == snapshot
 
 
@@ -221,6 +223,33 @@ def test_automatic_trim_and_compact_tool_do_not_both_compact() -> None:
     assert edits
     assert all(edit.applied_edits[0].type == "clear_tool_uses" for edit in edits)
     assert any(result.name == "compact_context" for result in _results(events))
+
+
+def test_negative_keep_last_n_is_a_model_correction() -> None:
+    """``keep_last_n=-1`` fails input validation and never reaches ``ContextPolicy``."""
+    tool = CompactContextTool()
+    events, provider = _drive(
+        [
+            (
+                [
+                    ToolUsePart(
+                        id="bad",
+                        name="compact_context",
+                        inputs={"instructions": "keep ids", "keep_last_n": -1},
+                    )
+                ],
+                _usage(0),
+            ),
+            ([], _usage(0)),
+        ],
+        _history(),
+        [tool],
+        policy=_policy(),
+    )
+    assert provider.summarize_calls == []
+    assert _edits(events) == []
+    assert str(_results(events)[0].result).startswith("[tool_input_invalid]")
+    assert _results(events)[0].is_error is True
 
 
 def test_invalid_compact_call_is_a_model_correction() -> None:
@@ -494,5 +523,7 @@ def test_compact_tool_runs_after_parallel_and_streaming_before_terminal() -> Non
     assert names == ["echo", "streamer", "compact_context", "finish"]
     assert _results(events)[-1].is_terminal is True
     stream_at = next(i for i, event in enumerate(events) if isinstance(event, ToolStreamEvent))
-    compact_at = next(i for i, event in enumerate(events) if getattr(event, "name", None) == "compact_context")
+    compact_at = next(
+        i for i, event in enumerate(events) if getattr(event, "name", None) == "compact_context"
+    )
     assert stream_at < compact_at

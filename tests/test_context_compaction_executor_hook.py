@@ -13,7 +13,9 @@ import pytest
 from dobby import AgentExecutor
 from dobby.context import ContextPolicy
 from dobby.context._tokens import compaction_trigger_basis, estimate_input_tokens
+from dobby.context.summarize import summarize_context
 from dobby.executor import _compaction_triggered
+from dobby.providers.gemini.converters import to_gemini_messages
 from dobby.tools import Tool
 from dobby.types import (
     AssistantMessagePart,
@@ -409,3 +411,55 @@ def test_host_retry_sleep_is_not_invoked_by_trim() -> None:
         )
     sleep.assert_not_called()
     assert _trim_applied(provider.agent_calls[1])
+
+
+def test_summarize_after_user_preamble_alternates_gemini_roles() -> None:
+    """A leading user message plus a summary user turn must not reach Gemini as two user roles."""
+    messages: list[Any] = [
+        UserMessagePart(parts=[TextPart(text="Find the account.")]),
+        AssistantMessagePart(parts=[ToolUsePart(id="old", name="search", inputs={"q": "old"})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="old",
+                    name="search",
+                    parts=[TextPart(text="stale ledger")],
+                )
+            ]
+        ),
+        AssistantMessagePart(parts=[ToolUsePart(id="new", name="search", inputs={"q": "new"})]),
+        UserMessagePart(
+            parts=[
+                ToolResultPart(
+                    tool_use_id="new",
+                    name="search",
+                    parts=[TextPart(text="current balance")],
+                )
+            ]
+        ),
+    ]
+    llm = AsyncMock()
+    llm.chat = AsyncMock(
+        return_value=StreamEndEvent(
+            model="summarizer",
+            parts=[TextPart(text="account lookup was stale")],
+            stop_reason="end_turn",
+            usage=_usage(0),
+        )
+    )
+
+    applied = asyncio.run(
+        summarize_context(messages, _policy(keep_last_n=1, mode="summarize"), llm)
+    )
+    assert applied is not None
+    assert [message.role for message in messages][:2] == ["user", "user"]
+
+    contents = to_gemini_messages(messages)
+    roles = [content.role for content in contents]
+    assert roles == ["user", "model", "user"]
+    assert all(roles[index] != roles[index + 1] for index in range(len(roles) - 1))
+    opening = "".join(getattr(part, "text", None) or "" for part in contents[0].parts or [])
+    assert "Find the account." in opening
+    assert "<summary>account lookup was stale</summary>" in opening
+    assert contents[1].parts[0].function_call is not None
+    assert contents[2].parts[0].function_response is not None

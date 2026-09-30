@@ -7,6 +7,8 @@ then routes the call through summarize because ``edits_context`` is true.
 from dataclasses import dataclass
 from typing import Annotated
 
+from pydantic import Field
+
 from .tool import Tool
 
 
@@ -35,7 +37,12 @@ class CompactContextTool(Tool):
         ],
         keep_last_n: Annotated[
             int | None,
-            "How many recent tool turns to keep verbatim. Omit to use the policy default.",
+            Field(
+                ge=0,
+                description=(
+                    "How many recent tool turns to keep verbatim. Omit to use the policy default."
+                ),
+            ),
         ] = None,
     ) -> dict[str, str]:
         """Return a small directive; the executor performs the actual compaction.
