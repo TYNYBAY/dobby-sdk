@@ -33,6 +33,22 @@ class SearchTool(Tool):
 | `requires_approval` | `bool` | False | Needs human approval |
 | `stream_output` | `bool` | False | Yields streaming events |
 | `terminal` | `bool` | False | Exits agent loop when called |
+| `edits_context` | `bool` | False | Summarize after the tool result when `context_policy` is set. A non-retryable error is skipped |
+
+---
+
+## Context-editing tools
+
+Set `edits_context = True` on a tool when invoking it should compact conversation context. The executor:
+
+1. Runs the tool and yields the normal `ToolResultEvent` (result appended to the **working** message list).
+2. If `context_policy` is set and no compaction edit ran yet this turn, calls the summarize path independently of `ContextPolicy.mode` (not trim, even when automatic compaction is `"trim"`). A non-retryable failure (`is_error=True` and `retry_model=False`) skips that step.
+
+Model correction still skips the rest of the batch. Approval and cancellation still propagate. A retryable failure is retried first; summarize runs only when that retry finishes without a non-retryable error.
+
+Custom `edits_context` tools may include an `instructions` input; the executor forwards it to the summarizer as `extra_instructions`. The built-in `CompactContextTool` is the standard agent-facing entry point.
+
+Without `context_policy`, `edits_context` tools behave like normal tools (no summarize step). At most one compaction edit runs per agent turn; automatic compaction earlier in the turn blocks a second summarize from `edits_context`.
 
 ---
 
@@ -352,6 +368,8 @@ async for event in executor.run_stream(messages, context=my_context):
     match event.type:
         case "tool-use":
             print(f"Calling {event.name}")
-        case "tool-result":
-            print(f"Result: {event.output}")
+        case "tool_result_event":
+            print(f"Result: {event.result}")
+        case "context_edit":
+            print(f"Compaction: {event.applied_edits}")
 ```

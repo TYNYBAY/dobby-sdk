@@ -86,6 +86,7 @@ async for event in executor.run_stream(messages):
 - **Streaming**: Real-time token streaming with typed events
 - **Tools**: Dataclass-based tools with auto-generated schemas
 - **Context injection**: Pass runtime context to tools via `Injected[T]`
+- **Context compaction (opt-in)**: `ContextPolicy` on `AgentExecutor` for automatic trim or summarize, plus optional `CompactContextTool` for agent-triggered summarize
 - **Structured output**: Pydantic model validation for agent responses
 
 ## Documentation

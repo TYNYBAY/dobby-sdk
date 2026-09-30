@@ -65,6 +65,7 @@ class Tool:
         stream_output: Whether tool yields streaming events (default: False)
         terminal: Whether tool exits the agent loop (default: False)
         sequential: Whether to force sequential execution in parallel batches (default: False)
+        edits_context: Whether invoking this tool compacts conversation context (default: False)
 
     Terminal Tools:
         When terminal=True, the AgentExecutor will:
@@ -90,6 +91,14 @@ class Tool:
     """If True, executing this tool exits the agent loop and returns control to caller."""
     sequential: ClassVar[bool] = False
     """If True, forces sequential execution when this tool is in a parallel batch."""
+    edits_context: ClassVar[bool] = False
+    """If True, this tool compacts the conversation context when invoked.
+
+    After a successful result is recorded, the executor routes it through
+    summarize. A non-retryable error (``is_error`` and not ``retry_model``)
+    does not. That step requires a ``context_policy``; otherwise only the tool
+    result is kept.
+    """
 
     # Auto-generated class variables (set by __init_subclass__)
     _parameters: ClassVar[list[ToolParameter]]
@@ -116,6 +125,12 @@ class Tool:
                         f"Tool '{cls.__name__}' has stream_output=True but __call__ "
                         "is not an async generator. Use 'async def' with 'yield'."
                     )
+
+            if not isinstance(getattr(cls, "edits_context", False), bool):
+                raise TypeError(
+                    f"Tool '{cls.__name__}' edits_context must be a bool, got "
+                    f"{type(cls.edits_context).__name__}."
+                )
 
             parameters, takes_ctx = cls._generate_schema()
             cls._parameters = parameters

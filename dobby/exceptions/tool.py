@@ -1,10 +1,14 @@
 """Tool-related exceptions."""
 
-from dataclasses import dataclass
-from typing import Any
+from __future__ import annotations
 
-from ..types.tool_events import ToolErrorDetails
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
 from .error_code import ErrorCode
+
+if TYPE_CHECKING:
+    from ..types.tool_events import ToolErrorDetails
 
 _MODEL_RETRY_CODES = frozenset(
     {
