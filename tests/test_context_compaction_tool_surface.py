@@ -13,6 +13,7 @@ import pytest
 from dobby import AgentExecutor
 from dobby.context import ContextPolicy
 from dobby.exceptions import ApprovalRequired
+from dobby.providers.base import ProviderError
 from dobby.tools import CompactContextTool, Tool
 from dobby.types import (
     AssistantMessagePart,
@@ -70,18 +71,32 @@ def _compact_call(call_id: str = "compact-1", *, keep_last_n: int | None = 1) ->
 
 
 class _Scripted:
-    def __init__(self, turns: list[tuple[list[Any], Usage | None]]) -> None:
+    name = "scripted"
+
+    def __init__(
+        self,
+        turns: list[tuple[list[Any], Usage | None]],
+        *,
+        summary_text: str = "digest-kept",
+        summary_error: Exception | None = None,
+    ) -> None:
         self.turns = turns
+        self.summary_text = summary_text
+        self.summary_error = summary_error
         self.agent_calls: list[list[Any]] = []
         self.summarize_calls: list[list[Any]] = []
+        self.summarize_prompts: list[Any] = []
         self._index = 0
 
     async def chat(self, messages: list[Any], **kwargs: Any) -> Any:
         if kwargs.get("stream") is False:
             self.summarize_calls.append(list(messages))
+            self.summarize_prompts.append(kwargs.get("system_prompt"))
+            if self.summary_error is not None:
+                raise self.summary_error
             return StreamEndEvent(
                 model="summarizer",
-                parts=[TextPart(text="digest-kept")],
+                parts=[TextPart(text=self.summary_text)],
                 stop_reason="end_turn",
                 usage=_usage(0),
             )
@@ -116,9 +131,11 @@ def _drive(
     tools: list[Tool],
     *,
     policy: ContextPolicy | None,
+    summary_text: str = "digest-kept",
+    summary_error: Exception | None = None,
     **run_kwargs: Any,
 ) -> tuple[list[Any], _Scripted]:
-    provider = _Scripted(turns)
+    provider = _Scripted(turns, summary_text=summary_text, summary_error=summary_error)
     executor = AgentExecutor(
         "openai",
         provider,  # type: ignore[arg-type]
@@ -326,6 +343,86 @@ def test_non_retryable_edits_context_failure_does_not_summarize() -> None:
     assert provider.summarize_calls == []
     assert _edits(events) == []
     assert caller == snapshot
+
+
+def test_blank_compact_digest_watermarks_until_context_grows() -> None:
+    """A whitespace digest from compact_context leaves history unchanged and watermarks.
+
+    The same combined basis does not summarize again. Growth does. A ProviderError
+    from that summarizer aborts without a ContextEditEvent or write-back.
+    """
+
+    @dataclass
+    class _HugeTool(Tool):
+        name = "huge"
+        description = "Return a large blob."
+
+        def __call__(self) -> dict[str, str]:
+            return {"blob": "H" * ((128_000 + 10) * 4)}
+
+    policy = _policy(keep_last_n=1, mode="summarize")
+    trigger = policy.trigger_tokens
+    caller = _history()
+    snapshot = copy.deepcopy(caller)
+    events, provider = _drive(
+        [
+            ([_compact_call()], _usage(trigger)),
+            ([ToolUsePart(id="e1", name="echo", inputs={})], _usage(trigger)),
+            ([ToolUsePart(id="h1", name="huge", inputs={})], _usage(trigger)),
+            ([], _usage(trigger)),
+        ],
+        caller,
+        [CompactContextTool(), _EchoTool(), _HugeTool()],
+        policy=policy,
+        summary_text="  \n\t ",
+    )
+    # Compact blanks and watermarks. Later turns at that basis do not summarize.
+    # The huge result raises the basis, so summarize runs once more. That call's
+    # span keeps the newest pair, so the blob itself is not what the summarizer sees.
+    assert len(provider.summarize_calls) == 2
+    assert "keep ids" in provider.summarize_prompts[0]
+    assert "payload-0" in str(provider.summarize_calls[0])
+    assert "tool call echo" not in str(provider.summarize_calls[0])
+    assert "Additional instructions" not in (provider.summarize_prompts[1] or "")
+    assert "tool call echo" in str(provider.summarize_calls[1])
+    assert "tool call huge" not in str(provider.summarize_calls[1])
+    assert _edits(events) == []
+    compact_results = [result for result in _results(events) if result.name == "compact_context"]
+    assert len(compact_results) == 1
+    assert compact_results[0].is_error is False
+    assert compact_results[0].result["status"] == "context_compacted"
+    assert caller == snapshot
+    assert all("<summary>" not in str(message) for message in provider.agent_calls)
+    assert "payload-0" in str(provider.agent_calls[-1])
+
+    error_caller = _history()
+    error_snapshot = copy.deepcopy(error_caller)
+    error_provider = _Scripted(
+        [([_compact_call()], _usage(trigger)), ([], _usage(trigger))],
+        summary_error=ProviderError("summarizer down"),
+    )
+    executor = AgentExecutor(
+        "openai",
+        error_provider,  # type: ignore[arg-type]
+        tools=[CompactContextTool()],
+        context_policy=policy,
+    )
+    error_events: list[Any] = []
+
+    async def run() -> None:
+        async for event in executor.run_stream(error_caller, max_iterations=2):
+            error_events.append(event)
+
+    with pytest.raises(ProviderError, match="summarizer down"):
+        asyncio.run(run())
+
+    assert len(error_provider.summarize_calls) == 1
+    assert "keep ids" in error_provider.summarize_prompts[0]
+    assert len(error_provider.agent_calls) == 1
+    assert _edits(error_events) == []
+    assert _results(error_events)[0].name == "compact_context"
+    assert _results(error_events)[0].is_error is False
+    assert error_caller == error_snapshot
 
 
 def test_host_retry_runs_before_a_single_summarize() -> None:
