@@ -13,19 +13,21 @@ from pydantic import BaseModel, Field
 class ContextPolicy(BaseModel):
     """Configuration for automatic context compaction.
 
-    Constructing a policy is the BETA gate: passing one to ``AgentExecutor``
-    enables compaction, while ``None`` (the default) preserves today's behavior
-    exactly.
+    Passing an instance to ``AgentExecutor(context_policy=...)`` opts in to
+    compaction; ``None`` (default) leaves the agent loop unchanged.
 
-    The trigger fires when the previous turn's input tokens cross
-    :attr:`trigger_tokens` (``trigger_pct`` of ``context_window``). The window is
-    supplied here rather than looked up, since providers expose only ``model``.
+    The trigger fires between turns when the combined token basis (previous
+    turn's input usage plus a live estimate of the outgoing message list)
+    reaches :attr:`trigger_tokens` (``ceil(trigger_pct * context_window)``), or
+    when the char estimate alone exceeds ``context_window``. The window size is
+    configured here rather than looked up from the provider.
 
     Attributes:
         context_window: Total context-window size, in tokens, for the model.
         trigger_pct: Fraction of ``context_window`` that triggers compaction (0.5–1.0).
-        keep_last_n: Number of most-recent tool turns kept verbatim.
-        mode: ``"trim"`` (deterministic, no LLM) or ``"summarize"`` (one LLM call).
+        keep_last_n: Number of most-recent complete tool round-trips kept verbatim.
+        mode: ``"trim"`` (deterministic placeholder on the send view) or
+            ``"summarize"`` (one LLM call, write-back into the working list).
         placeholder: Text substituted for cleared tool-result payloads in trim mode.
     """
 
@@ -37,7 +39,7 @@ class ContextPolicy(BaseModel):
 
     @property
     def trigger_tokens(self) -> int:
-        """Input-token count at which compaction fires.
+        """Threshold at which automatic compaction may fire (with usage + estimate).
 
         Returns:
             ``ceil(trigger_pct * context_window)`` using exact decimal arithmetic.

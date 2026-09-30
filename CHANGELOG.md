@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Context compaction (opt-in).** Pass `context_policy=ContextPolicy(...)` to `AgentExecutor` to enable between-turn compaction before the next model call. `mode="trim"` clears stale tool-result payloads to a placeholder on a transient send view; `mode="summarize"` replaces older tool round-trips with a single `<summary>` turn via one extra model call (watermarked so it is not repeated at the same token basis). The caller's `messages` list is never mutated; the executor keeps a working copy for the run.
+- **`ContextEditEvent` and `AppliedEdit`.** Yielded when compaction applies an edit so hosts can observe clears/summaries and optional `replaced_originals` for audit.
+- **`CompactContextTool` (`compact_context`).** Agent-invoked summarize with `instructions` and optional `keep_last_n`; requires `context_policy` and must be registered explicitly (not built into the executor). Tools with `edits_context=True` route through the summarize path after the tool result is recorded.
 - **`max_model_corrections` on `AgentExecutor.run_stream()`.** One run-wide model-correction budget, default `3`, shared by tool-call correction and final-result correction. Exhausting it raises `ModelRetryExhaustedError`.
 - Host-side `error_details` on tool result events: exception type, message, traceback, and related diagnostics. The model-facing payload does not include the traceback.
 

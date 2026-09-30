@@ -16,8 +16,14 @@ from .tool import Tool
 class CompactContextTool(Tool):
     """Agent-invoked context compaction (summarize older tool history).
 
+    Not registered automatically — add an instance to ``AgentExecutor(tools=[...])``.
     Requires the executor to be constructed with a ``context_policy``; otherwise
-    the call falls through as a normal tool result and does not summarize.
+    the call returns the normal confirmation dict and does not summarize. When a
+    policy is set, the executor records the tool result first, then runs
+    summarize (never trim) with ``instructions`` and optional ``keep_last_n``
+    overriding the policy default. At most one compaction edit runs per agent
+    turn; an automatic compaction earlier in the same turn skips the summarize
+    step for ``compact_context``.
     """
 
     name = "compact_context"

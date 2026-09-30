@@ -73,7 +73,14 @@ class AppliedEdit(BaseModel):
 
 
 class ContextEditEvent(BaseModel):
-    """Event emitted when context compaction applies an edit."""
+    """Event emitted when context compaction applies an edit.
+
+    Surfaced from ``AgentExecutor.run_stream()`` when automatic compaction
+    (trim or summarize) or an ``edits_context`` tool such as
+    :class:`~dobby.tools.compact.CompactContextTool` successfully summarizes
+    stale tool history. Inspect ``applied_edits`` for counts, optional
+    ``summary_text``, and ``replaced_originals`` stashed for audit/replay.
+    """
 
     type: Literal["context_edit"] = "context_edit"
     applied_edits: list[AppliedEdit]

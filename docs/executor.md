@@ -26,12 +26,15 @@ async for event in executor.run_stream(messages, system_prompt="You are helpful.
 ## Initialization
 
 ```python
+from dobby.context import ContextPolicy
+
 executor = AgentExecutor(
     provider="openai",           # "openai" | "azure-openai" | "anthropic"
     llm=provider,                # Provider instance
     tools=[Tool1(), Tool2()],    # Optional tools
     output_type=MyOutputModel,   # Optional structured output
     output_mode="tool",          # "tool" | "native"
+    context_policy=ContextPolicy(mode="trim"),  # Optional; default None = no compaction
 )
 ```
 
@@ -42,6 +45,7 @@ executor = AgentExecutor(
 | `tools` | `list[Tool]` | Available tools |
 | `output_type` | `type[BaseModel]` | Pydantic model for structured output |
 | `output_mode` | `str` | How to get structured output |
+| `context_policy` | `ContextPolicy \| None` | Opt-in compaction config. `None` (default) disables compaction entirely. |
 
 ### Accessing Registered Tools
 
@@ -98,9 +102,54 @@ The executor yields all provider events plus tool events:
 | `ToolStreamEvent` | Progress from streaming tool |
 | `ToolResultEvent` | Tool execution result (check `is_terminal` for terminal tools) |
 | `ToolUseEndEvent` | Tool finished |
+| `ContextEditEvent` | Context compaction applied (trim or summarize). See `applied_edits` for counts, optional `summary_text`, and audit stash. |
 | `StreamEndEvent` | Stream/iteration finished |
 
 > For terminal tools that exit the loop, see [Terminal Tools](./tools/creating-tools.md#terminal-tools).
+
+---
+
+## Context compaction (opt-in)
+
+Compaction is **off by default**. Pass `context_policy=ContextPolicy(...)` to enable it. The list you pass to `run_stream(messages, ...)` is **never mutated**; the executor copies it once per run and appends tool round-trips to that working copy only.
+
+### When automatic compaction runs
+
+Automatic compaction runs **between completed agent turns**: after tool results for the current batch are on the working list and **before** the next model call. It does not run mid-stream.
+
+The trigger uses the previous turn's reported input tokens (from `StreamEndEvent.usage`, or a one-time character estimate when usage is missing) combined with a live estimate of the outgoing message list so large tool results appended after that turn still count. Compaction fires when that combined basis reaches `ContextPolicy.trigger_tokens` (`ceil(trigger_pct * context_window)`) **or** when the char estimate alone exceeds `context_window`. It does not fire on the first model call (no prior token basis yet). A per-run watermark suppresses firing summarize again at the **same** combined basis.
+
+At most **one** compaction edit is applied per agent turn. If automatic compaction already ran that turn, a later `compact_context` tool call in the same turn still returns its normal tool result but does not summarize again.
+
+### Trim vs summarize
+
+| `mode` | Behavior on automatic trigger | Working list after edit |
+|--------|------------------------------|-------------------------|
+| `"trim"` | Builds a **transient** send view: older tool-result payloads become `placeholder` (default `[Tool result cleared to save context.]`), keeping assistant tool-use messages and `tool_use_id` pairing intact. | Unchanged (trim is recomputed each trigger). |
+| `"summarize"` | One non-streaming LLM call replaces older **complete** tool round-trips with a single user message `TextPart` wrapped in `<summary>...</summary>`. | Updated in the working copy; watermark prevents repeating at the same basis. |
+
+**`keep_last_n`**: the most recent *N* complete tool round-trips (assistant tool-use immediately followed by user tool-result) stay verbatim. An in-flight tool use with no result yet is never a compaction candidate.
+
+**Empty summary**: if the summarizer returns only whitespace, no edit is applied, no `ContextEditEvent` is emitted, and message lists stay unchanged for that attempt.
+
+**Summarization failure**: if the compaction LLM call raises `ProviderError`, the run aborts with that error, no `ContextEditEvent` is emitted, and history is left intact (no partial summarize write-back).
+
+Agent-invoked compaction via `CompactContextTool` always uses the summarize path (never trim). See [Built-in Tools](./tools/built-in-tools.md#compact-context-tool).
+
+Example: observe compaction in the stream:
+
+```python
+from dobby.context import ContextPolicy
+from dobby.types import ContextEditEvent
+
+policy = ContextPolicy(context_window=128_000, trigger_pct=0.8, keep_last_n=2, mode="trim")
+executor = AgentExecutor(provider="openai", llm=provider, tools=[...], context_policy=policy)
+
+async for event in executor.run_stream(messages):
+    if isinstance(event, ContextEditEvent):
+        for edit in event.applied_edits:
+            print(edit.type, edit.cleared_tool_uses, edit.summary_text)
+```
 
 ---
 
@@ -126,7 +175,7 @@ sequenceDiagram
                 Executor-->>User: ToolResultEvent(is_terminal=True)
                 Note over Executor: Exit loop immediately
             else Non-terminal tool
-                Executor->>Executor: Add to messages
+                Executor->>Executor: Append to working copy (caller list unchanged)
             end
         end
     end

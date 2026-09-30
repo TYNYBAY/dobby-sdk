@@ -581,11 +581,21 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         ``max_model_corrections`` is the run-level model-correction budget
         shared by tool-call and final-result corrections.
 
+        The ``messages`` argument is copied at the start of the run; compaction
+        and tool round-trips update an internal working list only, so the
+        caller's list is never mutated in place.
+
+        Yields:
+            Provider stream events, tool events, and :class:`ContextEditEvent`
+            when ``context_policy`` (or an ``edits_context`` tool with a policy)
+            applies a compaction edit.
+
         Raises:
             ApprovalRequired: When a tool with requires_approval=True is called
                 and its tool_call_id is not in approved_tool_calls.
             ModelRetryExhaustedError: When the run-wide model-correction budget
                 is exhausted.
+            ProviderError: When a summarize-mode compaction LLM call fails.
         """
         resolved_max_model_corrections = _resolve_max_model_corrections(max_model_corrections)
         self.last_output = None
@@ -673,12 +683,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ToolStreamEvent: Mid-execution tool events (for streaming tools)
             ToolUsePart: Tool call info
             ToolResultPart: Tool execution results
+            ContextEditEvent: Compaction applied (trim or summarize)
 
         Raises:
             ApprovalRequired: When a tool with requires_approval=True is called
                 and its tool_call_id is not in approved_tool_calls.
             ModelRetryExhaustedError: When the run-wide model-correction budget
                 is exhausted.
+            ProviderError: When summarize-mode compaction fails mid-run.
         """
         tools = self.get_tools_schema() if self._tools else None
         working_messages = list(messages)
