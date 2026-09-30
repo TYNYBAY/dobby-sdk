@@ -17,6 +17,7 @@ from dobby.executor import _compaction_triggered
 from dobby.tools import Tool
 from dobby.types import (
     AssistantMessagePart,
+    ContextEditEvent,
     StreamEndEvent,
     TextPart,
     ToolResultEvent,
@@ -273,7 +274,9 @@ def test_trim_runs_before_next_model_call_and_preserves_caller() -> None:
     assert "history-payload-1" not in sent_texts
     assert caller == snapshot
     assert noop._calls == 1  # type: ignore[attr-defined]
-    assert not any(getattr(event, "type", None) == "context_edit" for event in events)
+    edits = [event for event in events if isinstance(event, ContextEditEvent)]
+    assert len(edits) == 1
+    assert edits[0].applied_edits[0].type == "clear_tool_uses"
 
 
 def test_usage_zero_does_not_trim() -> None:

@@ -49,6 +49,7 @@ from .tools.retry import (
 from .tools.tool import Tool, format_pydantic_validation_issues
 from .types import (
     AssistantMessagePart,
+    ContextEditEvent,
     MessagePart,
     StreamEndEvent,
     StreamEvent,
@@ -695,6 +696,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             batch_has_model_correction = False
             batch_last_correction_error: ToolErrorDetails | None = None
             send_messages = working_messages
+            # Reset each turn. Set only after a real edit so a no-op auto-trigger
+            # does not suppress an explicit compact_context call this turn.
+            compaction_in_progress = False
 
             # Compaction runs only between completed turns, after tool results
             # are already on working_messages and before the next model call.
@@ -706,7 +710,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ):
                 if policy.mode == "trim":
                     # Transient view. working_messages and the caller list stay intact.
-                    send_messages, _applied = edit_context(working_messages, policy)
+                    send_messages, applied = edit_context(working_messages, policy)
                 else:
                     # Summarize writes back into the working copy, computed once.
                     applied = await summarize_context(working_messages, policy, self.llm)
@@ -715,6 +719,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         last_compacted_at_tokens = compaction_trigger_basis(
                             last_input_tokens, working_messages
                         )
+                if applied is not None:
+                    compaction_in_progress = True
+                    yield ContextEditEvent(applied_edits=[applied])
 
             async for event in await self.llm.chat(
                 send_messages,
@@ -819,6 +826,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             streaming_calls: list[ToolUsePart] = []
             parallel_calls: list[ToolUsePart] = []
             terminal_calls: list[ToolUsePart] = []
+            compact_calls: list[ToolUsePart] = []
             for tc in tool_calls:
                 if tc.name == OUTPUT_TOOL_NAME and self.output_type:
                     continue
@@ -838,7 +846,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     )
                     parallel_calls.append(tc)
                     continue
-                if tool.terminal:
+                if tool.edits_context:
+                    compact_calls.append(tc)
+                elif tool.terminal:
                     terminal_calls.append(tc)
                 elif tool.stream_output:
                     streaming_calls.append(tc)
@@ -905,7 +915,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             if control_flow is not None:
                 pending_control_flow = control_flow
                 async for event in self._emit_placeholders(
-                    parallel_calls[len(results) :] + streaming_calls + terminal_calls,
+                    parallel_calls[len(results) :]
+                    + streaming_calls
+                    + compact_calls
+                    + terminal_calls,
                     lambda remaining, flow=pending_control_flow: _control_flow_result(
                         remaining, flow
                     ),
@@ -918,7 +931,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             terminal_completed = False
             if batch_has_model_correction:
                 async for event in self._emit_placeholders(
-                    parallel_calls[len(results) :] + streaming_calls + terminal_calls,
+                    parallel_calls[len(results) :]
+                    + streaming_calls
+                    + compact_calls
+                    + terminal_calls,
                     lambda remaining: _unexecuted_result(remaining, reason="model_correction"),
                     working_messages,
                 ):
@@ -948,7 +964,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 result = event_or_result
                     except (ApprovalRequired, asyncio.CancelledError) as exception:
                         async for event in self._emit_placeholders(
-                            [tc, *streaming_calls[index + 1 :], *terminal_calls],
+                            [tc, *streaming_calls[index + 1 :], *compact_calls, *terminal_calls],
                             lambda remaining, caught=exception: _control_flow_result(
                                 remaining, caught
                             ),
@@ -970,7 +986,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
                     if streaming_correction:
                         async for event in self._emit_placeholders(
-                            streaming_calls[index + 1 :] + terminal_calls,
+                            streaming_calls[index + 1 :] + compact_calls + terminal_calls,
                             lambda remaining: _unexecuted_result(
                                 remaining,
                                 reason="model_correction",
@@ -980,32 +996,14 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             yield event
                         break
                 else:
-                    # Terminal tool exits the loop
-                    if terminal_calls:
-                        tc = terminal_calls[0]
-                        result = None
-                        is_error = False
-                        error_details = None
-                        skip_terminal_exit = False
+                    for index, tc in enumerate(compact_calls):
                         try:
-                            async for event_or_result in self._execute_tool_stream(
+                            call_result = await self._execute_tool_call(
                                 tc.name, tc.id, tc.inputs, context, approved
-                            ):
-                                if isinstance(event_or_result, ToolCallResult):
-                                    result = event_or_result.result
-                                    is_error = event_or_result.is_error
-                                    error_details = event_or_result.error_details
-                                    if event_or_result.retry_model:
-                                        batch_has_model_correction = True
-                                        batch_last_correction_error = event_or_result.error_details
-                                        skip_terminal_exit = True
-                                elif isinstance(event_or_result, ToolStreamEvent):
-                                    yield event_or_result
-                                else:
-                                    result = event_or_result
+                            )
                         except (ApprovalRequired, asyncio.CancelledError) as exception:
                             async for event in self._emit_placeholders(
-                                [tc, *terminal_calls[1:]],
+                                [tc, *compact_calls[index + 1 :], *terminal_calls],
                                 lambda remaining, caught=exception: _control_flow_result(
                                     remaining, caught
                                 ),
@@ -1014,29 +1012,115 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             ):
                                 yield event
                             raise
-                        result_event, end_event = self._emit_tool_result(
+
+                        if call_result.retry_model:
+                            batch_has_model_correction = True
+                            batch_last_correction_error = call_result.error_details
+
+                        result_event, end_event = self._emit_call_result(
                             tc,
-                            result,
-                            is_error,
+                            call_result,
                             working_messages,
-                            is_terminal=not skip_terminal_exit,
-                            error_details=error_details,
                         )
                         yield result_event
-                        if skip_terminal_exit:
-                            yield end_event
-                        else:
-                            terminal_completed = True
+                        yield end_event
 
-                        skip_reason = "model_correction" if skip_terminal_exit else "terminal"
-                        async for event in self._emit_placeholders(
-                            terminal_calls[1:],
-                            lambda remaining, reason=skip_reason: _unexecuted_result(
-                                remaining, reason=reason
-                            ),
+                        if call_result.retry_model:
+                            async for event in self._emit_placeholders(
+                                compact_calls[index + 1 :] + terminal_calls,
+                                lambda remaining: _unexecuted_result(
+                                    remaining,
+                                    reason="model_correction",
+                                ),
+                                working_messages,
+                            ):
+                                yield event
+                            break
+
+                        # Tool result is already on working_messages. Summarize only
+                        # when this turn has not already applied an edit.
+                        if policy is None or compaction_in_progress:
+                            continue
+                        compaction_in_progress = True
+                        effective_policy = policy
+                        keep_override = tc.inputs.get("keep_last_n")
+                        if keep_override is not None:
+                            effective_policy = policy.model_copy(
+                                update={"keep_last_n": keep_override}
+                            )
+                        applied = await summarize_context(
                             working_messages,
-                        ):
-                            yield event
+                            effective_policy,
+                            self.llm,
+                            extra_instructions=tc.inputs.get("instructions"),
+                        )
+                        if applied is not None:
+                            last_compacted_at_tokens = compaction_trigger_basis(
+                                last_input_tokens, working_messages
+                            )
+                            yield ContextEditEvent(applied_edits=[applied])
+                    else:
+                        # Terminal tool exits the loop
+                        if terminal_calls:
+                            tc = terminal_calls[0]
+                            result = None
+                            is_error = False
+                            error_details = None
+                            skip_terminal_exit = False
+                            try:
+                                async for event_or_result in self._execute_tool_stream(
+                                    tc.name, tc.id, tc.inputs, context, approved
+                                ):
+                                    if isinstance(event_or_result, ToolCallResult):
+                                        result = event_or_result.result
+                                        is_error = event_or_result.is_error
+                                        error_details = event_or_result.error_details
+                                        if event_or_result.retry_model:
+                                            batch_has_model_correction = True
+                                            batch_last_correction_error = (
+                                                event_or_result.error_details
+                                            )
+                                            skip_terminal_exit = True
+                                    elif isinstance(event_or_result, ToolStreamEvent):
+                                        yield event_or_result
+                                    else:
+                                        result = event_or_result
+                            except (ApprovalRequired, asyncio.CancelledError) as exception:
+                                async for event in self._emit_placeholders(
+                                    [tc, *terminal_calls[1:]],
+                                    lambda remaining, caught=exception: _control_flow_result(
+                                        remaining, caught
+                                    ),
+                                    working_messages,
+                                    yield_events=not isinstance(
+                                        exception, asyncio.CancelledError
+                                    ),
+                                ):
+                                    yield event
+                                raise
+                            result_event, end_event = self._emit_tool_result(
+                                tc,
+                                result,
+                                is_error,
+                                working_messages,
+                                is_terminal=not skip_terminal_exit,
+                                error_details=error_details,
+                            )
+                            yield result_event
+                            if skip_terminal_exit:
+                                yield end_event
+                            else:
+                                terminal_completed = True
+
+                            skip_reason = "model_correction" if skip_terminal_exit else "terminal"
+                            async for event in self._emit_placeholders(
+                                terminal_calls[1:],
+                                lambda remaining, reason=skip_reason: _unexecuted_result(
+                                    remaining, reason=reason
+                                ),
+                                working_messages,
+                            ):
+                                yield event
 
             if batch_has_model_correction:
                 model_corrections += 1

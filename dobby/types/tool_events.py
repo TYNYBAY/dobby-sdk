@@ -54,8 +54,8 @@ class ToolUseEndEvent(BaseModel):
 class AppliedEdit(BaseModel):
     """A single compaction edit applied to the conversation.
 
-    Records what trim or summarize changed so the executor can update its
-    watermark. This is not yet emitted as a stream event.
+    Carried on :class:`ContextEditEvent` so compaction is observable, and stashes
+    the replaced originals for audit/replay.
     """
 
     type: Literal["clear_tool_uses", "summarize"]
@@ -70,3 +70,10 @@ class AppliedEdit(BaseModel):
 
     Typed ``Any`` to avoid a parts-typing import cycle.
     """
+
+
+class ContextEditEvent(BaseModel):
+    """Event emitted when context compaction applies an edit."""
+
+    type: Literal["context_edit"] = "context_edit"
+    applied_edits: list[AppliedEdit]
