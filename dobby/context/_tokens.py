@@ -5,7 +5,59 @@ Both the trigger's token estimate (executor) and the summarizer's span rendering
 logic lives.
 """
 
-from ..types import MessagePart, TextPart, ToolResultPart, ToolUsePart
+from ..types import (
+    Base64ImageSource,
+    DocumentPart,
+    FileDocumentSource,
+    ImagePart,
+    MessagePart,
+    PlainTextSource,
+    ReasoningPart,
+    TextPart,
+    ToolResultPart,
+    ToolUsePart,
+    URLImageSource,
+    URLSource,
+)
+
+
+def _image_to_text(part: ImagePart) -> str:
+    """Describe an image without its raw bytes or data URL."""
+    source = part.source
+    if isinstance(source, URLImageSource) and not source.url.startswith("data:"):
+        return f"[image {source.url}]"
+    if isinstance(source, Base64ImageSource):
+        return f"[image {source.media_type}]"
+    return "[image]"
+
+
+def _document_to_text(part: DocumentPart, *, labeled: bool) -> str:
+    """Describe a document without embedded PDF bytes.
+
+    Plain-text document bodies are real model input, so they are kept.
+    Base64 PDF payloads and ``data:`` URLs are not.
+    """
+    source = part.source
+    if isinstance(source, PlainTextSource):
+        if labeled:
+            return f"[document {part.filename}] {source.data}"
+        return source.data
+    if isinstance(source, URLSource) and not source.url.startswith("data:"):
+        return f"[document {part.filename} {source.url}]"
+    if isinstance(source, FileDocumentSource):
+        return f"[document {part.filename} {source.file_id}]"
+    return f"[document {part.filename}]"
+
+
+def _reasoning_to_text(part: ReasoningPart, *, labeled: bool) -> str:
+    """Use readable reasoning text, never signatures or redacted payloads."""
+    if part.redacted:
+        return "[redacted reasoning]"
+    if not part.text:
+        return ""
+    if labeled:
+        return f"[reasoning] {part.text}"
+    return part.text
 
 
 def part_to_text(part: object, *, labeled: bool = False) -> str:
@@ -18,7 +70,9 @@ def part_to_text(part: object, *, labeled: bool = False) -> str:
             When False, raw text is returned for token estimation.
 
     Returns:
-        The flattened text.
+        The flattened text. Image bytes, PDF bytes, ``data:`` URLs, reasoning
+        signatures, and redacted reasoning payloads are omitted; the part
+        objects themselves are not modified.
     """
     if isinstance(part, TextPart):
         return part.text
@@ -29,7 +83,13 @@ def part_to_text(part: object, *, labeled: bool = False) -> str:
     if isinstance(part, ToolResultPart):
         inner = "".join(part_to_text(p, labeled=labeled) for p in part.parts)
         return f"[tool result {part.name}: {inner}]" if labeled else inner
-    return str(part)
+    if isinstance(part, ImagePart):
+        return _image_to_text(part)
+    if isinstance(part, DocumentPart):
+        return _document_to_text(part, labeled=labeled)
+    if isinstance(part, ReasoningPart):
+        return _reasoning_to_text(part, labeled=labeled)
+    return f"[{type(part).__name__}]"
 
 
 def estimate_input_tokens(messages: list[MessagePart]) -> int:
@@ -50,9 +110,11 @@ def compaction_trigger_basis(
 
     Provider-reported input from the previous turn is combined with a char
     estimate of the live outgoing message list so tool results appended after
-    that turn still count toward the trigger.
+    that turn still count toward the trigger. When there is no previous usage
+    (the first model call), the outgoing estimate is used alone so an already
+    oversized initial history can compact before that call.
     """
-    if last_input_tokens is None:
-        return None
     estimated = estimate_input_tokens(outgoing_messages)
+    if last_input_tokens is None:
+        return estimated
     return max(last_input_tokens, estimated)

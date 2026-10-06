@@ -10,6 +10,7 @@ from pydantic import ValidationError
 import pytest
 
 from dobby.context import SUMMARIZE_PROMPT, ContextPolicy, edit_context, summarize_context
+from dobby.context.edit import _find_tool_pairs
 from dobby.providers.gemini.converters import to_gemini_messages
 from dobby.types import (
     AssistantMessagePart,
@@ -160,6 +161,37 @@ def test_edit_context_inflight_tool_use_is_not_a_completed_pair() -> None:
     assert isinstance(last_use, AssistantMessagePart)
     assert last_use.parts[0] is inflight
     assert last_use is messages[-1]
+
+
+def _pair_ids(messages: list[Any]) -> list[tuple[str, str]]:
+    paired: list[tuple[str, str]] = []
+    for use_index, result_index in _find_tool_pairs(messages):
+        use = next(part for part in messages[use_index].parts if isinstance(part, ToolUsePart))
+        result = next(
+            part for part in messages[result_index].parts if isinstance(part, ToolResultPart)
+        )
+        paired.append((use.id, result.tool_use_id))
+    return paired
+
+
+def test_find_tool_pairs_keeps_adjacent_executor_pairs() -> None:
+    messages = _history(("A", "B"))
+    assert _find_tool_pairs(messages) == [(0, 1), (2, 3)]
+    assert _pair_ids(messages) == [("id-A", "id-A"), ("id-B", "id-B")]
+
+
+def test_find_tool_pairs_matches_interleaved_ids() -> None:
+    use_a, result_a = _pair("A")
+    use_b, result_b = _pair("B")
+    messages = [use_a, use_b, result_a, result_b]
+    assert _pair_ids(messages) == [("id-A", "id-A"), ("id-B", "id-B")]
+
+
+def test_find_tool_pairs_does_not_pair_unrelated_ids() -> None:
+    use_a, _result_a = _pair("A")
+    _use_b, result_b = _pair("B")
+    messages = [use_a, result_b]
+    assert _find_tool_pairs(messages) == []
 
 
 def test_edit_context_noop_when_pairs_within_keep_window() -> None:
@@ -375,3 +407,25 @@ def test_gemini_alternating_user_model_history_is_unchanged() -> None:
         ["again"],
         ["ok"],
     ]
+
+
+def test_gemini_merges_assistant_text_before_kept_tool_use() -> None:
+    """Summary + assistant text + tool-use must not reach Gemini as two model roles."""
+    use, result = _pair("C")
+    contents = to_gemini_messages(
+        [
+            UserMessagePart(parts=[TextPart(text="user question")]),
+            UserMessagePart(parts=[TextPart(text="<summary>digest-kept</summary>")]),
+            AssistantMessagePart(parts=[TextPart(text="assistant note")]),
+            use,
+            result,
+        ]
+    )
+    assert _gemini_roles(contents) == ["user", "model", "user"]
+    assert _gemini_texts(contents[0]) == ["user question", "<summary>digest-kept</summary>"]
+    assert _gemini_texts(contents[1]) == ["assistant note"]
+    assert contents[1].parts[1].function_call is not None
+    assert contents[1].parts[1].function_call.name == "search"
+    assert contents[2].parts[0].function_response is not None
+    assert contents[2].parts[0].function_response.name == "search"
+    assert contents[2].parts[0].function_response.response == {"text": "result-C"}

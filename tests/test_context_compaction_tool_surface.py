@@ -78,15 +78,18 @@ class _Scripted:
         turns: list[tuple[list[Any], Usage | None]],
         *,
         summary_text: str = "digest-kept",
+        summary_texts: list[str] | None = None,
         summary_error: Exception | None = None,
     ) -> None:
         self.turns = turns
         self.summary_text = summary_text
+        self.summary_texts = summary_texts
         self.summary_error = summary_error
         self.agent_calls: list[list[Any]] = []
         self.summarize_calls: list[list[Any]] = []
         self.summarize_prompts: list[Any] = []
         self._index = 0
+        self._summary_index = 0
 
     async def chat(self, messages: list[Any], **kwargs: Any) -> Any:
         if kwargs.get("stream") is False:
@@ -94,9 +97,14 @@ class _Scripted:
             self.summarize_prompts.append(kwargs.get("system_prompt"))
             if self.summary_error is not None:
                 raise self.summary_error
+            if self.summary_texts is None:
+                text = self.summary_text
+            else:
+                text = self.summary_texts[min(self._summary_index, len(self.summary_texts) - 1)]
+                self._summary_index += 1
             return StreamEndEvent(
                 model="summarizer",
-                parts=[TextPart(text=self.summary_text)],
+                parts=[TextPart(text=text)],
                 stop_reason="end_turn",
                 usage=_usage(0),
             )
@@ -132,10 +140,16 @@ def _drive(
     *,
     policy: ContextPolicy | None,
     summary_text: str = "digest-kept",
+    summary_texts: list[str] | None = None,
     summary_error: Exception | None = None,
     **run_kwargs: Any,
 ) -> tuple[list[Any], _Scripted]:
-    provider = _Scripted(turns, summary_text=summary_text, summary_error=summary_error)
+    provider = _Scripted(
+        turns,
+        summary_text=summary_text,
+        summary_texts=summary_texts,
+        summary_error=summary_error,
+    )
     executor = AgentExecutor(
         "openai",
         provider,  # type: ignore[arg-type]
@@ -327,8 +341,9 @@ def test_numeric_string_keep_last_n_override_is_validated() -> None:
     assert len(provider.summarize_calls) == 1
     summarized = str(provider.summarize_calls[0])
     assert "payload-0" in summarized
-    assert "payload-1" in summarized
+    assert "payload-1" not in summarized
     assert "payload-2" not in summarized
+    assert "payload-1" in str(provider.agent_calls[1])
     assert "payload-2" in str(provider.agent_calls[1])
 
 
@@ -355,8 +370,9 @@ def test_float_keep_last_n_from_custom_tool_falls_back_to_policy() -> None:
     assert len(_edits(events)) == 1
     summarized = str(provider.summarize_calls[0])
     assert "payload-0" in summarized
-    assert "payload-1" in summarized
+    assert "payload-1" not in summarized
     assert "payload-2" not in summarized
+    assert "payload-1" in str(provider.agent_calls[1])
     assert "payload-2" in str(provider.agent_calls[1])
 
 
@@ -415,21 +431,8 @@ def test_non_retryable_edits_context_failure_does_not_summarize() -> None:
     assert caller == snapshot
 
 
-def test_blank_compact_digest_watermarks_until_context_grows() -> None:
-    """A whitespace digest from compact_context leaves history unchanged and watermarks.
-
-    The same combined basis does not summarize again. Growth does. A ProviderError
-    from that summarizer aborts without a ContextEditEvent or write-back.
-    """
-
-    @dataclass
-    class _HugeTool(Tool):
-        name = "huge"
-        description = "Return a large blob."
-
-        def __call__(self) -> dict[str, str]:
-            return {"blob": "H" * ((128_000 + 10) * 4)}
-
+def test_blank_compact_digest_does_not_suppress_later_auto_summarize() -> None:
+    """A whitespace digest from compact_context must not watermark away a later automatic summarize."""
     policy = _policy(keep_last_n=1, mode="summarize")
     trigger = policy.trigger_tokens
     caller = _history()
@@ -438,35 +441,28 @@ def test_blank_compact_digest_watermarks_until_context_grows() -> None:
         [
             ([_compact_call()], _usage(trigger)),
             ([ToolUsePart(id="e1", name="echo", inputs={})], _usage(trigger)),
-            ([ToolUsePart(id="h1", name="huge", inputs={})], _usage(trigger)),
             ([], _usage(trigger)),
         ],
         caller,
-        [CompactContextTool(), _EchoTool(), _HugeTool()],
+        [CompactContextTool(), _EchoTool()],
         policy=policy,
-        summary_text="  \n\t ",
+        summary_texts=["  \n\t ", "digest-kept"],
     )
-    # Compact blanks and watermarks. Later turns at that basis do not summarize.
-    # The huge result raises the basis, so summarize runs once more. That call's
-    # span keeps the newest pair, so the blob itself is not what the summarizer sees.
-    assert len(provider.summarize_calls) == 2
-    assert "keep ids" in provider.summarize_prompts[0]
-    assert "payload-0" in str(provider.summarize_calls[0])
-    assert "tool call echo" not in str(provider.summarize_calls[0])
-    assert "Additional instructions" not in (provider.summarize_prompts[1] or "")
-    assert "tool call echo" in str(provider.summarize_calls[1])
-    assert "tool call huge" not in str(provider.summarize_calls[1])
-    assert _edits(events) == []
     compact_results = [result for result in _results(events) if result.name == "compact_context"]
     assert len(compact_results) == 1
-    assert compact_results[0].is_error is False
     assert compact_results[0].result == {
         "status": "context_unchanged",
         "reason": "empty_summary",
     }
+    assert len(provider.summarize_calls) == 2
+    assert "keep ids" in provider.summarize_prompts[0]
+    edits = _edits(events)
+    assert len(edits) == 1
+    assert edits[0].applied_edits[0].summary_text == "digest-kept"
+    assert any(
+        "<summary>digest-kept</summary>" in str(message) for message in provider.agent_calls[-1]
+    )
     assert caller == snapshot
-    assert all("<summary>" not in str(message) for message in provider.agent_calls)
-    assert "payload-0" in str(provider.agent_calls[-1])
 
     error_caller = _history()
     error_snapshot = copy.deepcopy(error_caller)
@@ -633,6 +629,126 @@ def test_host_cancellation_skips_terminal_after_compact_tool() -> None:
 
     asyncio.run(run())
     assert terminal_calls == 0
+
+
+def test_compact_provider_error_placeholders_remaining_tools() -> None:
+    """A summarize ProviderError still records remaining compact/terminal calls."""
+    terminal_calls = 0
+
+    @dataclass
+    class _Finish(Tool):
+        name = "finish"
+        description = "Stop."
+        terminal = True
+
+        def __call__(self) -> str:
+            nonlocal terminal_calls
+            terminal_calls += 1
+            return "done"
+
+    caller = _history()
+    snapshot = copy.deepcopy(caller)
+    provider = _Scripted(
+        [([_compact_call(), ToolUsePart(id="end", name="finish", inputs={})], _usage(0))],
+        summary_error=ProviderError("summarizer down"),
+    )
+    executor = AgentExecutor(
+        "openai",
+        provider,  # type: ignore[arg-type]
+        tools=[CompactContextTool(), _Finish()],
+        context_policy=_policy(keep_last_n=1),
+    )
+    events: list[Any] = []
+
+    async def run() -> None:
+        async for event in executor.run_stream(caller, max_iterations=1):
+            events.append(event)
+
+    with pytest.raises(ProviderError, match="summarizer down"):
+        asyncio.run(run())
+
+    results = _results(events)
+    assert [result.name for result in results] == ["compact_context", "finish"]
+    assert results[0].is_error is True
+    assert str(results[0].result).startswith("[tool_execution_error]")
+    assert results[1].result == {"skipped": True, "reason": "compaction_error"}
+    assert results[1].is_error is True
+    assert terminal_calls == 0
+    assert _edits(events) == []
+    assert caller == snapshot
+
+
+def test_compact_summarize_cancellation_placeholders_remaining_tools() -> None:
+    """Cancelling summarize records remaining tools without yielding cancelled events."""
+    started = asyncio.Event()
+    terminal_calls = 0
+
+    class _BlockingSummarizer:
+        name = "scripted"
+
+        def __init__(self) -> None:
+            self.agent_calls: list[list[Any]] = []
+            self.summarize_calls: list[list[Any]] = []
+
+        async def chat(self, messages: list[Any], **kwargs: Any) -> Any:
+            if kwargs.get("stream") is False:
+                self.summarize_calls.append(list(messages))
+                started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("summarizer was not cancelled")
+            self.agent_calls.append(list(messages))
+
+            async def stream() -> Any:
+                yield StreamEndEvent(
+                    type="stream_end",
+                    model="mock",
+                    parts=[
+                        _compact_call(),
+                        ToolUsePart(id="end", name="finish", inputs={}),
+                    ],
+                    stop_reason="tool_use",
+                    usage=_usage(0),
+                )
+
+            return stream()
+
+    @dataclass
+    class _Finish(Tool):
+        name = "finish"
+        description = "Stop."
+        terminal = True
+
+        def __call__(self) -> str:
+            nonlocal terminal_calls
+            terminal_calls += 1
+            return "done"
+
+    caller = _history()
+    provider = _BlockingSummarizer()
+    executor = AgentExecutor(
+        "openai",
+        provider,  # type: ignore[arg-type]
+        tools=[CompactContextTool(), _Finish()],
+        context_policy=_policy(keep_last_n=1),
+    )
+    events: list[Any] = []
+
+    async def run() -> None:
+        async def consume() -> None:
+            async for event in executor.run_stream(caller, max_iterations=1):
+                events.append(event)
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert terminal_calls == 0
+    assert provider.summarize_calls
+    assert _edits(events) == []
+    assert [result.name for result in _results(events)] == []
 
 
 def test_tool_raised_cancellation_is_a_structured_error() -> None:

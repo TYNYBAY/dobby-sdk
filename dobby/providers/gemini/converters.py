@@ -150,26 +150,26 @@ def _has_function_response(content: genai_types.Content) -> bool:
     )
 
 
-def _merge_consecutive_plain_user_contents(
+def _merge_consecutive_same_role_contents(
     contents: list[genai_types.Content],
 ) -> list[genai_types.Content]:
-    """Collapse adjacent plain user turns so Gemini sees alternating roles.
+    """Collapse adjacent same-role turns so Gemini sees alternating roles.
 
-    Summarization inserts a ``<summary>`` user message in front of a leading
-    user prompt. Gemini rejects consecutive user roles. Tool-result turns are
-    left separate so a function response still follows its function call.
+    Summarization can insert a ``<summary>`` user message next to a leading
+    user prompt, and can leave assistant text immediately before a later
+    tool-use. Gemini rejects consecutive same-role contents. Tool-result turns
+    are left separate so a function response still follows its function call.
     """
     merged: list[genai_types.Content] = []
     for content in contents:
         if (
             merged
-            and merged[-1].role == "user"
-            and content.role == "user"
+            and merged[-1].role == content.role
             and not _has_function_response(merged[-1])
             and not _has_function_response(content)
         ):
             merged[-1] = genai_types.Content(
-                role="user",
+                role=content.role,
                 parts=[*(merged[-1].parts or []), *(content.parts or [])],
             )
             continue
@@ -188,9 +188,10 @@ def to_gemini_messages(
     - ToolUsePart → Part with FunctionCall
     - ToolResultPart → Part with FunctionResponse
 
-    Adjacent plain user turns are merged so a summary inserted after the
-    opening user message does not produce consecutive user roles. Function
-    responses stay on their own user turn.
+    Adjacent same-role turns are merged so a summary inserted after the
+    opening user message, or assistant text left before a kept tool-use, does
+    not produce consecutive roles. Function responses stay on their own user
+    turn.
 
     Args:
         messages: Iterable of Dobby MessagePart objects
@@ -239,4 +240,4 @@ def to_gemini_messages(
                 if gemini_parts:
                     gemini_contents.append(genai_types.Content(role="model", parts=gemini_parts))
 
-    return _merge_consecutive_plain_user_contents(gemini_contents)
+    return _merge_consecutive_same_role_contents(gemini_contents)

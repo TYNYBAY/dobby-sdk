@@ -75,7 +75,7 @@ executor = AgentExecutor(
 )
 ```
 
-When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes but the executor does **not** summarize; the patched result is `context_unchanged` / `no_policy`.
+When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. `keep_last_n` applies to older completed tool round-trips; the compact call's own pair and any sibling tools from the same model turn stay in history, including when `keep_last_n` is `0`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes but the executor does **not** summarize; the patched result is `context_unchanged` / `no_policy`.
 
 ### Parameters
 

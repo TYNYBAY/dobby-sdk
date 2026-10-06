@@ -79,8 +79,10 @@ def _compaction_triggered(
 
     Uses the greater of the previous turn's reported input tokens and a char
     estimate of ``outgoing_messages`` (the list about to be sent, including
-    tool results appended since that turn). The watermark suppresses re-firing
-    summarize at the same combined count.
+    tool results appended since that turn). On the first call there is no
+    previous usage, so the outgoing estimate is used alone. The watermark
+    suppresses re-firing summarize at or below the last successful pre-edit
+    basis; an empty digest does not advance it.
     """
     messages = outgoing_messages if outgoing_messages is not None else []
     basis = compaction_trigger_basis(last_input_tokens, messages)
@@ -88,7 +90,7 @@ def _compaction_triggered(
         return False
     if basis < policy.trigger_tokens:
         return False
-    if last_compacted_at_tokens is not None and basis == last_compacted_at_tokens:
+    if last_compacted_at_tokens is not None and basis <= last_compacted_at_tokens:
         return False
     return True
 
@@ -117,14 +119,14 @@ def _patch_compact_tool_result(
     result_event.result = result
     result_event.is_error = is_error
     result_event.error_details = error_details
-    last = working_messages[-1]
-    if not isinstance(last, UserMessagePart):
-        return
-    for part in last.parts:
-        if isinstance(part, ToolResultPart) and part.tool_use_id == result_event.tool_use_id:
-            part.parts = [TextPart(text=str(result))]
-            part.is_error = is_error
-            return
+    for message in reversed(working_messages):
+        if not isinstance(message, UserMessagePart):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolResultPart) and part.tool_use_id == result_event.tool_use_id:
+                part.parts = [TextPart(text=str(result))]
+                part.is_error = is_error
+                return
 
 
 def _unchanged_compact_result(reason: str) -> dict[str, str]:
@@ -333,8 +335,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             output_mode: 'tool' (default) or 'native' (NotImplementedError)
             context_policy: Optional compaction policy. ``None`` (default) keeps
                 the agent loop unchanged. Passing one enables automatic
-                between-turns context compaction (trim or summarize) before the
-                next model call.
+                context compaction (trim or summarize) before a model call,
+                including the first call when the initial history already
+                meets the threshold.
         """
         self.provider = provider
         self.llm = llm
@@ -741,6 +744,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         policy = self._context_policy
         last_input_tokens: int | None = None
         last_compacted_at_tokens: int | None = None
+        trim_edit_reported = False
 
         for _ in range(max_iterations):
             tool_calls: list[ToolUsePart] = []
@@ -751,8 +755,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             # does not suppress an explicit compact_context call this turn.
             compaction_in_progress = False
 
-            # Compaction runs only between completed turns, after tool results
-            # are already on working_messages and before the next model call.
+            # Compaction runs before each model call, including the first when
+            # the initial history already meets the threshold. Later turns
+            # compact after tool results are on working_messages.
             if policy is not None and _compaction_triggered(
                 last_input_tokens,
                 policy,
@@ -764,18 +769,23 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     send_messages, applied = edit_context(working_messages, policy)
                 else:
                     # Summarize writes a non-empty digest back into the working copy.
-                    # A finished call with no usable digest still advances the
-                    # watermark. ProviderError propagates and does not.
+                    # Watermark the pre-edit basis so a first-call summarize does
+                    # not look like a new growth episode. An empty digest does
+                    # not watermark; ProviderError propagates and does not.
+                    pre_basis = compaction_trigger_basis(last_input_tokens, working_messages)
                     attempt = await _summarize_attempt(working_messages, policy, self.llm)
                     applied = attempt.applied
                     send_messages = working_messages
-                    if applied is not None or attempt.blank_digest:
-                        last_compacted_at_tokens = compaction_trigger_basis(
-                            last_input_tokens, working_messages
-                        )
+                    if applied is not None:
+                        last_compacted_at_tokens = pre_basis
                 if applied is not None:
                     compaction_in_progress = True
-                    yield ContextEditEvent(applied_edits=[applied])
+                    # Trim rebuilds the same kind of send view every turn; report
+                    # it once. Summarize yields on every successful write-back.
+                    if policy.mode != "trim" or not trim_edit_reported:
+                        if policy.mode == "trim":
+                            trim_edit_reported = True
+                        yield ContextEditEvent(applied_edits=[applied])
 
             async for event in await self.llm.chat(
                 send_messages,
@@ -892,6 +902,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
             if final_result_invalid:
                 continue
+
+            # Pairs appended this batch must not occupy keep_last_n when
+            # compact_context summarizes: sibling tools and compact_context
+            # itself stay in the next model-visible history.
+            completed_history_len = len(working_messages)
 
             # Categorize tool calls
             streaming_calls: list[ToolUsePart] = []
@@ -1113,9 +1128,9 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             yield end_event
                             continue
 
-                        # Tool result is already on working_messages so the new
-                        # pair occupies keep_last_n. Patch the stored result
-                        # after the summarize attempt, then yield.
+                        # Tool result is already on working_messages. Current-turn
+                        # pairs are excluded from keep_last_n via protect_after.
+                        # Patch the stored result after the summarize attempt.
                         if policy is None:
                             _patch_compact_tool_result(
                                 working_messages,
@@ -1140,13 +1155,33 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         keep_override = tc.inputs.get("keep_last_n")
                         if keep_override is not None:
                             effective_policy = _effective_keep_last_n_policy(policy, keep_override)
+                        pre_basis = compaction_trigger_basis(last_input_tokens, working_messages)
+                        remaining_after_compact = compact_calls[index + 1 :] + terminal_calls
                         try:
                             attempt = await _summarize_attempt(
                                 working_messages,
                                 effective_policy,
                                 self.llm,
                                 extra_instructions=tc.inputs.get("instructions"),
+                                protect_after=completed_history_len,
                             )
+                        except asyncio.CancelledError as exception:
+                            _patch_compact_tool_result(
+                                working_messages,
+                                result_event,
+                                {"cancelled": True},
+                                is_error=True,
+                            )
+                            async for event in self._emit_placeholders(
+                                remaining_after_compact,
+                                lambda remaining, caught=exception: _control_flow_result(
+                                    remaining, caught
+                                ),
+                                working_messages,
+                                yield_events=False,
+                            ):
+                                yield event
+                            raise
                         except ProviderError as exception:
                             classified = _classified_tool_result(tc.name, tc.id, exception)
                             _patch_compact_tool_result(
@@ -1158,13 +1193,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             )
                             yield result_event
                             yield end_event
+                            async for event in self._emit_placeholders(
+                                remaining_after_compact,
+                                lambda remaining: _unexecuted_result(
+                                    remaining, reason="compaction_error"
+                                ),
+                                working_messages,
+                            ):
+                                yield event
                             raise
 
-                        if attempt.applied is not None or attempt.blank_digest:
-                            last_compacted_at_tokens = compaction_trigger_basis(
-                                last_input_tokens, working_messages
-                            )
                         if attempt.applied is not None:
+                            last_compacted_at_tokens = pre_basis
                             compact_result: Any = {
                                 "status": "context_compacted",
                                 "detail": (

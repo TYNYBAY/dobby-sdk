@@ -18,41 +18,57 @@ from ..types import (
 from .policy import ContextPolicy
 
 
-def _is_tool_use_message(msg: MessagePart) -> bool:
-    """True when ``msg`` is an assistant message carrying a tool call."""
-    return isinstance(msg, AssistantMessagePart) and any(
-        isinstance(p, ToolUsePart) for p in msg.parts
-    )
+def _tool_use_ids(msg: MessagePart) -> list[str]:
+    """Tool-call ids on an assistant message, otherwise empty."""
+    if not isinstance(msg, AssistantMessagePart):
+        return []
+    return [part.id for part in msg.parts if isinstance(part, ToolUsePart)]
 
 
-def _is_tool_result_message(msg: MessagePart) -> bool:
-    """True when ``msg`` is a user message carrying a tool result."""
-    return isinstance(msg, UserMessagePart) and any(
-        isinstance(p, ToolResultPart) for p in msg.parts
-    )
+def _tool_result_ids(msg: MessagePart) -> list[str]:
+    """Tool-result ids on a user message, otherwise empty."""
+    if not isinstance(msg, UserMessagePart):
+        return []
+    return [part.tool_use_id for part in msg.parts if isinstance(part, ToolResultPart)]
 
 
 def _find_tool_pairs(messages: list[MessagePart]) -> list[tuple[int, int]]:
     """Index complete tool round-trips as ``(tool_use_index, tool_result_index)``.
 
-    A trailing tool-use with no following tool-result (in-flight) is excluded, so
-    the current/unanswered turn is never a compaction candidate. Shared by the
-    trim and summarize paths.
+    Pairs a ``ToolUsePart`` with the later ``ToolResultPart`` that shares its
+    ``tool_use_id``. Adjacent executor-shaped use/result messages still pair;
+    interleaved uses then results (A, B, result-A, result-B) pair by id rather
+    than by neighbor. Unrelated ids are not paired. A trailing tool-use with no
+    matching result (in-flight) is excluded, so the current/unanswered turn is
+    never a compaction candidate. Shared by the trim and summarize paths.
     """
+    unmatched: dict[str, int] = {}
     pairs: list[tuple[int, int]] = []
-    i = 0
-    n = len(messages)
-    while i < n:
-        if (
-            _is_tool_use_message(messages[i])
-            and i + 1 < n
-            and _is_tool_result_message(messages[i + 1])
-        ):
-            pairs.append((i, i + 1))
-            i += 2
-        else:
-            i += 1
+    for index, message in enumerate(messages):
+        for use_id in _tool_use_ids(message):
+            unmatched.setdefault(use_id, index)
+        for result_id in _tool_result_ids(message):
+            use_index = unmatched.pop(result_id, None)
+            if use_index is not None:
+                pairs.append((use_index, index))
     return pairs
+
+
+def _cleared_tool_result_count(messages: list[MessagePart], result_indices: set[int]) -> int:
+    """Count tool-result payloads on messages that compaction actually edits.
+
+    Trim and summarize both report this as ``cleared_tool_uses``. Executor-shaped
+    history has one result per round-trip, so the count matches the number of
+    cleared pairs. When several results share one user message, every result on
+    that message is cleared together, and each one counts.
+    """
+    total = 0
+    for index in result_indices:
+        message = messages[index]
+        if not isinstance(message, UserMessagePart):
+            continue
+        total += sum(isinstance(part, ToolResultPart) for part in message.parts)
+    return total
 
 
 def edit_context(
@@ -60,11 +76,11 @@ def edit_context(
 ) -> tuple[list[MessagePart], AppliedEdit | None]:
     """Trim stale tool results into a placeholder on a fresh message list.
 
-    Identifies tool round-trips (an assistant tool-use message immediately
-    followed by its user tool-result message), keeps the most recent
-    ``policy.keep_last_n`` of them plus any in-flight (unanswered) tool use
-    verbatim, and replaces the tool-result payloads of older round-trips with
-    ``policy.placeholder``.
+    Identifies tool round-trips by matching ``ToolUsePart.id`` to
+    ``ToolResultPart.tool_use_id`` (adjacent executor-shaped pairs still match),
+    keeps the most recent ``policy.keep_last_n`` of them plus any in-flight
+    (unanswered) tool use verbatim, and replaces the tool-result payloads of
+    older round-trips with ``policy.placeholder``.
 
     The round-trip skeleton is preserved: the assistant tool-use message (and any
     Gemini thought-signature in its metadata) is reused by identity, and only the
@@ -89,9 +105,11 @@ def edit_context(
     # Clear every round-trip except the most recent keep_last_n.
     clear_cutoff = len(pairs) - policy.keep_last_n
     indices_to_clear = {result_idx for _, result_idx in pairs[:clear_cutoff]}
+    cleared_tool_uses = _cleared_tool_result_count(messages, indices_to_clear)
+    if cleared_tool_uses == 0:
+        return messages, None
 
     new_messages: list[MessagePart] = []
-    cleared_tool_uses = 0
     cleared_chars = 0
     for idx, msg in enumerate(messages):
         if idx not in indices_to_clear:
@@ -102,7 +120,6 @@ def edit_context(
         new_parts: list = []
         for part in msg.parts:
             if isinstance(part, ToolResultPart):
-                cleared_tool_uses += 1
                 cleared_chars += sum(len(p.text) for p in part.parts if isinstance(p, TextPart))
                 new_parts.append(
                     dataclasses.replace(part, parts=[TextPart(text=policy.placeholder)])
@@ -110,9 +127,6 @@ def edit_context(
             else:
                 new_parts.append(part)
         new_messages.append(dataclasses.replace(msg, parts=new_parts))
-
-    if cleared_tool_uses == 0:
-        return messages, None
 
     applied = AppliedEdit(
         type="clear_tool_uses",

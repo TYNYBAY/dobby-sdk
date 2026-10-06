@@ -16,10 +16,12 @@ class ContextPolicy(BaseModel):
     Passing an instance to ``AgentExecutor(context_policy=...)`` opts in to
     compaction; ``None`` (default) leaves the agent loop unchanged.
 
-    The trigger fires between turns when the combined token basis (previous
-    turn's input usage plus a live estimate of the outgoing message list)
-    reaches :attr:`trigger_tokens` (``ceil(trigger_pct * context_window)``).
-    The window size is configured here rather than looked up from the provider.
+    The trigger fires before a model call when the combined token basis
+    (previous turn's input usage plus a live estimate of the outgoing
+    message list) reaches :attr:`trigger_tokens`
+    (``ceil(trigger_pct * context_window)``). On the first call the live
+    estimate is used alone. The window size is configured here rather than
+    looked up from the provider.
 
     Attributes:
         context_window: Total context-window size, in tokens, for the model.
