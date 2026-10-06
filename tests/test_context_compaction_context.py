@@ -10,6 +10,7 @@ from pydantic import ValidationError
 import pytest
 
 from dobby.context import SUMMARIZE_PROMPT, ContextPolicy, edit_context, summarize_context
+from dobby.providers.gemini.converters import to_gemini_messages
 from dobby.types import (
     AssistantMessagePart,
     StreamEndEvent,
@@ -234,3 +235,143 @@ def test_summarize_context_noop_does_not_call_chat() -> None:
     assert applied is None
     llm.chat.assert_not_called()
     assert _result_texts(messages) == ["result-D", "result-E"]
+
+
+def test_summarize_preserves_messages_between_clearable_pairs() -> None:
+    """User instructions and assistant text between old pairs are not swallowed."""
+    preamble = UserMessagePart(parts=[TextPart(text="user question")])
+    never_delete = UserMessagePart(parts=[TextPart(text="NEVER-DELETE")])
+    assistant_text = AssistantMessagePart(parts=[TextPart(text="assistant note")])
+    use_a, result_a = _pair("A")
+    use_b, result_b = _pair("B")
+    use_c, result_c = _pair("C")
+    messages: list[Any] = [
+        preamble,
+        use_a,
+        result_a,
+        never_delete,
+        assistant_text,
+        use_b,
+        result_b,
+        use_c,
+        result_c,
+    ]
+    llm = AsyncMock()
+    llm.chat = AsyncMock(
+        return_value=StreamEndEvent(
+            model="summarizer",
+            parts=[TextPart(text="digest-AB")],
+            stop_reason="end_turn",
+            usage=None,
+        )
+    )
+    policy = ContextPolicy(keep_last_n=1, mode="summarize")
+
+    applied = asyncio.run(summarize_context(messages, policy, llm))
+
+    assert applied is not None
+    assert applied.cleared_tool_uses == 2
+    assert messages[0] is preamble
+    assert messages[1] is not never_delete
+    assert isinstance(messages[1], UserMessagePart)
+    assert messages[1].parts[0].text == "<summary>digest-AB</summary>"
+    assert messages[2] is never_delete
+    assert messages[3] is assistant_text
+    assert messages[4] is use_c
+    assert messages[5] is result_c
+    assert len(messages) == 6
+    assert use_a not in messages
+    assert result_a not in messages
+    assert use_b not in messages
+    assert result_b not in messages
+    summaries = [
+        message
+        for message in messages
+        if isinstance(message, UserMessagePart)
+        and any(
+            isinstance(part, TextPart) and part.text.startswith("<summary>")
+            for part in message.parts
+        )
+    ]
+    assert len(summaries) == 1
+
+
+def _gemini_roles(contents: list[Any]) -> list[str]:
+    return [content.role for content in contents]
+
+
+def _gemini_texts(content: Any) -> list[str]:
+    return [part.text for part in content.parts or [] if getattr(part, "text", None)]
+
+
+def test_gemini_merges_three_adjacent_plain_user_messages() -> None:
+    contents = to_gemini_messages(
+        [
+            UserMessagePart(parts=[TextPart(text="one")]),
+            UserMessagePart(parts=[TextPart(text="two")]),
+            UserMessagePart(parts=[TextPart(text="three")]),
+        ]
+    )
+    assert _gemini_roles(contents) == ["user"]
+    assert _gemini_texts(contents[0]) == ["one", "two", "three"]
+
+
+def test_gemini_plain_user_before_tool_result_stays_separate() -> None:
+    _use, result = _pair("A")
+    contents = to_gemini_messages(
+        [
+            UserMessagePart(parts=[TextPart(text="before")]),
+            result,
+        ]
+    )
+    assert _gemini_roles(contents) == ["user", "user"]
+    assert _gemini_texts(contents[0]) == ["before"]
+    assert contents[1].parts[0].function_response is not None
+    assert _gemini_texts(contents[1]) == []
+
+
+def test_gemini_plain_user_after_tool_result_stays_separate() -> None:
+    _use, result = _pair("A")
+    contents = to_gemini_messages(
+        [
+            result,
+            UserMessagePart(parts=[TextPart(text="after")]),
+        ]
+    )
+    assert _gemini_roles(contents) == ["user", "user"]
+    assert contents[0].parts[0].function_response is not None
+    assert _gemini_texts(contents[0]) == []
+    assert _gemini_texts(contents[1]) == ["after"]
+
+
+def test_gemini_model_turn_breaks_plain_user_merge() -> None:
+    contents = to_gemini_messages(
+        [
+            UserMessagePart(parts=[TextPart(text="one")]),
+            UserMessagePart(parts=[TextPart(text="two")]),
+            AssistantMessagePart(parts=[TextPart(text="mid")]),
+            UserMessagePart(parts=[TextPart(text="three")]),
+        ]
+    )
+    assert _gemini_roles(contents) == ["user", "model", "user"]
+    assert _gemini_texts(contents[0]) == ["one", "two"]
+    assert _gemini_texts(contents[1]) == ["mid"]
+    assert _gemini_texts(contents[2]) == ["three"]
+
+
+def test_gemini_alternating_user_model_history_is_unchanged() -> None:
+    contents = to_gemini_messages(
+        [
+            UserMessagePart(parts=[TextPart(text="hi")]),
+            AssistantMessagePart(parts=[TextPart(text="hello")]),
+            UserMessagePart(parts=[TextPart(text="again")]),
+            AssistantMessagePart(parts=[TextPart(text="ok")]),
+        ]
+    )
+    assert _gemini_roles(contents) == ["user", "model", "user", "model"]
+    assert [_gemini_texts(content) for content in contents] == [
+        ["hi"],
+        ["hello"],
+        ["again"],
+        ["ok"],
+    ]

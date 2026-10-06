@@ -60,15 +60,14 @@ async def summarize_context(
     """Summarize the old span of ``messages`` in place, write-back style.
 
     Selects tool round-trips older than ``policy.keep_last_n`` (never an
-    in-flight tool use). The clearable span runs from the first of those
-    tool-use messages through the last of their tool-result messages and
-    includes any messages in between. One non-streaming model call reusing
-    ``llm`` summarizes that span, then **replaces** it in ``messages`` with a
-    single new ``<summary>`` user turn. Only the list entries are mutated —
-    fresh dataclass instances are created, so the caller's part objects are
-    never touched. The replaced originals are stashed on the returned edit.
-    The executor, not this function, suppresses another attempt at the same
-    combined token basis.
+    in-flight tool use). Only those pair messages are summarized and removed;
+    user instructions and assistant text between pairs stay in place. One
+    non-streaming model call reusing ``llm`` summarizes the pairs, then a
+    single new ``<summary>`` user turn is inserted at the first removed pair.
+    Only the list entries are mutated — fresh dataclass instances are created,
+    so the caller's part objects are never touched. The replaced originals are
+    stashed on the returned edit. The executor, not this function, suppresses
+    another attempt at the same combined token basis.
 
     Args:
         messages: The live working message list (mutated in place).
@@ -84,7 +83,9 @@ async def summarize_context(
         from ``llm.chat``, including :class:`~dobby.providers.base.ProviderError`,
         propagate to the caller.
     """
-    return (await _summarize_attempt(messages, policy, llm, extra_instructions=extra_instructions)).applied
+    return (
+        await _summarize_attempt(messages, policy, llm, extra_instructions=extra_instructions)
+    ).applied
 
 
 async def _summarize_attempt(
@@ -104,9 +105,12 @@ async def _summarize_attempt(
         return _SummarizeAttempt(None, False)
 
     clearable = pairs[: len(pairs) - policy.keep_last_n]
-    span_start = clearable[0][0]  # first tool-use index
-    span_end = clearable[-1][1]  # last tool-result index
-    span = messages[span_start : span_end + 1]
+    clear_indices: set[int] = set()
+    span: list[MessagePart] = []
+    for use_idx, result_idx in clearable:
+        clear_indices.update((use_idx, result_idx))
+        span.append(messages[use_idx])
+        span.append(messages[result_idx])
 
     prompt = SUMMARIZE_PROMPT
     if extra_instructions:
@@ -126,7 +130,16 @@ async def _summarize_attempt(
 
     summary_msg = UserMessagePart(parts=[TextPart(text=f"<summary>{summary_text}</summary>")])
     replaced_originals = list(span)
-    messages[span_start : span_end + 1] = [summary_msg]
+    rebuilt: list[MessagePart] = []
+    inserted = False
+    for idx, msg in enumerate(messages):
+        if idx in clear_indices:
+            if not inserted:
+                rebuilt.append(summary_msg)
+                inserted = True
+            continue
+        rebuilt.append(msg)
+    messages[:] = rebuilt
 
     return _SummarizeAttempt(
         AppliedEdit(

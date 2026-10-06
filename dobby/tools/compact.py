@@ -17,9 +17,19 @@ class CompactContextTool(Tool):
     """Agent-invoked context compaction (summarize older tool history).
 
     Not registered automatically — add an instance to ``AgentExecutor(tools=[...])``.
-    Requires the executor to be constructed with a ``context_policy``; otherwise
-    the call returns the normal confirmation dict and does not summarize. When a
-    policy is set, the executor records the tool result first, then runs
+    After a successful call, the executor patches this tool's result to match
+    whether summarize actually edited the working copy:
+
+    * ``context_compacted`` — a digest was written back.
+    * ``context_unchanged`` / ``no_policy`` — no ``context_policy``; no summarize.
+    * ``context_unchanged`` / ``already_compacted`` — an automatic compaction
+      already ran this turn.
+    * ``context_unchanged`` / ``nothing_to_compact`` — nothing older than
+      ``keep_last_n`` was eligible.
+    * ``context_unchanged`` / ``empty_summary`` — summarizer returned only
+      whitespace; no edit.
+
+    When a policy is set, the executor records the tool result first, then runs
     summarize (never trim) with ``instructions`` and optional ``keep_last_n``
     overriding the policy default. A non-retryable tool error does not
     summarize. At most one compaction edit runs per agent turn; an automatic

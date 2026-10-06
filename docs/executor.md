@@ -117,7 +117,7 @@ Compaction is **off by default**. Pass `context_policy=ContextPolicy(...)` to en
 
 Automatic compaction runs **between completed agent turns**: after tool results for the current batch are on the working list and **before** the next model call. It does not run mid-stream.
 
-The trigger uses the previous turn's reported input tokens (from `StreamEndEvent.usage`, or a one-time character estimate when usage is missing) combined with a live estimate of the outgoing message list so large tool results appended after that turn still count. Compaction fires when that combined basis reaches `ContextPolicy.trigger_tokens` (`ceil(trigger_pct * context_window)`) **or** when the char estimate alone exceeds `context_window`. It does not fire on the first model call (no prior token basis yet). A per-run watermark suppresses firing summarize again at the **same** combined basis.
+The trigger uses the previous turn's reported input tokens (from `StreamEndEvent.usage`, or a one-time character estimate when usage is missing) combined with a live estimate of the outgoing message list so large tool results appended after that turn still count. Compaction fires when that combined basis reaches `ContextPolicy.trigger_tokens` (`ceil(trigger_pct * context_window)`). It does not fire on the first model call (no prior token basis yet). A per-run watermark suppresses firing summarize again at the **same** combined basis.
 
 At most **one** compaction edit is applied per agent turn. If automatic compaction already ran that turn, a later `compact_context` tool call in the same turn still returns its normal tool result but does not summarize again.
 
@@ -126,7 +126,7 @@ At most **one** compaction edit is applied per agent turn. If automatic compacti
 | `mode` | Behavior on automatic trigger | Working list after edit |
 |--------|------------------------------|-------------------------|
 | `"trim"` | Builds a **transient** send view: older tool-result payloads become `placeholder` (default `[Tool result cleared to save context.]`), keeping assistant tool-use messages and `tool_use_id` pairing intact. | Unchanged (trim is recomputed each trigger). |
-| `"summarize"` | One non-streaming LLM call replaces the clearable span — from the first older tool round-trip through the last, including any messages between them — with a single user message `TextPart` wrapped in `<summary>...</summary>`. | Updated in the working copy; the watermark blocks another summarize at the same combined basis, not for the whole growth episode. |
+| `"summarize"` | One non-streaming LLM call summarizes clearable tool-use/tool-result pairs older than `keep_last_n`. Only those pairs are removed; user instructions and assistant text between pairs stay in place. A single user message `TextPart` wrapped in `<summary>...</summary>` is inserted at the first removed pair. | Updated in the working copy; the watermark blocks another summarize at the same combined basis, not for the whole growth episode. |
 
 **`keep_last_n`**: the most recent *N* complete tool round-trips (assistant tool-use immediately followed by user tool-result) stay verbatim. An in-flight tool use with no result yet is never a compaction candidate.
 

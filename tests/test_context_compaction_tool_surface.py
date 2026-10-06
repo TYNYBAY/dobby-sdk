@@ -63,7 +63,7 @@ def _history(pairs: int = 3) -> list[Any]:
     return messages
 
 
-def _compact_call(call_id: str = "compact-1", *, keep_last_n: int | None = 1) -> ToolUsePart:
+def _compact_call(call_id: str = "compact-1", *, keep_last_n: Any = 1) -> ToolUsePart:
     inputs: dict[str, Any] = {"instructions": "keep ids"}
     if keep_last_n is not None:
         inputs["keep_last_n"] = keep_last_n
@@ -217,8 +217,27 @@ def test_compact_tool_without_policy_returns_result_only() -> None:
     assert tool._calls == 1  # type: ignore[attr-defined]
     assert provider.summarize_calls == []
     assert _edits(events) == []
-    assert _results(events)[0].result["status"] == "context_compacted"
+    assert _results(events)[0].result == {
+        "status": "context_unchanged",
+        "reason": "no_policy",
+    }
     assert _results(events)[0].is_error is False
+
+
+def test_compact_tool_reports_nothing_to_compact_when_keep_window_covers_history() -> None:
+    events, provider = _drive(
+        [([_compact_call(keep_last_n=5)], _usage(0)), ([], _usage(0))],
+        _history(pairs=3),
+        [CompactContextTool()],
+        policy=_policy(keep_last_n=5),
+    )
+    assert provider.summarize_calls == []
+    assert _edits(events) == []
+    assert _results(events)[0].is_error is False
+    assert _results(events)[0].result == {
+        "status": "context_unchanged",
+        "reason": "nothing_to_compact",
+    }
 
 
 def test_automatic_trim_and_compact_tool_do_not_both_compact() -> None:
@@ -239,7 +258,11 @@ def test_automatic_trim_and_compact_tool_do_not_both_compact() -> None:
     assert provider.summarize_calls == []
     assert edits
     assert all(edit.applied_edits[0].type == "clear_tool_uses" for edit in edits)
-    assert any(result.name == "compact_context" for result in _results(events))
+    compact_results = [result for result in _results(events) if result.name == "compact_context"]
+    assert compact_results[0].result == {
+        "status": "context_unchanged",
+        "reason": "already_compacted",
+    }
 
 
 def test_negative_keep_last_n_is_a_model_correction() -> None:
@@ -288,6 +311,53 @@ def test_invalid_compact_call_is_a_model_correction() -> None:
     assert _edits(events) == []
     assert str(_results(events)[0].result).startswith("[tool_input_invalid]")
     assert _results(events)[0].is_error is True
+
+
+def test_numeric_string_keep_last_n_override_is_validated() -> None:
+    """``keep_last_n="2"`` is coerced for the policy and does not raise TypeError."""
+    events, provider = _drive(
+        [([_compact_call(keep_last_n="2")], _usage(0)), ([], _usage(0))],
+        _history(pairs=3),
+        [CompactContextTool()],
+        policy=_policy(keep_last_n=1),
+    )
+    assert _results(events)[0].is_error is False
+    assert _results(events)[0].result["status"] == "context_compacted"
+    assert len(_edits(events)) == 1
+    assert len(provider.summarize_calls) == 1
+    summarized = str(provider.summarize_calls[0])
+    assert "payload-0" in summarized
+    assert "payload-1" in summarized
+    assert "payload-2" not in summarized
+    assert "payload-2" in str(provider.agent_calls[1])
+
+
+def test_float_keep_last_n_from_custom_tool_falls_back_to_policy() -> None:
+    """A custom edits_context tool may accept ``1.5``; the policy keeps its integer default."""
+
+    @dataclass
+    class _FloatKeepCompact(Tool):
+        name = "compact_context"
+        description = "Accept a float keep_last_n."
+        edits_context = True
+
+        def __call__(self, instructions: str, keep_last_n: float | None = None) -> dict[str, str]:
+            return {"status": "context_compacted", "detail": "ok"}
+
+    events, provider = _drive(
+        [([_compact_call(keep_last_n=1.5)], _usage(0)), ([], _usage(0))],
+        _history(pairs=3),
+        [_FloatKeepCompact()],
+        policy=_policy(keep_last_n=2),
+    )
+    assert _results(events)[0].is_error is False
+    assert _results(events)[0].result["status"] == "context_compacted"
+    assert len(_edits(events)) == 1
+    summarized = str(provider.summarize_calls[0])
+    assert "payload-0" in summarized
+    assert "payload-1" in summarized
+    assert "payload-2" not in summarized
+    assert "payload-2" in str(provider.agent_calls[1])
 
 
 def test_parallel_correction_skips_compact_tool() -> None:
@@ -390,7 +460,10 @@ def test_blank_compact_digest_watermarks_until_context_grows() -> None:
     compact_results = [result for result in _results(events) if result.name == "compact_context"]
     assert len(compact_results) == 1
     assert compact_results[0].is_error is False
-    assert compact_results[0].result["status"] == "context_compacted"
+    assert compact_results[0].result == {
+        "status": "context_unchanged",
+        "reason": "empty_summary",
+    }
     assert caller == snapshot
     assert all("<summary>" not in str(message) for message in provider.agent_calls)
     assert "payload-0" in str(provider.agent_calls[-1])
@@ -421,7 +494,8 @@ def test_blank_compact_digest_watermarks_until_context_grows() -> None:
     assert len(error_provider.agent_calls) == 1
     assert _edits(error_events) == []
     assert _results(error_events)[0].name == "compact_context"
-    assert _results(error_events)[0].is_error is False
+    assert _results(error_events)[0].is_error is True
+    assert str(_results(error_events)[0].result).startswith("[tool_execution_error]")
     assert error_caller == error_snapshot
 
 

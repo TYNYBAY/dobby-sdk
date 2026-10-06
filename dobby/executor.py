@@ -86,12 +86,50 @@ def _compaction_triggered(
     basis = compaction_trigger_basis(last_input_tokens, messages)
     if basis is None:
         return False
-    estimated = estimate_input_tokens(messages)
-    if basis < policy.trigger_tokens and estimated <= policy.context_window:
+    if basis < policy.trigger_tokens:
         return False
     if last_compacted_at_tokens is not None and basis == last_compacted_at_tokens:
         return False
     return True
+
+
+def _effective_keep_last_n_policy(policy: ContextPolicy, keep_override: Any) -> ContextPolicy:
+    """Return ``policy`` with a validated ``keep_last_n`` override.
+
+    Raw tool-call values are re-validated because ``model_copy(update=...)``
+    does not run field constraints. Invalid overrides keep the original policy.
+    """
+    try:
+        return policy.model_validate({**policy.model_dump(), "keep_last_n": keep_override})
+    except ValidationError:
+        return policy
+
+
+def _patch_compact_tool_result(
+    working_messages: list[MessagePart],
+    result_event: ToolResultEvent,
+    result: Any,
+    *,
+    is_error: bool = False,
+    error_details: ToolErrorDetails | None = None,
+) -> None:
+    """Replace the compact-tool result after the summarize attempt finishes."""
+    result_event.result = result
+    result_event.is_error = is_error
+    result_event.error_details = error_details
+    last = working_messages[-1]
+    if not isinstance(last, UserMessagePart):
+        return
+    for part in last.parts:
+        if isinstance(part, ToolResultPart) and part.tool_use_id == result_event.tool_use_id:
+            part.parts = [TextPart(text=str(result))]
+            part.is_error = is_error
+            return
+
+
+def _unchanged_compact_result(reason: str) -> dict[str, str]:
+    """Model-facing result when compact_context did not summarize."""
+    return {"status": "context_unchanged", "reason": reason}
 
 
 def _resolve_max_model_corrections(max_model_corrections: int | None) -> int:
@@ -754,8 +792,25 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                         if isinstance(part, ToolUsePart):
                             tool_calls.append(part)
                     if policy is not None:
+                        trimmed_send = send_messages is not working_messages
                         if event.usage is not None:
-                            last_input_tokens = event.usage.input_tokens
+                            reported = event.usage.input_tokens
+                            if trimmed_send:
+                                candidates = [
+                                    reported,
+                                    estimate_input_tokens(working_messages),
+                                ]
+                                if last_input_tokens is not None:
+                                    candidates.append(last_input_tokens)
+                                last_input_tokens = max(candidates)
+                            else:
+                                last_input_tokens = reported
+                        elif trimmed_send:
+                            estimated = estimate_input_tokens(working_messages)
+                            if last_input_tokens is None:
+                                last_input_tokens = estimated
+                            else:
+                                last_input_tokens = max(last_input_tokens, estimated)
                         elif last_input_tokens is None:
                             last_input_tokens = estimate_input_tokens(send_messages)
 
@@ -1038,10 +1093,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             call_result,
                             working_messages,
                         )
-                        yield result_event
-                        yield end_event
 
                         if call_result.retry_model:
+                            yield result_event
+                            yield end_event
                             async for event in self._emit_placeholders(
                                 compact_calls[index + 1 :] + terminal_calls,
                                 lambda remaining: _unexecuted_result(
@@ -1053,30 +1108,76 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 yield event
                             break
 
-                        # Tool result is already on working_messages. Summarize only
-                        # when this turn has not already applied an edit and this
-                        # invocation did not finish as a non-retryable error.
-                        if policy is None or compaction_in_progress:
+                        if call_result.is_error:
+                            yield result_event
+                            yield end_event
                             continue
-                        if call_result.is_error and not call_result.retry_model:
+
+                        # Tool result is already on working_messages so the new
+                        # pair occupies keep_last_n. Patch the stored result
+                        # after the summarize attempt, then yield.
+                        if policy is None:
+                            _patch_compact_tool_result(
+                                working_messages,
+                                result_event,
+                                _unchanged_compact_result("no_policy"),
+                            )
+                            yield result_event
+                            yield end_event
                             continue
+                        if compaction_in_progress:
+                            _patch_compact_tool_result(
+                                working_messages,
+                                result_event,
+                                _unchanged_compact_result("already_compacted"),
+                            )
+                            yield result_event
+                            yield end_event
+                            continue
+
                         compaction_in_progress = True
                         effective_policy = policy
                         keep_override = tc.inputs.get("keep_last_n")
                         if keep_override is not None:
-                            effective_policy = policy.model_copy(
-                                update={"keep_last_n": keep_override}
+                            effective_policy = _effective_keep_last_n_policy(policy, keep_override)
+                        try:
+                            attempt = await _summarize_attempt(
+                                working_messages,
+                                effective_policy,
+                                self.llm,
+                                extra_instructions=tc.inputs.get("instructions"),
                             )
-                        attempt = await _summarize_attempt(
-                            working_messages,
-                            effective_policy,
-                            self.llm,
-                            extra_instructions=tc.inputs.get("instructions"),
-                        )
+                        except ProviderError as exception:
+                            classified = _classified_tool_result(tc.name, tc.id, exception)
+                            _patch_compact_tool_result(
+                                working_messages,
+                                result_event,
+                                classified.result,
+                                is_error=True,
+                                error_details=classified.error_details,
+                            )
+                            yield result_event
+                            yield end_event
+                            raise
+
                         if attempt.applied is not None or attempt.blank_digest:
                             last_compacted_at_tokens = compaction_trigger_basis(
                                 last_input_tokens, working_messages
                             )
+                        if attempt.applied is not None:
+                            compact_result: Any = {
+                                "status": "context_compacted",
+                                "detail": (
+                                    "Older tool history has been summarized into a digest above."
+                                ),
+                            }
+                        elif attempt.blank_digest:
+                            compact_result = _unchanged_compact_result("empty_summary")
+                        else:
+                            compact_result = _unchanged_compact_result("nothing_to_compact")
+                        _patch_compact_tool_result(working_messages, result_event, compact_result)
+                        yield result_event
+                        yield end_event
                         if attempt.applied is not None:
                             yield ContextEditEvent(applied_edits=[attempt.applied])
                     else:
@@ -1112,9 +1213,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                         remaining, caught
                                     ),
                                     working_messages,
-                                    yield_events=not isinstance(
-                                        exception, asyncio.CancelledError
-                                    ),
+                                    yield_events=not isinstance(exception, asyncio.CancelledError),
                                 ):
                                     yield event
                                 raise

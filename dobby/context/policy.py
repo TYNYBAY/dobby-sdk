@@ -18,9 +18,8 @@ class ContextPolicy(BaseModel):
 
     The trigger fires between turns when the combined token basis (previous
     turn's input usage plus a live estimate of the outgoing message list)
-    reaches :attr:`trigger_tokens` (``ceil(trigger_pct * context_window)``), or
-    when the char estimate alone exceeds ``context_window``. The window size is
-    configured here rather than looked up from the provider.
+    reaches :attr:`trigger_tokens` (``ceil(trigger_pct * context_window)``).
+    The window size is configured here rather than looked up from the provider.
 
     Attributes:
         context_window: Total context-window size, in tokens, for the model.

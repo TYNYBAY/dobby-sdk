@@ -296,6 +296,29 @@ def test_trim_runs_before_next_model_call_and_preserves_caller() -> None:
     assert edits[0].applied_edits[0].type == "clear_tool_uses"
 
 
+def test_trim_stays_active_after_trimmed_usage_drops() -> None:
+    """A later trimmed-view usage report must not turn trim off while full history is still large."""
+    policy = _policy(keep_last_n=1)
+    trigger = policy.trigger_tokens
+    caller = _history(pairs=3)
+    assert estimate_input_tokens(caller) < trigger
+    _events, provider = _drive(
+        policy,
+        [
+            ([ToolUsePart(id="t1", name="noop", inputs={})], _usage(trigger)),
+            ([ToolUsePart(id="t2", name="noop", inputs={})], _usage(10)),
+            ([ToolUsePart(id="t3", name="noop", inputs={})], None),
+            ([], _usage(10)),
+        ],
+        caller,
+    )
+    assert len(provider.agent_calls) == 4
+    assert not _trim_applied(provider.agent_calls[0])
+    assert _trim_applied(provider.agent_calls[1])
+    assert _trim_applied(provider.agent_calls[2])
+    assert _trim_applied(provider.agent_calls[3])
+
+
 def test_usage_zero_does_not_trim() -> None:
     policy = _policy()
     _events, provider = _drive(

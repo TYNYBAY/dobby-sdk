@@ -94,8 +94,6 @@ exclude = [
     "node_modules",
     "site-packages",
     "venv",
-    # Frozen historical compaction snapshot; kept byte-for-byte.
-    "tests/vendor",
 ]
 
 # Same as Black.

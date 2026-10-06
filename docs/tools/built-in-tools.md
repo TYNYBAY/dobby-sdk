@@ -75,7 +75,7 @@ executor = AgentExecutor(
 )
 ```
 
-When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes and returns its confirmation dict, but the executor does **not** summarize.
+When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes but the executor does **not** summarize; the patched result is `context_unchanged` / `no_policy`.
 
 ### Parameters
 
@@ -86,13 +86,21 @@ When a `context_policy` is set and the tool call succeeds, `compact_context` use
 
 ### Tool result
 
-On a successful tool call the model sees:
+The executor patches the tool result after the summarize attempt. The status reflects whether an edit actually occurred:
 
 ```python
 {"status": "context_compacted", "detail": "Older tool history has been summarized into a digest above."}
+{"status": "context_unchanged", "reason": "no_policy"}
+{"status": "context_unchanged", "reason": "already_compacted"}
+{"status": "context_unchanged", "reason": "nothing_to_compact"}
+{"status": "context_unchanged", "reason": "empty_summary"}
 ```
 
-That confirmation is not proof that an edit was applied. `ContextEditEvent` is the authoritative signal that summarize changed the working copy.
+- `context_compacted` — summarize wrote a digest into the working copy (`ContextEditEvent` is also emitted).
+- `no_policy` — no `context_policy` on the executor.
+- `already_compacted` — an automatic compaction already ran this turn.
+- `nothing_to_compact` — nothing older than `keep_last_n` was eligible.
+- `empty_summary` — the summarizer returned only whitespace; no edit applied.
 
 ---
 
