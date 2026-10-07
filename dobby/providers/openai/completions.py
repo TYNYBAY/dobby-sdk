@@ -123,7 +123,7 @@ class OpenAICompletionsProvider:
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[BaseTool] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> StreamEndEvent: ...
 
     @overload
@@ -135,7 +135,7 @@ class OpenAICompletionsProvider:
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[BaseTool] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]: ...
 
     async def chat(
@@ -146,7 +146,7 @@ class OpenAICompletionsProvider:
         system_prompt: str | None = None,
         temperature: float = 0.0,
         tools: list[BaseTool] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
         """Generate chat completion from messages.
 

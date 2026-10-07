@@ -276,7 +276,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         model: str | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> StreamEndEvent: ...
 
     @overload
@@ -291,7 +291,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         model: str | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]: ...
 
     async def chat(
@@ -305,7 +305,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         model: str | None = None,
         reasoning_effort: str | int | None = None,
         max_tokens: int | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
         """Generate response from messages using Anthropic Messages API.
 

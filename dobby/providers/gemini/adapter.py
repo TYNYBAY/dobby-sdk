@@ -203,6 +203,9 @@ class GeminiProvider(Provider[genai.Client]):
         target_model = model or self._model
 
         max_tokens = kwargs.pop("max_tokens", None)
+        # Executor always forwards reasoning_effort=; Gemini config forbids extras.
+        if kwargs.get("reasoning_effort") is None:
+            kwargs.pop("reasoning_effort", None)
 
         config = genai_types.GenerateContentConfig(
             temperature=temperature,

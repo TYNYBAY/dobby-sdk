@@ -52,3 +52,9 @@ class TestGeminiChatModelOverride:
         provider = self._make_provider()
         captured = self._run_chat(provider, top_p=0.4)
         assert captured["config"].top_p == 0.4
+
+    def test_none_reasoning_effort_does_not_reach_config(self) -> None:
+        provider = self._make_provider()
+        captured = self._run_chat(provider, reasoning_effort=None)
+        dumped = captured["config"].model_dump(exclude_none=True)
+        assert "reasoning_effort" not in dumped

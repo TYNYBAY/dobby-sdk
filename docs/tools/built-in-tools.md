@@ -51,6 +51,59 @@ executor = AgentExecutor(
 
 ---
 
+## Compact Context Tool
+
+`CompactContextTool` lets the model request summarize-mode compaction on demand. It is **not** registered automatically — add it to your tool list like any custom tool.
+
+### Installation
+
+Part of `dobby-sdk` (`dobby.tools`).
+
+### Usage
+
+```python
+from dobby.context import ContextPolicy
+from dobby.tools import CompactContextTool
+
+# Any ContextPolicy enables the tool. It always summarizes, even if mode="trim".
+policy = ContextPolicy(keep_last_n=3)
+executor = AgentExecutor(
+    provider="openai",
+    llm=provider,
+    tools=[CompactContextTool(), ...],
+    context_policy=policy,
+)
+```
+
+When a `context_policy` is set and the tool call succeeds, `compact_context` uses the summarize path, regardless of `ContextPolicy.mode`. `keep_last_n` applies to older completed tool round-trips; the compact call's own pair and any sibling tools from the same model turn stay in history, including when `keep_last_n` is `0`. A non-retryable tool error does not summarize. Without `context_policy`, it still executes but the executor does **not** summarize; the patched result is `context_unchanged` / `no_policy`.
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `instructions` | `str` | Extra guidance appended to the summarizer prompt (IDs, paths, decisions to preserve). |
+| `keep_last_n` | `int \| None` | Recent tool round-trips to keep verbatim. Omit to use `ContextPolicy.keep_last_n`. |
+
+### Tool result
+
+The executor patches the tool result after the summarize attempt. The status reflects whether an edit actually occurred:
+
+```python
+{"status": "context_compacted", "detail": "Older tool history has been summarized into a digest above."}
+{"status": "context_unchanged", "reason": "no_policy"}
+{"status": "context_unchanged", "reason": "already_compacted"}
+{"status": "context_unchanged", "reason": "nothing_to_compact"}
+{"status": "context_unchanged", "reason": "empty_summary"}
+```
+
+- `context_compacted` — summarize wrote a digest into the working copy (`ContextEditEvent` is also emitted).
+- `no_policy` — no `context_policy` on the executor.
+- `already_compacted` — an automatic compaction already ran this turn.
+- `nothing_to_compact` — nothing older than `keep_last_n` was eligible.
+- `empty_summary` — the summarizer returned only whitespace; no edit applied.
+
+---
+
 ## Creating Custom Built-in Tools
 
 Add your own to `dobby/common_tools/`:
