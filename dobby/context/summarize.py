@@ -11,6 +11,7 @@ prefix into the new digest and removes them, so summary messages do not
 accumulate. Other user and assistant text stays in place.
 """
 
+import dataclasses
 from typing import NamedTuple
 
 from ..providers.base import Provider
@@ -19,10 +20,12 @@ from ..types import (
     MessagePart,
     StreamEndEvent,
     TextPart,
+    ToolResultPart,
+    ToolUsePart,
     UserMessagePart,
 )
 from ._tokens import part_to_text
-from .edit import _cleared_tool_result_count, _find_tool_pairs
+from .edit import _find_tool_round_trips
 from .policy import ContextPolicy
 
 _SUMMARY_PREFIX = "<summary>"
@@ -99,6 +102,64 @@ def _span_text(messages: list[MessagePart]) -> str:
     return "\n".join(lines)
 
 
+def _is_clearable_tool_part(part: object, clearable_ids: set[str]) -> bool:
+    """True when ``part`` is a tool use or result belonging to a clearable pair."""
+    if isinstance(part, ToolUsePart):
+        return part.id in clearable_ids
+    if isinstance(part, ToolResultPart):
+        return part.tool_use_id in clearable_ids
+    return False
+
+
+def _message_without_clearable_parts(
+    message: MessagePart, clearable_ids: set[str]
+) -> MessagePart | None:
+    """Drop clearable tool parts. ``None`` when nothing remains."""
+    kept = [part for part in message.parts if not _is_clearable_tool_part(part, clearable_ids)]
+    if not kept:
+        return None
+    if len(kept) == len(message.parts):
+        return message
+    return dataclasses.replace(message, parts=kept)
+
+
+def _message_clearable_span(message: MessagePart, clearable_ids: set[str]) -> MessagePart | None:
+    """Message containing only the clearable tool parts, if any."""
+    clearable = [part for part in message.parts if _is_clearable_tool_part(part, clearable_ids)]
+    if not clearable:
+        return None
+    if len(clearable) == len(message.parts):
+        return message
+    return dataclasses.replace(message, parts=clearable)
+
+
+def _summary_insert_index(
+    messages: list[MessagePart],
+    *,
+    clearable_ids: set[str],
+    fold_indices: set[int],
+    kept_pairs: list[tuple[int, int]],
+) -> int:
+    """Index at which to insert the new ``<summary>`` turn.
+
+    Starts at the first folded summary or message that holds a clearable part
+    (the previous "first removed entry" rule). If that point sits strictly
+    inside a kept pair, it moves to that pair's tool-use so the kept use and
+    result stay together.
+    """
+    touched = [
+        index
+        for index, message in enumerate(messages)
+        if index in fold_indices
+        or any(_is_clearable_tool_part(part, clearable_ids) for part in message.parts)
+    ]
+    insert_at = min(touched)
+    for use_idx, result_idx in kept_pairs:
+        if use_idx < insert_at < result_idx:
+            insert_at = use_idx
+    return insert_at
+
+
 async def summarize_context(
     messages: list[MessagePart],
     policy: ContextPolicy,
@@ -109,12 +170,14 @@ async def summarize_context(
     """Summarize the old span of ``messages`` in place, write-back style.
 
     Selects tool round-trips older than ``policy.keep_last_n`` (never an
-    in-flight tool use). Those pair messages are summarized and removed.
-    Earlier ``<summary>`` turns in that same prefix are included in the digest
-    and removed so repeated summarizes collapse to one summary message. User
-    instructions and assistant text between pairs stay in place. One
-    non-streaming model call reusing ``llm`` summarizes the span, then a
-    single new ``<summary>`` user turn is inserted at the first removed entry.
+    in-flight tool use). Those tool-use and tool-result *parts* are summarized
+    and removed; a message that still has other parts (kept tool parts or
+    normal text) stays. Earlier ``<summary>`` turns in that same prefix are
+    included in the digest and removed so repeated summarizes collapse to one
+    summary message. User instructions and assistant text between pairs stay
+    in place. One non-streaming model call reusing ``llm`` summarizes the
+    span, then a single new ``<summary>`` user turn is inserted at the first
+    removed entry, or before a kept pair that insertion would otherwise split.
     Only the list entries are mutated — fresh dataclass instances are created,
     so the caller's part objects are never touched. The replaced originals are
     stashed on the returned edit. The executor, not this function, suppresses
@@ -158,34 +221,44 @@ async def _summarize_attempt(
     (this turn's sibling tools and ``compact_context`` itself) are not
     clearable, so ``keep_last_n`` still applies only to older history.
     """
-    pairs = _find_tool_pairs(messages)
+    trips = _find_tool_round_trips(messages)
     if protect_after is None:
-        candidates = pairs
+        candidates = trips
     else:
-        candidates = [
-            (use_idx, result_idx) for use_idx, result_idx in pairs if use_idx < protect_after
-        ]
+        candidates = [trip for trip in trips if trip[0] < protect_after]
     if len(candidates) <= policy.keep_last_n:
         return _SummarizeAttempt(None, False)
 
-    clearable = candidates[: len(candidates) - policy.keep_last_n]
-    clear_indices: set[int] = set()
-    span_entries: list[tuple[int, MessagePart]] = []
-    for use_idx, result_idx in clearable:
-        clear_indices.update((use_idx, result_idx))
-        span_entries.append((use_idx, messages[use_idx]))
-        span_entries.append((result_idx, messages[result_idx]))
-    fold_indices = _summary_fold_indices(messages, candidates, policy.keep_last_n, protect_after)
-    for index in sorted(fold_indices):
-        span_entries.append((index, messages[index]))
-    if fold_indices:
-        span_entries.sort(key=lambda item: item[0])
-    span = [message for _, message in span_entries]
-    remove_indices = clear_indices | fold_indices
-    # Count before write-back. Shared result messages contribute every
-    # ToolResultPart on them, matching trim, not len(clearable).
-    cleared_tool_uses = _cleared_tool_result_count(
-        messages, {result_idx for _, result_idx in clearable}
+    keep_last_n = policy.keep_last_n
+    clearable = candidates[: len(candidates) - keep_last_n]
+    kept_pairs = (
+        [(use_idx, result_idx) for use_idx, result_idx, _ in candidates[-keep_last_n:]]
+        if keep_last_n
+        else []
+    )
+    clearable_ids = {tool_id for _, _, tool_id in clearable}
+    fold_indices = _summary_fold_indices(
+        messages,
+        [(use_idx, result_idx) for use_idx, result_idx, _ in candidates],
+        keep_last_n,
+        protect_after,
+    )
+    span: list[MessagePart] = []
+    for index, message in enumerate(messages):
+        if index in fold_indices:
+            span.append(message)
+            continue
+        piece = _message_clearable_span(message, clearable_ids)
+        if piece is not None:
+            span.append(piece)
+    # Count the result parts whose ids are actually removed, not every
+    # ToolResultPart sharing a message with a clearable pair.
+    cleared_tool_uses = sum(
+        1
+        for message in messages
+        if isinstance(message, UserMessagePart)
+        for part in message.parts
+        if isinstance(part, ToolResultPart) and part.tool_use_id in clearable_ids
     )
 
     prompt = SUMMARIZE_PROMPT
@@ -206,15 +279,26 @@ async def _summarize_attempt(
 
     summary_msg = UserMessagePart(parts=[TextPart(text=f"<summary>{summary_text}</summary>")])
     replaced_originals = list(span)
+    insert_at = _summary_insert_index(
+        messages,
+        clearable_ids=clearable_ids,
+        fold_indices=fold_indices,
+        kept_pairs=kept_pairs,
+    )
     rebuilt: list[MessagePart] = []
     inserted = False
     for idx, msg in enumerate(messages):
-        if idx in remove_indices:
-            if not inserted:
-                rebuilt.append(summary_msg)
-                inserted = True
+        if idx == insert_at and not inserted:
+            rebuilt.append(summary_msg)
+            inserted = True
+        if idx in fold_indices:
             continue
-        rebuilt.append(msg)
+        stripped = _message_without_clearable_parts(msg, clearable_ids)
+        if stripped is None:
+            continue
+        rebuilt.append(stripped)
+    if not inserted:
+        rebuilt.append(summary_msg)
     messages[:] = rebuilt
 
     return _SummarizeAttempt(

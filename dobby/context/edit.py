@@ -32,8 +32,8 @@ def _tool_result_ids(msg: MessagePart) -> list[str]:
     return [part.tool_use_id for part in msg.parts if isinstance(part, ToolResultPart)]
 
 
-def _find_tool_pairs(messages: list[MessagePart]) -> list[tuple[int, int]]:
-    """Index complete tool round-trips as ``(tool_use_index, tool_result_index)``.
+def _find_tool_round_trips(messages: list[MessagePart]) -> list[tuple[int, int, str]]:
+    """Complete tool round-trips as ``(tool_use_index, tool_result_index, tool_use_id)``.
 
     Pairs a ``ToolUsePart`` with the later ``ToolResultPart`` that shares its
     ``tool_use_id``. Adjacent executor-shaped use/result messages still pair;
@@ -43,24 +43,32 @@ def _find_tool_pairs(messages: list[MessagePart]) -> list[tuple[int, int]]:
     never a compaction candidate. Shared by the trim and summarize paths.
     """
     unmatched: dict[str, int] = {}
-    pairs: list[tuple[int, int]] = []
+    pairs: list[tuple[int, int, str]] = []
     for index, message in enumerate(messages):
         for use_id in _tool_use_ids(message):
             unmatched.setdefault(use_id, index)
         for result_id in _tool_result_ids(message):
             use_index = unmatched.pop(result_id, None)
             if use_index is not None:
-                pairs.append((use_index, index))
+                pairs.append((use_index, index, result_id))
     return pairs
+
+
+def _find_tool_pairs(messages: list[MessagePart]) -> list[tuple[int, int]]:
+    """Index complete tool round-trips as ``(tool_use_index, tool_result_index)``."""
+    return [
+        (use_index, result_index)
+        for use_index, result_index, _ in _find_tool_round_trips(messages)
+    ]
 
 
 def _cleared_tool_result_count(messages: list[MessagePart], result_indices: set[int]) -> int:
     """Count tool-result payloads on messages that compaction actually edits.
 
-    Trim and summarize both report this as ``cleared_tool_uses``. Executor-shaped
-    history has one result per round-trip, so the count matches the number of
-    cleared pairs. When several results share one user message, every result on
-    that message is cleared together, and each one counts.
+    Trim reports this as ``cleared_tool_uses``. Executor-shaped history has one
+    result per round-trip, so the count matches the number of cleared pairs.
+    When several results share one user message, every result on that message
+    is cleared together, and each one counts.
     """
     total = 0
     for index in result_indices:

@@ -271,7 +271,9 @@ def test_cleared_tool_uses_matches_results_actually_cleared() -> None:
     llm = _llm("digest")
     summary_edit = asyncio.run(summarize_context(summarized, policy, llm))
     assert summary_edit is not None
-    assert summary_edit.cleared_tool_uses == trim_edit.cleared_tool_uses == 2
+    # Trim clears every result on a shared message. Summarize removes only
+    # the older pair's result so the kept pair stays intact.
+    assert summary_edit.cleared_tool_uses == 1
 
     separate: list[Any] = []
     for label in ("A", "B", "C"):
