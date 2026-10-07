@@ -133,6 +133,16 @@ def _results(events: list[Any]) -> list[ToolResultEvent]:
     return [event for event in events if isinstance(event, ToolResultEvent)]
 
 
+def _stored_result_text(messages: list[Any], tool_use_id: str) -> str | None:
+    for message in messages:
+        if not isinstance(message, UserMessagePart):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolResultPart) and part.tool_use_id == tool_use_id:
+                return "".join(inner.text for inner in part.parts if isinstance(inner, TextPart))
+    return None
+
+
 def _drive(
     turns: list[tuple[list[Any], Usage | None]],
     messages: list[Any],
@@ -196,6 +206,25 @@ class _TypedTool(Tool):
         return count
 
 
+_CUSTOM_PAYLOAD = {"payload": "keep-me"}
+
+
+@dataclass
+class _LookupTool(Tool):
+    name = "lookup"
+    description = "Look up a value and compact older tool history."
+    edits_context = True
+
+    def __call__(self) -> dict[str, str]:
+        calls = getattr(self, "_calls", 0)
+        self._calls = calls + 1  # type: ignore[attr-defined]
+        return dict(_CUSTOM_PAYLOAD)
+
+
+def _lookup_call(call_id: str = "lookup-1") -> ToolUsePart:
+    return ToolUsePart(id=call_id, name="lookup", inputs={})
+
+
 def test_compact_tool_emits_summary_event_and_preserves_caller() -> None:
     caller = _history()
     snapshot = copy.deepcopy(caller)
@@ -218,6 +247,74 @@ def test_compact_tool_emits_summary_event_and_preserves_caller() -> None:
         "<summary>digest-kept</summary>" in str(message) for message in provider.agent_calls[1]
     )
     assert caller == snapshot
+
+
+def test_custom_edits_context_tool_without_policy_keeps_original_result() -> None:
+    """A custom edits_context tool is not patched to no_policy."""
+    tool = _LookupTool()
+    events, provider = _drive(
+        [([_lookup_call()], _usage(0)), ([], _usage(0))],
+        _history(),
+        [tool],
+        policy=None,
+    )
+    result = _results(events)[0]
+    assert tool._calls == 1  # type: ignore[attr-defined]
+    assert provider.summarize_calls == []
+    assert _edits(events) == []
+    assert result.name == "lookup"
+    assert result.is_error is False
+    assert result.result == _CUSTOM_PAYLOAD
+    assert _stored_result_text(provider.agent_calls[1], "lookup-1") == str(_CUSTOM_PAYLOAD)
+
+
+def test_custom_edits_context_tool_keeps_result_when_summarize_succeeds() -> None:
+    """Summarize still runs; the custom tool's successful payload is not replaced."""
+    tool = _LookupTool()
+    events, provider = _drive(
+        [([_lookup_call()], _usage(0)), ([], _usage(0))],
+        _history(),
+        [tool],
+        policy=_policy(keep_last_n=1),
+    )
+    result = _results(events)[0]
+    edits = _edits(events)
+    assert tool._calls == 1  # type: ignore[attr-defined]
+    assert len(provider.summarize_calls) == 1
+    assert result.name == "lookup"
+    assert result.is_error is False
+    assert result.result == _CUSTOM_PAYLOAD
+    assert _stored_result_text(provider.agent_calls[1], "lookup-1") == str(_CUSTOM_PAYLOAD)
+    assert len(edits) == 1
+    assert edits[0].applied_edits[0].type == "summarize"
+    assert edits[0].applied_edits[0].summary_text == "digest-kept"
+    assert any(
+        "<summary>digest-kept</summary>" in str(message) for message in provider.agent_calls[1]
+    )
+
+
+def test_custom_edits_context_tool_keeps_result_when_already_compacted() -> None:
+    """Auto-trim still skips a second summarize without overwriting the custom result."""
+    policy = _policy(keep_last_n=1, mode="trim")
+    trigger = policy.trigger_tokens
+    tool = _LookupTool()
+    events, provider = _drive(
+        [
+            ([ToolUsePart(id="n1", name="echo", inputs={})], _usage(trigger)),
+            ([_lookup_call()], _usage(trigger)),
+            ([], _usage(trigger)),
+        ],
+        _history(pairs=2),
+        [_EchoTool(), tool],
+        policy=policy,
+    )
+    lookup_results = [result for result in _results(events) if result.name == "lookup"]
+    assert tool._calls == 1  # type: ignore[attr-defined]
+    assert provider.summarize_calls == []
+    assert lookup_results[0].is_error is False
+    assert lookup_results[0].result == _CUSTOM_PAYLOAD
+    assert _stored_result_text(provider.agent_calls[2], "lookup-1") == str(_CUSTOM_PAYLOAD)
+    assert all(edit.applied_edits[0].type == "clear_tool_uses" for edit in _edits(events))
 
 
 def test_compact_tool_without_policy_returns_result_only() -> None:

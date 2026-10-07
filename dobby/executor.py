@@ -41,6 +41,7 @@ from .exceptions import (
 from .exceptions.tool import UNEXPECTED_TOOL_ERROR_MESSAGE
 from .providers.base import Provider, ProviderError
 from .providers.vertexai.converters import to_vertexai_tool
+from .tools.compact import CompactContextTool
 from .tools.retry import (
     ToolRetryPolicy,
     is_retryable_tool_exception,
@@ -1130,22 +1131,28 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
                         # Tool result is already on working_messages. Current-turn
                         # pairs are excluded from keep_last_n via protect_after.
-                        # Patch the stored result after the summarize attempt.
+                        # CompactContextTool's stub result is patched after the
+                        # summarize attempt; other edits_context tools keep theirs.
+                        patch_compact_status = isinstance(
+                            self._tools.get(tc.name), CompactContextTool
+                        )
                         if policy is None:
-                            _patch_compact_tool_result(
-                                working_messages,
-                                result_event,
-                                _unchanged_compact_result("no_policy"),
-                            )
+                            if patch_compact_status:
+                                _patch_compact_tool_result(
+                                    working_messages,
+                                    result_event,
+                                    _unchanged_compact_result("no_policy"),
+                                )
                             yield result_event
                             yield end_event
                             continue
                         if compaction_in_progress:
-                            _patch_compact_tool_result(
-                                working_messages,
-                                result_event,
-                                _unchanged_compact_result("already_compacted"),
-                            )
+                            if patch_compact_status:
+                                _patch_compact_tool_result(
+                                    working_messages,
+                                    result_event,
+                                    _unchanged_compact_result("already_compacted"),
+                                )
                             yield result_event
                             yield end_event
                             continue
@@ -1215,7 +1222,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             compact_result = _unchanged_compact_result("empty_summary")
                         else:
                             compact_result = _unchanged_compact_result("nothing_to_compact")
-                        _patch_compact_tool_result(working_messages, result_event, compact_result)
+                        if patch_compact_status:
+                            _patch_compact_tool_result(
+                                working_messages, result_event, compact_result
+                            )
                         yield result_event
                         yield end_event
                         if attempt.applied is not None:
