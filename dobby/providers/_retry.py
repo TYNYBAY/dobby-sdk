@@ -16,6 +16,7 @@ from tenacity.stop import stop_base
 
 from .._context import run_id_var
 from .._logging import logger
+from ..types import StreamStartEvent
 from .base import RETRYABLE_ERRORS
 
 
@@ -80,7 +81,11 @@ def create_retry_config(
 def with_retries[F: Callable[..., Any]](f: F) -> F:
     """Decorator that applies retry logic to async LLM API calls.
 
-    For async generators, wraps only the initial API call that may fail.
+    For async generators, retries until the first event that carries output.
+    Leading ``StreamStartEvent``s are held back, not yielded, because a
+    provider can accept a request, announce it, and then reject it before any
+    content (Azure OpenAI under regional load). Once an output event reaches
+    the caller, later failures propagate without retry.
     Reads `max_retries` from `self` if available, otherwise skips retry.
     Retries on unified RETRYABLE_ERRORS from base module.
     """
@@ -124,18 +129,25 @@ def with_retries[F: Callable[..., Any]](f: F) -> F:
             provider_name=getattr(self, "name", type(self).__name__),
         )
 
-        # Retry getting the async generator (where the API call happens)
+        # Retry until the stream yields its first output event. Start events
+        # carry no output, so a failure right after one is still retryable.
         gen: AsyncIterator[Any] = f(self, *args, **kwargs)  # overwritten on first attempt
-        first_item: Any = None
+        held: list[Any] = []
         async for attempt in AsyncRetrying(**config):
             with attempt:
                 gen = f(self, *args, **kwargs)
-                # Get first item to trigger any connection errors
-                first_item = await anext(gen)
+                held = []
+                while True:
+                    try:
+                        item = await anext(gen)
+                    except StopAsyncIteration:
+                        break
+                    held.append(item)
+                    if not isinstance(item, StreamStartEvent):
+                        break
 
-        # If we get here, first_item was successful
-        if first_item is not None:
-            yield first_item
+        for item in held:
+            yield item
         async for item in gen:
             yield item
 

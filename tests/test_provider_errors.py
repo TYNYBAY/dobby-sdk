@@ -533,6 +533,68 @@ class TestRetryWithUnifiedErrors:
             asyncio.run(run())
         assert calls == 1
 
+    def test_async_generator_retries_failure_after_start_event(self) -> None:
+        from dobby.providers._retry import with_retries
+        from dobby.types import StreamStartEvent
+
+        calls = 0
+
+        class FakeProvider:
+            name = "fake"
+            max_retries = 2
+
+            @with_retries
+            async def stream(self):
+                nonlocal calls
+                calls += 1
+                yield StreamStartEvent(id=f"attempt-{calls}", model="m")
+                if calls == 1:
+                    raise RateLimitError("rejected after accept", provider="fake")
+                yield "output"
+
+        async def run() -> list:
+            return [item async for item in FakeProvider().stream()]
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=self._fast_retry_config,
+        ):
+            items = asyncio.run(run())
+        assert calls == 2
+        assert [getattr(i, "id", i) for i in items] == ["attempt-2", "output"]
+
+    def test_async_generator_does_not_retry_after_output_following_start(self) -> None:
+        from dobby.providers._retry import with_retries
+        from dobby.types import StreamStartEvent
+
+        calls = 0
+
+        class FakeProvider:
+            name = "fake"
+            max_retries = 2
+
+            @with_retries
+            async def stream(self):
+                nonlocal calls
+                calls += 1
+                yield StreamStartEvent(id="s", model="m")
+                yield "output"
+                raise RateLimitError("after output", provider="fake")
+
+        async def run() -> None:
+            stream = FakeProvider().stream()
+            assert isinstance(await anext(stream), StreamStartEvent)
+            assert await anext(stream) == "output"
+            with pytest.raises(RateLimitError, match="after output"):
+                await anext(stream)
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=self._fast_retry_config,
+        ):
+            asyncio.run(run())
+        assert calls == 1
+
     def test_provider_retry_log_has_layer_correlation_and_attempt(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -624,6 +686,188 @@ class TestMidStreamErrorTranslation:
             assert exc_info.value.__cause__ is native
 
         asyncio.run(run())
+
+
+class TestOpenAIStreamRejectedAfterCreated:
+    """Azure capacity rejections that arrive after ``response.created``.
+
+    Under regional load, Azure OpenAI accepts the streamed request, sends
+    ``response.created``, then rejects it before any content. No output has
+    reached the caller, so the provider retry must still cover it.
+    """
+
+    @staticmethod
+    def _created():
+        return SimpleNamespace(
+            type="response.created",
+            response=SimpleNamespace(id="resp_1", model="gpt-5.1"),
+        )
+
+    @staticmethod
+    def _completed():
+        return SimpleNamespace(type="response.completed", response=SimpleNamespace(usage=None))
+
+    def _run_with_first_stream(self, rejected_stream):
+        """Return (events, create_call_count) for a rejected-then-healthy stream pair."""
+
+        async def healthy_stream():
+            yield self._created()
+            yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+            yield self._completed()
+
+        provider = TestOpenAIErrorTranslation()._make_provider()
+        provider.max_retries = 3
+        streams = iter([rejected_stream(), healthy_stream()])
+        provider._client.responses.create = AsyncMock(side_effect=lambda **_: next(streams))
+
+        async def run():
+            return [e async for e in provider._stream_chat_completion([], 0.0, "gpt-5.1")]
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=TestRetryWithUnifiedErrors._fast_retry_config,
+        ):
+            events = asyncio.run(run())
+        return events, provider._client.responses.create.await_count
+
+    def _assert_retried_cleanly(self, events, calls) -> None:
+        from dobby.types import StreamEndEvent, StreamErrorEvent, StreamStartEvent, TextPart
+
+        assert calls == 2, "rejected stream was not retried"
+        assert sum(isinstance(e, StreamStartEvent) for e in events) == 1
+        assert not any(isinstance(e, StreamErrorEvent) for e in events)
+        assert isinstance(events[-1], StreamEndEvent)
+        assert events[-1].parts == [TextPart(text="ok")]
+
+    def test_response_failed_non_transient_code_is_not_retried(self) -> None:
+        from dobby.types import StreamErrorEvent
+
+        async def rejected():
+            yield self._created()
+            yield SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    error=SimpleNamespace(code="invalid_prompt", message="Bad prompt")
+                ),
+            )
+
+        events, calls = self._run_with_first_stream(rejected)
+        assert calls == 1
+        assert isinstance(events[-1], StreamErrorEvent)
+        assert events[-1].error_code == "invalid_prompt"
+
+    def test_sdk_raised_rate_limit_after_created_is_retried(self) -> None:
+        import openai
+
+        async def rejected():
+            yield self._created()
+            raise openai.APIError(
+                "Too many requests",
+                request=MagicMock(),
+                body={"code": "rate_limit_exceeded", "message": "Too many requests"},
+            )
+
+        self._assert_retried_cleanly(*self._run_with_first_stream(rejected))
+
+    def test_error_event_after_created_is_retried(self) -> None:
+        async def rejected():
+            yield self._created()
+            yield SimpleNamespace(
+                type="error", code="rate_limit_exceeded", message="Too many requests", param=None
+            )
+
+        self._assert_retried_cleanly(*self._run_with_first_stream(rejected))
+
+    def test_response_failed_server_error_after_created_is_retried(self) -> None:
+        async def rejected():
+            yield self._created()
+            yield SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    error=SimpleNamespace(code="server_error", message="Server is busy")
+                ),
+            )
+
+        self._assert_retried_cleanly(*self._run_with_first_stream(rejected))
+
+
+class TestVertexStreamRejectedAfterAccept:
+    """Vertex AI quota or capacity errors that arrive inside an accepted stream.
+
+    The OpenAI SDK raises a plain ``openai.APIError`` for an error chunk, with
+    Google's error body: a numeric ``code`` and a ``status`` such as
+    ``RESOURCE_EXHAUSTED``. A transient one must be retried like an HTTP 429.
+    """
+
+    @staticmethod
+    def _chunk(text=None, finish=None):
+        return SimpleNamespace(
+            id="c1",
+            model="gemini",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=text, tool_calls=None, reasoning_content=None),
+                    finish_reason=finish,
+                )
+            ],
+        )
+
+    def _run(self, error_body):
+        """Return (events, create_call_count) for an error-chunk stream then a healthy one."""
+        import openai
+
+        from dobby.providers.vertexai.adapter import VertexAIProvider
+
+        async def rejected():
+            yield SimpleNamespace(id="c1", model="gemini", usage=None, choices=[])
+            raise openai.APIError("Vertex stream error", request=MagicMock(), body=error_body)
+
+        async def healthy():
+            yield self._chunk("ok")
+            yield self._chunk(None, "stop")
+
+        provider = VertexAIProvider(
+            model="google/gemini-2.5-flash", project="p", credentials=MagicMock()
+        )
+        provider.max_retries = 3
+        provider._client = MagicMock()
+        provider._bearer_token = AsyncMock(return_value="token")
+        streams = iter([rejected(), healthy()])
+        provider._client.chat.completions.create = AsyncMock(side_effect=lambda **_: next(streams))
+
+        async def run():
+            return [
+                e async for e in provider._stream_chat_completion([], "google/gemini-2.5-flash")
+            ]
+
+        with patch(
+            "dobby.providers._retry.create_retry_config",
+            side_effect=TestRetryWithUnifiedErrors._fast_retry_config,
+        ):
+            events = asyncio.run(run())
+        return events, provider._client.chat.completions.create.await_count
+
+    def test_resource_exhausted_in_stream_is_retried(self) -> None:
+        from dobby.types import StreamEndEvent
+
+        events, calls = self._run(
+            {"code": 429, "message": "Resource exhausted", "status": "RESOURCE_EXHAUSTED"}
+        )
+        assert calls == 2, "in-stream RESOURCE_EXHAUSTED was not retried"
+        assert isinstance(events[-1], StreamEndEvent)
+
+    def test_unavailable_in_stream_is_retried(self) -> None:
+        from dobby.types import StreamEndEvent
+
+        events, calls = self._run({"code": 503, "message": "Overloaded", "status": "UNAVAILABLE"})
+        assert calls == 2, "in-stream UNAVAILABLE was not retried"
+        assert isinstance(events[-1], StreamEndEvent)
+
+    def test_invalid_argument_in_stream_is_not_retried(self) -> None:
+        with pytest.raises(ProviderError) as exc_info:
+            self._run({"code": 400, "message": "Bad request", "status": "INVALID_ARGUMENT"})
+        assert not isinstance(exc_info.value, RETRYABLE_ERRORS)
 
 
 # ---------------------------------------------------------------------------

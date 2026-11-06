@@ -251,8 +251,31 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                 raise DobbyProviderError(
                     str(e), provider=self.name, status_code=e.status_code
                 ) from e
+            case openai.APIError():
+                # Raised by the SDK for an error payload inside an accepted
+                # stream; it carries the error code but no HTTP status.
+                self._raise_for_stream_error_code(e.code, str(e), cause=e)
+                raise DobbyProviderError(str(e), provider=self.name) from e
             case _:
                 raise DobbyProviderError(str(e), provider=self.name) from e
+
+    def _raise_for_stream_error_code(
+        self, code: str | None, message: str, cause: BaseException | None = None
+    ) -> None:
+        """Raise the retryable dobby error for a transient in-stream error code.
+
+        Returns normally for any other code, so the caller decides how to
+        surface it.
+
+        Raises:
+            DobbyRateLimitError: For ``rate_limit_exceeded``.
+            DobbyInternalServerError: For ``server_error``.
+        """
+        match code:
+            case "rate_limit_exceeded":
+                raise DobbyRateLimitError(message, provider=self.name) from cause
+            case "server_error":
+                raise DobbyInternalServerError(message, provider=self.name) from cause
 
     @overload
     async def chat(
@@ -626,8 +649,15 @@ class OpenAIProvider(Provider[AsyncOpenAI | AsyncAzureOpenAI]):
                         usage=usage_data,
                     )
 
+                case "error":
+                    message = event.message or "Unknown error"
+                    self._raise_for_stream_error_code(event.code, message)
+                    yield StreamErrorEvent(error_code=event.code, error_message=message)
+
                 case "response.failed":
                     error = event.response.error if event.response else None
+                    if error:
+                        self._raise_for_stream_error_code(error.code, error.message)
                     yield StreamErrorEvent(
                         error_code=error.code if error else None,
                         error_message=error.message if error else "Unknown error",

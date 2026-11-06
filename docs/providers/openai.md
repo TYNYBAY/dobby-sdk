@@ -114,7 +114,11 @@ async for event in await provider.chat(
 | `StreamEndEvent` | Stream finished, includes `parts`, `usage` |
 | `StreamErrorEvent` | Error occurred |
 
-SDK exceptions raised **mid-stream** (while reading chunks) use the same translation as a failed `chat()` call: rate limits, timeouts, connection failures, and 5xx map to `RateLimitError`, `APITimeoutError`, `APIConnectionError`, and `InternalServerError`; every other provider error is raised as `ProviderError` (the type provider adapters alias as `DobbyProviderError`). Those failures are not counted as Dobby tool retries or model corrections. Provider Tenacity retries those mapped retryable types only before the first streamed event. An error after streaming has begun is translated and propagated, not retried by that wrapper. That retry is independent of tool retry and `max_model_corrections`.
+SDK exceptions raised **mid-stream** (while reading chunks) use the same translation as a failed `chat()` call: rate limits, timeouts, connection failures, and 5xx map to `RateLimitError`, `APITimeoutError`, `APIConnectionError`, and `InternalServerError`; every other provider error is raised as `ProviderError` (the type provider adapters alias as `DobbyProviderError`). Those failures are not counted as Dobby tool retries or model corrections.
+
+An error that arrives inside an accepted stream is classified by its error code, whether the SDK raises it or it arrives as an `error` or `response.failed` event: `rate_limit_exceeded` becomes `RateLimitError` and `server_error` becomes `InternalServerError`. Any other code on an `error` or `response.failed` event is yielded as `StreamErrorEvent`.
+
+Provider Tenacity retries those mapped retryable types until the first event that carries output. `StreamStartEvent` carries none, so it is held back and a rejection right after it is still retried; this covers Azure OpenAI accepting a request under regional load and then rejecting it. An error after output has reached the caller is translated and propagated, not retried by that wrapper. That retry is independent of tool retry and `max_model_corrections`.
 
 ---
 
