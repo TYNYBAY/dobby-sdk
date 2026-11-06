@@ -681,6 +681,21 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 raise DobbyProviderError(
                     str(e), provider=self.name, status_code=e.status_code
                 ) from e
+            case openai.APIError():
+                # Raised by the SDK for an error chunk inside an accepted
+                # stream. Google's error body carries a numeric `code` and a
+                # `status` but no HTTP status on the exception.
+                body = e.body if isinstance(e.body, dict) else {}
+                code, status = str(body.get("code", "")), body.get("status")
+                if code == "429" or status == "RESOURCE_EXHAUSTED":
+                    raise DobbyRateLimitError(str(e), provider=self.name) from e
+                if code in ("500", "503") or status in ("INTERNAL", "UNAVAILABLE"):
+                    raise DobbyInternalServerError(
+                        str(e),
+                        provider=self.name,
+                        status_code=int(code) if code.isdigit() else 500,
+                    ) from e
+                raise DobbyProviderError(str(e), provider=self.name) from e
             case _:
                 raise DobbyProviderError(str(e), provider=self.name) from e
 

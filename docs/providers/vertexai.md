@@ -240,6 +240,8 @@ async for event in await provider.chat(messages, stream=True):
 
 Reasoning events are not emitted — Model Garden MaaS models targeted by this provider (Llama and OpenAI-compatible self-deployed containers) have no reasoning/thinking channel analogous to Claude's or OpenAI's o-series.
 
+An error chunk inside an accepted stream is classified by Google's error body: code `429` or status `RESOURCE_EXHAUSTED` raises `RateLimitError`, and code `500` or `503` or status `INTERNAL` or `UNAVAILABLE` raises `InternalServerError`. Anything else raises `ProviderError`. Both retryable types are retried until the first event that carries output; `StreamStartEvent` carries none, so it is held back until that event arrives. An error after output has reached the caller propagates without retry.
+
 ---
 
 ## Message Conversion
