@@ -1,11 +1,15 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.18] - 2026-11-06
+
+Streamed calls now survive a provider that accepts a request and then rejects it for load before sending any output: Azure OpenAI and Vertex AI rate-limit and overload errors inside a stream are retried instead of failing the call. This release also carries the tool-error and model-correction changes below, which break hosts that read `{"error": ...}` tool results.
 
 ### Added
 - **`max_model_corrections` on `AgentExecutor.run_stream()`.** One run-wide model-correction budget, default `3`, shared by tool-call correction and final-result correction. Exhausting it raises `ModelRetryExhaustedError`.
@@ -14,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 - **Tool error results and history no longer use `{"error": ...}`.** Classified failures are now a string of the form `[error_code] message` (for example `[tool_execution_error] The tool failed unexpectedly.`). Hosts that indexed `event.result["error"]` will raise `TypeError`.
 - **`run_stream()` can raise `ModelRetryExhaustedError`.** With the default budget of 3, a fourth correction batch raises instead of continuing until `max_iterations`. `max_iterations` is unchanged: it remains a silent cap.
+
+### Fixed
+- **Streamed calls are retried when the provider rejects them right after accepting them.** Under regional load, Azure OpenAI accepts a streamed request, announces it, then rejects it before any output. The retry used to stop at that announcement, so one rejection failed the whole call. Streams are now retried until the first output reaches the caller, for every provider; after output starts, an error still propagates without retry.
+- **In-stream rate-limit and overload errors are now retryable.** `OpenAIProvider` maps `rate_limit_exceeded` and `server_error` inside a stream (raised by the SDK, sent as an `error` event, or as `response.failed`) to `RateLimitError` and `InternalServerError`; an `error` event was previously dropped silently. `VertexAIProvider` maps an in-stream `429`/`RESOURCE_EXHAUSTED` to `RateLimitError` and `500`/`503`/`INTERNAL`/`UNAVAILABLE` to `InternalServerError`. Both used to surface as a non-retryable `ProviderError`.
 
 ## [0.2.17] - 2026-07-20
 
