@@ -159,13 +159,18 @@ class TestVertexAIConstructor:
         legitimately-named self-deployed containers (e.g. `gemini-finetune-v2`),
         matched only unqualified prefixes so fully-qualified ids slipped through
         anyway, and diverged from how comparable SDKs treat model names.
+
+        Pinned under `routing="openai"`, the route that keeps the verbatim
+        contract; native routing is covered in test_vertexai_routing.py.
         """
         provider = VertexAIProvider(
             model=model_id,
             project="my-project",
             credentials=_mock_credentials(),
+            routing="openai",
         )
         assert provider.model == model_id
+        assert provider._target.body_model(model_id) == model_id
 
     def test_max_retries_stored_on_instance(self) -> None:
         provider = VertexAIProvider(
@@ -742,12 +747,13 @@ class TestToVertexAITool:
 # ---------------------------------------------------------------------------
 
 
-def _make_chat_provider() -> VertexAIProvider:
+def _make_chat_provider(**kwargs: Any) -> VertexAIProvider:
     """Provider with a mocked underlying AsyncOpenAI client for chat() tests."""
     provider = VertexAIProvider(
         model="meta/llama-3.1-405b-instruct-maas",
         project="my-project",
         credentials=_mock_credentials(),
+        **kwargs,
     )
     provider._client = MagicMock()
     return provider
@@ -940,9 +946,10 @@ class TestNonStreamChatCompletion:
         """The removed guard fired at two sites: construction AND per-call override.
 
         A constructor-only test would still pass if a per-call-only guard were
-        reintroduced, so the permissive contract is pinned at both sites.
+        reintroduced, so the permissive contract is pinned at both sites. The
+        verbatim contract belongs to `routing="openai"`.
         """
-        provider = _make_chat_provider()
+        provider = _make_chat_provider(routing="openai")
         provider._client.chat.completions.create = AsyncMock(return_value=_make_response("ok"))
 
         async def _run() -> None:
