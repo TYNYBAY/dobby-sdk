@@ -22,12 +22,20 @@ tags:
   - model-garden
   - duplication
   - pydantic-ai
+  - native-routing
 related_components:
   - executor
   - tooling
 ---
 
 # VertexAIProvider looks like a duplicate of OpenAIProvider but cannot be deleted
+
+> **Update 2026-11-26.** `VertexAIProvider` is now **an auth strategy plus a router over
+> three protocols**: native Gemini (`google-genai`, `Client(vertexai=True)`), native
+> Anthropic (`AsyncAnthropicVertex`), and OpenAI-compatible Chat Completions. See
+> [the update below](#update-2026-11-26-a-router-over-three-protocols). The reasoning in the
+> rest of this document still holds for its Chat Completions route, which is the only
+> route for every publisher other than Google's Gemini and Anthropic.
 
 ## Problem
 
@@ -119,9 +127,11 @@ exists anywhere in the codebase.
 The package is named after a **cloud vendor**, while its actual identity is a **wire
 protocol plus an auth strategy**:
 
-| Named | Actually is |
+| Named | Actually is (2026-07-20) |
 |---|---|
 | `VertexAIProvider` | OpenAI Chat Completions client + GCP bearer-token auth |
+
+As of 2026-11-26 it is GCP auth plus a router over three protocols; see the update below.
 
 That mismatch is the root cause of the recurring question — it *is* another OpenAI
 provider, for a different dialect, and nothing in the name says so.
@@ -185,6 +195,51 @@ is load-bearing.
 - Similar file size and a shared SDK import are not evidence of duplication. Check the
   API surface actually called — here, `responses.create` versus
   `chat.completions.create` — before concluding anything.
+
+## Update 2026-11-26: a router over three protocols
+
+`VertexAIProvider` now routes by publisher, with `routing="native"` as the default:
+
+| Instance model | Route |
+|---|---|
+| `google/gemini*` | Native Gemini API through an internal `GeminiProvider` on `genai.Client(vertexai=True)` |
+| `anthropic/*` | Anthropic Messages API through an internal `AnthropicProvider` on `AsyncAnthropicVertex` |
+| anything else, or `endpoint_id=` set | OpenAI-compatible Chat Completions, as described above |
+
+`routing="openai"` keeps every model on Chat Completions. Its identity is now **an auth
+strategy plus a router over three protocols**, not one Chat Completions client.
+
+Why it changed:
+
+- **Comparable libraries route Gemini and Claude natively.** LiteLLM picks
+  `generateContent` for `gemini-*` and Anthropic's `rawPredict` for `claude-*` from one
+  entry point. pydantic-ai pairs `GoogleModel` with a Vertex provider and `AnthropicModel`
+  with `AsyncAnthropicVertex`. LangChain ships `ChatGoogleGenerativeAI(vertexai=True)` and
+  `ChatAnthropicVertex`. Only the remaining Model Garden publishers go through
+  `endpoints/openapi` in any of them.
+- **The extra translation lost data.** On the Chat Completions route Google translates
+  each request a second time. Gemini thought signatures were dropped (the Chat Completions
+  route now replays them through `tool_calls[].extra_content`), and Claude's thinking blocks
+  and their signatures had no place in the Chat Completions shape.
+
+What did not change, and why the 2026-07-20 decision still stands:
+
+- The Chat Completions route is still the only implementation of that protocol in the
+  codebase and still serves Llama, gpt-oss, Gemma and self-deployed endpoints. Test 1
+  above still holds for it.
+- No converters were copied. The native routes delegate to the existing Gemini and
+  Anthropic adapters through an internal `_from_client` constructor, so there is one
+  converter per protocol (avoiding LangChain's copied-converter drift).
+- `provider.name` stays `"vertexai"` on every route. The route is a private attribute,
+  and the tool format reaches the executor through the public `Provider.format_tools()`
+  rather than through a new executor literal.
+
+The rename question from 2026-07-20 changes shape: the package is now named after the
+cloud because it genuinely spans several protocols on that cloud. Naming by wire protocol
+still applies to the protocol modules underneath it.
+
+Diagrams: `docs/vertex-routing-options.md`. Migration: the "Upgrading from 0.2.x" section
+of `docs/providers/vertexai.md`.
 
 ## Related Issues
 

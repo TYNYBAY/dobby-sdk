@@ -4,26 +4,23 @@ Sends real requests and prints the raw response objects verbatim -- no
 formatting, no summarising, no interpretation. What the SDK returns is what you
 see.
 
-Everything goes through `VertexAIProvider`, Vertex's OpenAI-compatible Chat
-Completions surface. There are no native-provider cases here: `GeminiProvider`
-and `AnthropicProvider` target their direct APIs and need their own API keys,
-whereas this script needs only GCP credentials.
+Everything goes through `VertexAIProvider`, which needs only GCP credentials.
+With the default `--routing native`, Gemini and Claude go to their native
+Vertex APIs and every other case to the OpenAI-compatible Chat Completions
+endpoint. `--routing openai` sends every case through Chat Completions, as in
+0.2.x, so the two routes can be compared on the same prompts.
 
-    gemini   -> google/gemini-2.5-flash
-    claude   -> anthropic/claude-sonnet-4-5
-    openai   -> openai/gpt-oss-20b-maas
-    llama    -> meta/llama-3.3-70b-instruct-maas   (Model Garden)
-    deployed -> a self-deployed endpoint            (opt-in, needs VERTEX_ENDPOINT_ID)
+    gemini   -> google/gemini-2.5-flash             (native Gemini by default)
+    claude   -> anthropic/claude-sonnet-4-5         (native Anthropic by default)
+    openai   -> openai/gpt-oss-20b-maas             (Chat Completions)
+    llama    -> meta/llama-3.3-70b-instruct-maas    (Chat Completions, Model Garden)
+    deployed -> a self-deployed endpoint            (Chat Completions, opt-in, needs VERTEX_ENDPOINT_ID)
 
 Every id here is publisher-qualified, because the `openapi` endpoint requires
 it. A bare id is rejected before the model is ever consulted:
 
     400 INVALID_ARGUMENT — Malformed publisher model ('claude-sonnet-4-5') for
     the 'openapi' request endpoint ID; expected '<publisher>/<model>'
-
-Native Gemini and Claude are served here on a cruder path than a dedicated
-client would take -- no thought-signature handling, coarser finish-reason
-mapping. That is the documented trade-off of this endpoint, not a bug.
 
 Each case runs five scenarios against the live API:
 
@@ -43,6 +40,9 @@ Usage:
 
     # one scenario across all cases
     uv run --env-file .env python examples/live_vertex_test.py --only tools
+
+    # every case over Chat Completions (the 0.2.x route)
+    uv run --env-file .env python examples/live_vertex_test.py --routing openai
 
     # list case ids without calling anything
     uv run python examples/live_vertex_test.py --list
@@ -67,13 +67,13 @@ This spends real money on every model it reaches. Prompts are small, but it is
 not free.
 """
 
+import argparse
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import os
-import sys
 import traceback
-from typing import Annotated
+from typing import Annotated, Literal
 
 from dobby import AgentExecutor
 from dobby.providers import VertexAIProvider
@@ -129,23 +129,26 @@ class Case:
 
     id: str
     description: str
-    build: Callable[[], VertexAIProvider]
+    build: Callable[[Literal["native", "openai"]], VertexAIProvider]
     skip_by_default: bool = False
 
 
-def _model(model: str) -> Callable[[], VertexAIProvider]:
-    def build() -> VertexAIProvider:
+def _model(model: str) -> Callable[[Literal["native", "openai"]], VertexAIProvider]:
+    def build(routing: Literal["native", "openai"]) -> VertexAIProvider:
         return VertexAIProvider(
             model=model,
             project=VERTEX_PROJECT,
             location=VERTEX_LOCATION,
             scopes=VERTEX_SCOPES,
+            routing=routing,
         )
 
     return build
 
 
-def _self_deployed() -> VertexAIProvider:
+def _self_deployed(routing: Literal["native", "openai"]) -> VertexAIProvider:
+    # A self-deployed endpoint always uses Chat Completions; `routing` does not apply.
+    del routing
     return VertexAIProvider(
         endpoint_id=os.environ["VERTEX_ENDPOINT_ID"],
         endpoint_host=os.getenv("VERTEX_ENDPOINT_HOST"),
@@ -235,8 +238,8 @@ async def scenario_system(provider: VertexAIProvider) -> None:
 async def scenario_tools(provider: VertexAIProvider) -> None:
     """Full agent loop: tool call, execution, result fed back, final answer.
 
-    Runs through AgentExecutor so the tool-schema conversion to Vertex's
-    Chat Completions shape is exercised too.
+    Runs through AgentExecutor so the tool format of the active route
+    (`provider.format_tools()`) is exercised too.
     """
     executor = AgentExecutor(provider="vertexai", llm=provider, tools=[GetWeatherTool()])
     print(f"tool schema sent: {executor.get_tools_schema()!r}")
@@ -276,12 +279,14 @@ SCENARIO_FNS: dict[str, Callable] = {
 }
 
 
-async def run_case(case: Case, scenarios: tuple[str, ...]) -> dict[str, str]:
+async def run_case(
+    case: Case, scenarios: tuple[str, ...], routing: Literal["native", "openai"]
+) -> dict[str, str]:
     """Run every requested scenario for one case."""
-    _banner(f"{case.id}  |  {case.description}")
+    _banner(f"{case.id}  |  {case.description}  |  routing={routing}")
 
     try:
-        provider = case.build()
+        provider = case.build(routing)
     except Exception:
         print("CONSTRUCTION FAILED:")
         traceback.print_exc()
@@ -290,6 +295,7 @@ async def run_case(case: Case, scenarios: tuple[str, ...]) -> dict[str, str]:
     print(f"provider.name  = {provider.name!r}")
     print(f"provider.model = {provider.model!r}")
     print(f"project        = {provider.project!r}")
+    # The Chat Completions client; native routes use their own SDK clients.
     print(f"base_url       = {provider.client.base_url}")
 
     results: dict[str, str] = {}
@@ -304,7 +310,9 @@ async def run_case(case: Case, scenarios: tuple[str, ...]) -> dict[str, str]:
     return results
 
 
-async def main(selected: list[str], scenarios: tuple[str, ...]) -> int:
+async def main(
+    selected: list[str], scenarios: tuple[str, ...], routing: Literal["native", "openai"]
+) -> int:
     if not _has_credentials():
         print(
             "no GCP credentials found. Set GOOGLE_APPLICATION_CREDENTIALS_JSON, or "
@@ -322,7 +330,7 @@ async def main(selected: list[str], scenarios: tuple[str, ...]) -> int:
     else:
         cases = [c for c in CASES if not c.skip_by_default]
 
-    results = {case.id: await run_case(case, scenarios) for case in cases}
+    results = {case.id: await run_case(case, scenarios, routing) for case in cases}
 
     _banner("SUMMARY")
     header = f"{'case':12}" + "".join(f"{s:>11}" for s in scenarios)
@@ -339,26 +347,26 @@ async def main(selected: list[str], scenarios: tuple[str, ...]) -> int:
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
+    parser = argparse.ArgumentParser(
+        description="Live end-to-end test of VertexAIProvider against real models."
+    )
+    parser.add_argument("cases", nargs="*", help="case ids to run (default: all non opt-in)")
+    parser.add_argument("--only", choices=SCENARIOS, help="run a single scenario")
+    parser.add_argument(
+        "--routing",
+        choices=("native", "openai"),
+        default="native",
+        help="VertexAIProvider routing (default: native)",
+    )
+    parser.add_argument("--list", action="store_true", help="list case ids and exit")
+    args = parser.parse_args()
 
-    if "--list" in args:
+    if args.list:
         for c in CASES:
             marker = "  (opt-in)" if c.skip_by_default else ""
             print(f"{c.id:10} {c.description}{marker}")
         print(f"\nscenarios: {', '.join(SCENARIOS)}")
         raise SystemExit(0)
 
-    chosen = SCENARIOS
-    if "--only" in args:
-        i = args.index("--only")
-        if i + 1 >= len(args):
-            print(f"--only needs a scenario name: {', '.join(SCENARIOS)}")
-            raise SystemExit(2)
-        name = args[i + 1]
-        if name not in SCENARIOS:
-            print(f"unknown scenario {name!r}. available: {', '.join(SCENARIOS)}")
-            raise SystemExit(2)
-        chosen = (name,)
-        args = args[:i] + args[i + 2 :]
-
-    raise SystemExit(asyncio.run(main(args, chosen)))
+    chosen = (args.only,) if args.only else SCENARIOS
+    raise SystemExit(asyncio.run(main(args.cases, chosen, args.routing)))
