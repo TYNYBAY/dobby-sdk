@@ -59,6 +59,23 @@ def _make_mock_provider(tool_calls: list[ToolUsePart]):
     return provider
 
 
+def _assert_batched_turns(messages, turn_count: int) -> None:
+    """Require each tool turn to be one assistant message and one result message.
+
+    The results must answer the turn's calls one to one, in call order.
+    """
+    assistant_messages = [m for m in messages if isinstance(m, AssistantMessagePart)]
+    assert len(assistant_messages) == turn_count
+    for index, message in enumerate(messages):
+        if isinstance(message, AssistantMessagePart):
+            call_ids = [part.id for part in message.parts if isinstance(part, ToolUsePart)]
+            reply = messages[index + 1]
+            assert isinstance(reply, UserMessagePart)
+            assert [
+                part.tool_use_id for part in reply.parts if isinstance(part, ToolResultPart)
+            ] == call_ids
+
+
 async def _collect_results(executor, **kwargs):
     """Run executor.run_stream and collect ToolResultEvents."""
     results = []
@@ -70,22 +87,20 @@ async def _collect_results(executor, **kwargs):
 
 async def _collect_results_and_emitted_messages(executor):
     """Collect tool results and the messages built while emitting them."""
-    with patch.object(
-        executor, "_emit_tool_result", wraps=executor._emit_tool_result
-    ) as emit_result:
+    with patch.object(executor, "_flush_turn", wraps=executor._flush_turn) as flush_turn:
         results = await _collect_results(executor)
 
-    assert emit_result.call_args is not None
-    return results, emit_result.call_args.args[3]
+    assert flush_turn.call_args is not None
+    messages = flush_turn.call_args.args[0]
+    _assert_batched_turns(messages, flush_turn.call_count)
+    return results, messages
 
 
 async def _collect_batch_until_control_flow(executor, exception_type):
     """Collect an assembled batch and the host control-flow exception."""
     results = []
     caught = None
-    with patch.object(
-        executor, "_emit_tool_result", wraps=executor._emit_tool_result
-    ) as emit_result:
+    with patch.object(executor, "_flush_turn", wraps=executor._flush_turn) as flush_turn:
         try:
             async for event in executor.run_stream(messages=[], system_prompt=None):
                 if isinstance(event, ToolResultEvent):
@@ -94,8 +109,10 @@ async def _collect_batch_until_control_flow(executor, exception_type):
             caught = exception
 
     assert caught is not None
-    assert emit_result.call_args is not None
-    return results, emit_result.call_args.args[3], caught
+    assert flush_turn.call_args is not None
+    messages = flush_turn.call_args.args[0]
+    _assert_batched_turns(messages, flush_turn.call_count)
+    return results, messages, caught
 
 
 def _tool_result_parts(messages):
