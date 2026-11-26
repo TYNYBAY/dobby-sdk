@@ -20,6 +20,7 @@ from dobby.providers.base import ToolCallTruncatedError
 from dobby.tools import Tool
 from dobby.types import (
     AssistantMessagePart,
+    MessagePart,
     StreamEndEvent,
     StreamStartEvent,
     TextDeltaEvent,
@@ -32,7 +33,7 @@ from dobby.types import (
     UserMessagePart,
 )
 
-HI = [UserMessagePart(parts=[TextPart(text="hi")])]
+HI: list[MessagePart] = [UserMessagePart(parts=[TextPart(text="hi")])]
 
 
 def _make_provider():
@@ -54,7 +55,7 @@ def _call(
 
 
 def _response(
-    parts: list[genai_types.Part], finish_reason: str = "STOP", usage: bool = True
+    parts: list[genai_types.Part], finish_reason: str | None = "STOP", usage: bool = True
 ) -> genai_types.GenerateContentResponse:
     return genai_types.GenerateContentResponse(
         candidates=[
@@ -222,7 +223,9 @@ class TestNonStreamParsing:
         part = _call("search")
         part.thought_signature = b"sig"
         end = self._chat(_response([part]))
-        assert end.parts[0].metadata == {"signature": base64.b64encode(b"sig").decode()}
+        tool_part = end.parts[0]
+        assert isinstance(tool_part, ToolUsePart)
+        assert tool_part.metadata == {"signature": base64.b64encode(b"sig").decode()}
 
     def test_safety_finish_reason(self) -> None:
         end = self._chat(_response([genai_types.Part(text="x")], finish_reason="SAFETY"))
@@ -469,7 +472,9 @@ class TestToolCallIds:
         captured = _capture_non_stream(provider, _response([_call("search")]))
         end = asyncio.run(provider.chat(iter(history)))
         assert len(captured["contents"]) == 3
-        assert end.parts[0].id == "call_search_2"
+        tool_part = end.parts[0]
+        assert isinstance(tool_part, ToolUsePart)
+        assert tool_part.id == "call_search_2"
 
     def test_truncated_stream_call_matches_helper(self) -> None:
         history = _history_with_search("ok", is_error=False)
