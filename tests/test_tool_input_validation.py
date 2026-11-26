@@ -6,7 +6,7 @@ from datetime import date
 from enum import Enum
 import json
 from typing import Annotated
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -38,6 +38,7 @@ def _make_mock_provider(tool_calls: list[ToolUsePart]) -> AsyncMock:
 
     provider = AsyncMock()
     provider.chat = mock_chat
+    provider.format_tools = Mock(return_value=None)
     return provider
 
 

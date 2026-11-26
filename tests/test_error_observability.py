@@ -42,6 +42,10 @@ class _RecordingProvider:
         self.calls = 0
         self.messages: list[list[object]] = []
 
+    def format_tools(self, tools):
+        del tools
+        return None
+
     async def chat(self, messages, **kwargs):
         del kwargs
         self.calls += 1

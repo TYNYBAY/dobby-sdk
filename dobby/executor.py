@@ -263,10 +263,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
-        provider: The tool-schema wire format ('openai', 'azure-openai', 'gemini',
-            'anthropic', 'vertexai'). This selects a schema shape, not a provider
-            identity -- a provider's `.name` may differ (e.g. AnthropicProvider
-            reports "azure-anthropic" on Azure but pairs with 'anthropic' here).
+        provider: The fallback tool-schema wire format ('openai', 'azure-openai',
+            'gemini', 'anthropic', 'vertexai'), used when `llm.format_tools()`
+            returns None. This selects a schema shape, not a provider identity --
+            a provider's `.name` may differ (e.g. AnthropicProvider reports
+            "azure-anthropic" on Azure but pairs with 'anthropic' here).
         llm: The LLM provider instance
         output_type: Pydantic model for structured output (optional)
         output_mode: How to get structured output ('tool' or 'native')
@@ -285,9 +286,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
         Args:
             provider: Tool-schema wire format. Use 'openai' for OpenAIProvider
-                (Responses API), 'vertexai' for VertexAIProvider (Chat
-                Completions), 'anthropic' for AnthropicProvider in either mode
-                (direct or Azure), and 'gemini' for GeminiProvider.
+                (Responses API), 'vertexai' for VertexAIProvider, 'anthropic'
+                for AnthropicProvider in either mode (direct or Azure), and
+                'gemini' for GeminiProvider. A provider whose `format_tools()`
+                returns a list overrides this literal, so 'vertexai' follows
+                the VertexAIProvider's route rather than always meaning Chat
+                Completions.
             llm: LLM provider instance for chat completions
             tools: List of Tool instances to register
             output_type: Pydantic BaseModel for structured output
@@ -333,9 +337,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
     def get_tools_schema(self) -> list:
         """Get tool schemas formatted for the LLM provider.
 
+        The provider's `format_tools()` decides the format when it returns a
+        list; otherwise the `provider` literal does. The result is cached.
+
         Returns:
             List of tool schemas in provider-specific format
         """
+        if self._formatted_tools is None:
+            if self._tools:
+                self._formatted_tools = self.llm.format_tools(list(self._tools.values()))
         if self._formatted_tools is None:
             match self.provider:
                 case "openai" | "azure-openai":
