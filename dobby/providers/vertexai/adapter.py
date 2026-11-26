@@ -47,7 +47,7 @@ from ..base import (
     RateLimitError as DobbyRateLimitError,
     _iter_translated,
 )
-from .converters import to_vertexai_messages
+from .converters import EXTRA_CONTENT_KEY, to_vertexai_messages
 
 __all__ = ["VertexAIProvider"]
 
@@ -160,6 +160,27 @@ _FINISH_REASON_MAP: dict[str, StopReason] = {
     "tool_calls": "tool_use",
     "content_filter": "content_filter",
 }
+
+
+def _extra_content_metadata(tool_call: Any) -> dict[str, Any] | None:
+    """Return ToolUsePart metadata for a tool call's `extra_content`, if usable.
+
+    Vertex's OpenAI-compatible endpoint returns Gemini thought signatures on
+    `tool_calls[].extra_content`, a field the openai SDK keeps as a pydantic
+    extra. Omitting a required signature on a Gemini 3+ function call returns
+    400, so it must be replayed unchanged. Values that are missing, empty or
+    not a dict are dropped rather than replayed.
+
+    Args:
+        tool_call: A response tool call or streaming tool-call delta.
+
+    Returns:
+        `{"extra_content": value}`, or None when there is nothing to replay.
+    """
+    value = getattr(tool_call, "extra_content", None)
+    if isinstance(value, dict) and value:
+        return {EXTRA_CONTENT_KEY: value}
+    return None
 
 
 # Bounds for the streaming tool-call accumulator (see _stream_chat_completion).
@@ -732,6 +753,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                     id=tool_call.id,
                     name=tool_call.function.name,
                     inputs=json.loads(tool_call.function.arguments),
+                    metadata=_extra_content_metadata(tool_call),
                 )
             )
 
@@ -802,7 +824,8 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         finish_reason: str | None = None
         usage: Usage | None = None
 
-        # index -> {"id": str | None, "name": str | None, "arguments": str}
+        # index -> {"id": str | None, "name": str | None, "arguments": str,
+        #           "metadata": dict | None}
         tool_call_accumulator: dict[int, dict[str, Any]] = {}
         accumulated_arguments_length = 0
 
@@ -872,6 +895,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                             "id": None,
                             "name": None,
                             "arguments": "",
+                            "metadata": None,
                         }
                     acc = tool_call_accumulator[index]
 
@@ -882,6 +906,8 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                         acc["id"] = tc_delta.id
                     if tc_delta.function is not None and tc_delta.function.name:
                         acc["name"] = tc_delta.function.name
+                    if metadata := _extra_content_metadata(tc_delta):
+                        acc["metadata"] = metadata
                     if fragment:
                         acc["arguments"] += fragment
                         accumulated_arguments_length += len(fragment)
@@ -902,10 +928,16 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 id=acc["id"] or "",
                 name=acc["name"] or "",
                 inputs=json.loads(acc["arguments"]) if acc["arguments"] else {},
+                metadata=acc["metadata"],
             )
             yield tool_event
             parts.append(
-                ToolUsePart(id=tool_event.id, name=tool_event.name, inputs=tool_event.inputs)
+                ToolUsePart(
+                    id=tool_event.id,
+                    name=tool_event.name,
+                    inputs=tool_event.inputs,
+                    metadata=tool_event.metadata,
+                )
             )
 
         stop_reason: StopReason = (
