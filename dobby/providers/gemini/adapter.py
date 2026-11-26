@@ -7,13 +7,14 @@ Google's Gemini API via the google-genai SDK.
 import base64
 from collections.abc import AsyncIterator, Iterable
 import json
-from typing import Any, Literal, NoReturn, overload
+from typing import Any, Literal, NoReturn, Self, overload
 
 from google import genai
 from google.genai import (
     errors as gemini_errors,
     types as genai_types,
 )
+import httpx
 
 from ...types import (
     AssistantMessagePart,
@@ -35,6 +36,7 @@ from ...types import (
 )
 from .._retry import with_retries
 from ..base import (
+    APIConnectionError as DobbyAPIConnectionError,
     APITimeoutError as DobbyAPITimeoutError,
     InternalServerError as DobbyInternalServerError,
     Provider,
@@ -169,6 +171,7 @@ class GeminiProvider(Provider[genai.Client]):
     api_key: str | None
     _model: str
     _client: genai.Client
+    _provider_name: str
     max_retries: int
 
     def __init__(
@@ -201,10 +204,44 @@ class GeminiProvider(Provider[genai.Client]):
 
         self._client = genai.Client(api_key=api_key)
 
+    @classmethod
+    def _from_client(
+        cls,
+        client: genai.Client,
+        model: str,
+        *,
+        max_retries: int = 3,
+        provider_name: str = "gemini",
+    ) -> Self:
+        """Build a provider around a pre-built client, skipping `__init__`.
+
+        Internal construction path for `VertexAIProvider`, which hands in a
+        `genai.Client(vertexai=True, ...)` and reuses this adapter's converters,
+        streaming, retries and error translation as they are.
+
+        Args:
+            client: An already-configured `genai.Client`.
+            model: Model name sent on each request.
+            max_retries: Maximum retry attempts for transient errors.
+            provider_name: Value of `name`, reported in errors and retry logs.
+
+        Returns:
+            A provider that sends every request through `client`.
+        """
+        provider = cls.__new__(cls)
+        provider.api_key = None
+        provider._model = model
+        provider.max_retries = max_retries
+        provider._client = client
+        provider._provider_name = provider_name
+        return provider
+
     @property
     def name(self) -> str:
-        """Provider name."""
-        return "gemini"
+        """Provider name (`"gemini"` unless injected via `_from_client`)."""
+        # getattr fallback keeps this robust when the instance is built via
+        # __new__ (e.g. in tests) without running __init__.
+        return getattr(self, "_provider_name", "gemini")
 
     @property
     def model(self) -> str:
@@ -224,26 +261,30 @@ class GeminiProvider(Provider[genai.Client]):
         Args:
             e: The original Gemini SDK exception.
 
+        `google-genai` puts the int HTTP code in `code`; `status` holds the
+        gRPC status string (e.g. `"RESOURCE_EXHAUSTED"`), so matching keys on
+        `code`. Transport failures arrive as raw `httpx` exceptions.
+
         Raises:
             DobbyRateLimitError: For rate limit errors (429).
-            DobbyAPITimeoutError: For timeout errors (408).
-            DobbyAPIConnectionError: For connection failures.
+            DobbyAPITimeoutError: For timeout errors (408, httpx timeouts).
+            DobbyAPIConnectionError: For other httpx transport failures.
             DobbyInternalServerError: For server errors (5xx).
             DobbyProviderError: For all other API errors.
         """
         match e:
-            case gemini_errors.ClientError() if getattr(e, "status", None) == 429:
+            case gemini_errors.APIError(code=429):
                 raise DobbyRateLimitError(str(e), provider=self.name) from e
-            case gemini_errors.ClientError() if getattr(e, "status", None) == 408:
+            case gemini_errors.APIError(code=408) | httpx.TimeoutException():
                 raise DobbyAPITimeoutError(str(e), provider=self.name) from e
             case gemini_errors.ServerError():
-                status = getattr(e, "status", 500)
                 raise DobbyInternalServerError(
-                    str(e), provider=self.name, status_code=status
+                    str(e), provider=self.name, status_code=e.code
                 ) from e
-            case gemini_errors.ClientError():
-                status = getattr(e, "status", None)
-                raise DobbyProviderError(str(e), provider=self.name, status_code=status) from e
+            case gemini_errors.APIError():
+                raise DobbyProviderError(str(e), provider=self.name, status_code=e.code) from e
+            case httpx.TransportError():
+                raise DobbyAPIConnectionError(str(e), provider=self.name) from e
             case _:
                 raise DobbyProviderError(str(e), provider=self.name) from e
 

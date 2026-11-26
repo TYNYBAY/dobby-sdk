@@ -687,6 +687,75 @@ class TestConstructorSignature:
             assert GeminiProvider(model="gemini-2.5-flash", api_key="k").name == "gemini"
 
 
+def _vertex_provider(max_retries: int = 3):
+    """An adapter built through the internal path around a mock `AsyncAnthropicVertex`."""
+    from anthropic import AsyncAnthropicVertex
+
+    from dobby.providers.anthropic.adapter import AnthropicProvider
+
+    client = MagicMock(spec=AsyncAnthropicVertex)
+    client.messages = MagicMock()
+    return AnthropicProvider._from_client(
+        client, "claude-sonnet-4-5", max_retries=max_retries, provider_name="vertexai"
+    )
+
+
+class TestInjectedVertexClient:
+    """The internal `_from_client` path runs the adapter on an `AsyncAnthropicVertex`."""
+
+    def test_messages_create_called_with_converted_messages(self) -> None:
+        from dobby.types import TextPart, UserMessagePart
+
+        provider = _vertex_provider()
+        response = MagicMock()
+        response.content = []
+        response.stop_reason = "end_turn"
+        response.model = "claude-sonnet-4-5"
+        response.usage = None
+        provider.client.messages.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat([UserMessagePart(parts=[TextPart(text="hi")])], system_prompt="be brief")
+        )
+
+        provider.client.messages.create.assert_awaited_once()
+        sent = provider.client.messages.create.await_args.kwargs
+        assert sent["model"] == "claude-sonnet-4-5"
+        assert sent["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        assert sent["system"] == "be brief"
+
+    def test_name_and_attributes(self) -> None:
+        provider = _vertex_provider(max_retries=0)
+        assert provider.name == "vertexai"
+        assert provider.model == "claude-sonnet-4-5"
+        assert provider.max_retries == 0
+
+    def test_rate_limit_reports_vertexai(self) -> None:
+        import anthropic
+        import httpx
+
+        from dobby.types import TextPart, UserMessagePart
+
+        provider = _vertex_provider(max_retries=0)
+        native_err = anthropic.RateLimitError(
+            "rate limited",
+            response=httpx.Response(
+                429,
+                headers={"retry-after": "7"},
+                request=httpx.Request("POST", "https://example.invalid"),
+            ),
+            body=None,
+        )
+        provider.client.messages.create = AsyncMock(side_effect=native_err)
+
+        with pytest.raises(RateLimitError) as exc_info:
+            asyncio.run(provider.chat([UserMessagePart(parts=[TextPart(text="hi")])]))
+
+        assert exc_info.value.provider == "vertexai"
+        assert exc_info.value.retry_after == 7.0
+        assert exc_info.value.__cause__ is native_err
+
+
 class TestAzureValidation:
     """Test fail-fast validation of mutually exclusive Azure params."""
 
@@ -790,6 +859,13 @@ class TestChatModelOverride:
         redacted = [p for p in result.parts if isinstance(p, ReasoningPart) and p.redacted]
         assert len(redacted) == 1
         assert redacted[0].text == "ENC"
+
+
+class TestChatModelOverrideOnVertexClient(TestChatModelOverride):
+    """Re-run the request-shape tests against an injected `AsyncAnthropicVertex`."""
+
+    def _make_provider(self):
+        return _vertex_provider()
 
 
 # ---------------------------------------------------------------------------
