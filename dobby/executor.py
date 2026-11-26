@@ -48,6 +48,7 @@ from .tools.tool import Tool, format_pydantic_validation_issues
 from .types import (
     AssistantMessagePart,
     MessagePart,
+    ResponsePart,
     StreamEndEvent,
     StreamEvent,
     TextPart,
@@ -59,6 +60,7 @@ from .types import (
     ToolUsePart,
     UserMessagePart,
 )
+from .types.tool_result_part import _APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT
 
 OUTPUT_TOOL_NAME = "final_result"
 _DEFAULT_MAX_MODEL_CORRECTIONS = 3
@@ -208,9 +210,9 @@ def _control_flow_result(
     not routed through error classification.
     """
     if isinstance(exception, ApprovalRequired):
-        result = {"approval_required": True}
+        result = dict(_APPROVAL_REQUIRED_RESULT)
     else:
-        result = {"cancelled": True}
+        result = dict(_CANCELLED_RESULT)
     return ToolCallResult(tool_call.name, tool_call.id, result, True)
 
 
@@ -224,6 +226,36 @@ def _unexecuted_result(tool_call: ToolUsePart, *, reason: str) -> ToolCallResult
     )
 
 
+class _TurnResults:
+    """Tool results of one model turn, kept in the order the model emitted the calls.
+
+    Results are slotted by each call's position in the turn, never by call ID:
+    some providers return empty or repeated IDs.
+    """
+
+    def __init__(self, tool_calls: list[ToolUsePart]) -> None:
+        self._tool_calls = tool_calls
+        self._parts: list[ToolResultPart | None] = [None] * len(tool_calls)
+
+    def record(self, tool_call: ToolUsePart, part: ToolResultPart) -> None:
+        """Store the result for the first unanswered occurrence of ``tool_call``."""
+        for index, call in enumerate(self._tool_calls):
+            if call is tool_call and self._parts[index] is None:
+                self._parts[index] = part
+                return
+        raise RuntimeError(f"tool call {tool_call.id!r} is not awaiting a result in this turn")
+
+    def ordered(self) -> list[ToolResultPart]:
+        """Return every result in call order.
+
+        Raises:
+            RuntimeError: If a call in the turn has no result.
+        """
+        if any(part is None for part in self._parts):
+            raise RuntimeError("every tool call in a turn must have exactly one result")
+        return [part for part in self._parts if part is not None]
+
+
 class AgentExecutor[ContextT, OutputT: BaseModel]:
     """Manages tool registration, execution, and LLM interactions with streaming support.
 
@@ -232,10 +264,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         OutputT: Type of structured output (Pydantic model) when output_type is set
 
     Attributes:
-        provider: The tool-schema wire format ('openai', 'azure-openai', 'gemini',
-            'anthropic', 'vertexai'). This selects a schema shape, not a provider
-            identity -- a provider's `.name` may differ (e.g. AnthropicProvider
-            reports "azure-anthropic" on Azure but pairs with 'anthropic' here).
+        provider: The fallback tool-schema wire format ('openai', 'azure-openai',
+            'gemini', 'anthropic', 'vertexai'), used when `llm.format_tools()`
+            returns None. This selects a schema shape, not a provider identity --
+            a provider's `.name` may differ (e.g. AnthropicProvider reports
+            "azure-anthropic" on Azure but pairs with 'anthropic' here).
         llm: The LLM provider instance
         output_type: Pydantic model for structured output (optional)
         output_mode: How to get structured output ('tool' or 'native')
@@ -254,9 +287,12 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
         Args:
             provider: Tool-schema wire format. Use 'openai' for OpenAIProvider
-                (Responses API), 'vertexai' for VertexAIProvider (Chat
-                Completions), 'anthropic' for AnthropicProvider in either mode
-                (direct or Azure), and 'gemini' for GeminiProvider.
+                (Responses API), 'vertexai' for VertexAIProvider, 'anthropic'
+                for AnthropicProvider in either mode (direct or Azure), and
+                'gemini' for GeminiProvider. A provider whose `format_tools()`
+                returns a list overrides this literal, so 'vertexai' follows
+                the VertexAIProvider's route rather than always meaning Chat
+                Completions.
             llm: LLM provider instance for chat completions
             tools: List of Tool instances to register
             output_type: Pydantic BaseModel for structured output
@@ -302,9 +338,21 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
     def get_tools_schema(self) -> list:
         """Get tool schemas formatted for the LLM provider.
 
+        The provider's `format_tools()` decides the format when it returns a
+        list; otherwise the `provider` literal does. The result is cached.
+        Providers that do not subclass `Provider` (duck-typed hosts) and so
+        lack `format_tools()` keep the literal-based format.
+
         Returns:
             List of tool schemas in provider-specific format
         """
+        if self._formatted_tools is None and self._tools:
+            format_tools = getattr(self.llm, "format_tools", None)
+            formatted = (
+                format_tools(list(self._tools.values())) if callable(format_tools) else None
+            )
+            if isinstance(formatted, list):
+                self._formatted_tools = formatted
         if self._formatted_tools is None:
             match self.provider:
                 case "openai" | "azure-openai":
@@ -439,36 +487,32 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         tool_call: ToolUsePart,
         result: Any,
         is_error: bool,
-        working_messages: list[MessagePart],
+        turn: _TurnResults,
         *,
         error_details: ToolErrorDetails | None = None,
         is_terminal: bool = False,
     ) -> tuple[ToolResultEvent, ToolUseEndEvent]:
-        """Build result events and append tool round-trip messages.
+        """Build result events and record the call's result for the turn.
 
         Args:
             tool_call: The original tool call from the LLM
             result: The tool execution result (or error dict)
             is_error: Whether the result represents an error
-            working_messages: Conversation message list to append to
+            turn: Results of the current turn, flushed to history once per turn
             error_details: Structured diagnostics for a tool execution exception
             is_terminal: Whether this tool ends the agent loop
 
         Returns:
             Tuple of (ToolResultEvent, ToolUseEndEvent) for the caller to yield
         """
-        working_messages.append(AssistantMessagePart(parts=[tool_call]))
-        working_messages.append(
-            UserMessagePart(
-                parts=[
-                    ToolResultPart(
-                        tool_use_id=tool_call.id,
-                        name=tool_call.name,
-                        parts=[TextPart(text=str(result))],
-                        is_error=is_error,
-                    )
-                ]
-            )
+        turn.record(
+            tool_call,
+            ToolResultPart(
+                tool_use_id=tool_call.id,
+                name=tool_call.name,
+                parts=[TextPart(text=str(result))],
+                is_error=is_error,
+            ),
         )
         return (
             ToolResultEvent(
@@ -486,11 +530,27 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             ),
         )
 
+    def _flush_turn(
+        self,
+        working_messages: list[MessagePart],
+        parts: list[ResponsePart],
+        results: list[ToolResultPart],
+    ) -> None:
+        """Append one model turn and its tool results to the working history.
+
+        Args:
+            working_messages: Conversation message list to append to
+            parts: Every part the model returned for the turn, unchanged
+            results: One result per tool call, in the order the calls were made
+        """
+        working_messages.append(AssistantMessagePart(parts=list(parts)))
+        working_messages.append(UserMessagePart(parts=list(results)))
+
     def _emit_call_result(
         self,
         tool_call: ToolUsePart,
         call_result: ToolCallResult,
-        working_messages: list[MessagePart],
+        turn: _TurnResults,
     ) -> tuple[ToolResultEvent, ToolUseEndEvent]:
         """Build result and end events from an already-assembled tool-call result.
 
@@ -501,7 +561,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             tool_call,
             call_result.result,
             call_result.is_error,
-            working_messages,
+            turn,
             error_details=call_result.error_details,
         )
 
@@ -509,7 +569,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         self,
         calls: list[ToolUsePart],
         build_result: Callable[[ToolUsePart], ToolCallResult],
-        working_messages: list[MessagePart],
+        turn: _TurnResults,
         *,
         yield_events: bool = True,
     ) -> AsyncIterator[StreamEvent]:
@@ -523,7 +583,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
             result_event, end_event = self._emit_call_result(
                 call,
                 build_result(call),
-                working_messages,
+                turn,
             )
             if yield_events:
                 yield result_event
@@ -651,6 +711,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
         last_correction_error: ToolErrorDetails | None = None
 
         for _ in range(max_iterations):
+            turn_parts: list[ResponsePart] = []
             tool_calls: list[ToolUsePart] = []
             batch_has_model_correction = False
             batch_last_correction_error: ToolErrorDetails | None = None
@@ -666,12 +727,15 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 yield event
 
                 if isinstance(event, StreamEndEvent):
+                    turn_parts.extend(event.parts)
                     for part in event.parts:
                         if isinstance(part, ToolUsePart):
                             tool_calls.append(part)
 
             if not tool_calls:
                 break
+
+            turn = _TurnResults(tool_calls)
 
             # Handle output tool (final_result)
             final_result_invalid = False
@@ -717,9 +781,10 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                     reason=ErrorCode.FINAL_RESULT_INVALID.value,
                                 )
                             ),
-                            working_messages,
+                            turn,
                         ):
                             yield event
+                        self._flush_turn(working_messages, turn_parts, turn.ordered())
 
                         model_corrections += 1
                         last_correction_error = call_result.error_details
@@ -829,7 +894,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 result_event, end_event = self._emit_call_result(
                     tc,
                     call_result,
-                    working_messages,
+                    turn,
                 )
                 if is_cancellation:
                     continue
@@ -843,10 +908,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                     lambda remaining, flow=pending_control_flow: _control_flow_result(
                         remaining, flow
                     ),
-                    working_messages,
+                    turn,
                     yield_events=not isinstance(pending_control_flow, asyncio.CancelledError),
                 ):
                     yield event
+                self._flush_turn(working_messages, turn_parts, turn.ordered())
                 raise pending_control_flow
 
             terminal_completed = False
@@ -854,7 +920,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                 async for event in self._emit_placeholders(
                     parallel_calls[len(results) :] + streaming_calls + terminal_calls,
                     lambda remaining: _unexecuted_result(remaining, reason="model_correction"),
-                    working_messages,
+                    turn,
                 ):
                     yield event
             else:
@@ -886,17 +952,18 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             lambda remaining, caught=exception: _control_flow_result(
                                 remaining, caught
                             ),
-                            working_messages,
+                            turn,
                             yield_events=not isinstance(exception, asyncio.CancelledError),
                         ):
                             yield event
+                        self._flush_turn(working_messages, turn_parts, turn.ordered())
                         raise
 
                     result_event, end_event = self._emit_tool_result(
                         tc,
                         result,
                         is_error,
-                        working_messages,
+                        turn,
                         error_details=error_details,
                     )
                     yield result_event
@@ -909,7 +976,7 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 remaining,
                                 reason="model_correction",
                             ),
-                            working_messages,
+                            turn,
                         ):
                             yield event
                         break
@@ -943,16 +1010,17 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                                 lambda remaining, caught=exception: _control_flow_result(
                                     remaining, caught
                                 ),
-                                working_messages,
+                                turn,
                                 yield_events=not isinstance(exception, asyncio.CancelledError),
                             ):
                                 yield event
+                            self._flush_turn(working_messages, turn_parts, turn.ordered())
                             raise
                         result_event, end_event = self._emit_tool_result(
                             tc,
                             result,
                             is_error,
-                            working_messages,
+                            turn,
                             is_terminal=not skip_terminal_exit,
                             error_details=error_details,
                         )
@@ -968,9 +1036,11 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
                             lambda remaining, reason=skip_reason: _unexecuted_result(
                                 remaining, reason=reason
                             ),
-                            working_messages,
+                            turn,
                         ):
                             yield event
+
+            self._flush_turn(working_messages, turn_parts, turn.ordered())
 
             if batch_has_model_correction:
                 model_corrections += 1

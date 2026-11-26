@@ -687,6 +687,75 @@ class TestConstructorSignature:
             assert GeminiProvider(model="gemini-2.5-flash", api_key="k").name == "gemini"
 
 
+def _vertex_provider(max_retries: int = 3):
+    """An adapter built through the internal path around a mock `AsyncAnthropicVertex`."""
+    from anthropic import AsyncAnthropicVertex
+
+    from dobby.providers.anthropic.adapter import AnthropicProvider
+
+    client = MagicMock(spec=AsyncAnthropicVertex)
+    client.messages = MagicMock()
+    return AnthropicProvider._from_client(
+        client, "claude-sonnet-4-5", max_retries=max_retries, provider_name="vertexai"
+    )
+
+
+class TestInjectedVertexClient:
+    """The internal `_from_client` path runs the adapter on an `AsyncAnthropicVertex`."""
+
+    def test_messages_create_called_with_converted_messages(self) -> None:
+        from dobby.types import TextPart, UserMessagePart
+
+        provider = _vertex_provider()
+        response = MagicMock()
+        response.content = []
+        response.stop_reason = "end_turn"
+        response.model = "claude-sonnet-4-5"
+        response.usage = None
+        provider.client.messages.create = AsyncMock(return_value=response)
+
+        asyncio.run(
+            provider.chat([UserMessagePart(parts=[TextPart(text="hi")])], system_prompt="be brief")
+        )
+
+        provider.client.messages.create.assert_awaited_once()
+        sent = provider.client.messages.create.await_args.kwargs
+        assert sent["model"] == "claude-sonnet-4-5"
+        assert sent["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        assert sent["system"] == "be brief"
+
+    def test_name_and_attributes(self) -> None:
+        provider = _vertex_provider(max_retries=0)
+        assert provider.name == "vertexai"
+        assert provider.model == "claude-sonnet-4-5"
+        assert provider.max_retries == 0
+
+    def test_rate_limit_reports_vertexai(self) -> None:
+        import anthropic
+        import httpx
+
+        from dobby.types import TextPart, UserMessagePart
+
+        provider = _vertex_provider(max_retries=0)
+        native_err = anthropic.RateLimitError(
+            "rate limited",
+            response=httpx.Response(
+                429,
+                headers={"retry-after": "7"},
+                request=httpx.Request("POST", "https://example.invalid"),
+            ),
+            body=None,
+        )
+        provider.client.messages.create = AsyncMock(side_effect=native_err)
+
+        with pytest.raises(RateLimitError) as exc_info:
+            asyncio.run(provider.chat([UserMessagePart(parts=[TextPart(text="hi")])]))
+
+        assert exc_info.value.provider == "vertexai"
+        assert exc_info.value.retry_after == 7.0
+        assert exc_info.value.__cause__ is native_err
+
+
 class TestAzureValidation:
     """Test fail-fast validation of mutually exclusive Azure params."""
 
@@ -790,3 +859,300 @@ class TestChatModelOverride:
         redacted = [p for p in result.parts if isinstance(p, ReasoningPart) and p.redacted]
         assert len(redacted) == 1
         assert redacted[0].text == "ENC"
+
+
+class TestChatModelOverrideOnVertexClient(TestChatModelOverride):
+    """Re-run the request-shape tests against an injected `AsyncAnthropicVertex`."""
+
+    def _make_provider(self):
+        return _vertex_provider()
+
+
+# ---------------------------------------------------------------------------
+# Streaming part assembly tests
+# ---------------------------------------------------------------------------
+
+
+def _ev(type_: str, **fields) -> SimpleNamespace:
+    """Build a fake Anthropic stream event."""
+    return SimpleNamespace(type=type_, **fields)
+
+
+def _message_start() -> SimpleNamespace:
+    usage = SimpleNamespace(input_tokens=5)
+    return _ev("message_start", message=SimpleNamespace(id="msg_1", model="claude", usage=usage))
+
+
+def _thinking_block(index: int, text: str, signature: str) -> list[SimpleNamespace]:
+    """Events for one streamed thinking block (text split across two deltas)."""
+    half = len(text) // 2
+    return [
+        _ev("content_block_start", index=index, content_block=SimpleNamespace(type="thinking")),
+        _ev(
+            "content_block_delta",
+            index=index,
+            delta=SimpleNamespace(type="thinking_delta", thinking=text[:half]),
+        ),
+        _ev(
+            "content_block_delta",
+            index=index,
+            delta=SimpleNamespace(type="thinking_delta", thinking=text[half:]),
+        ),
+        _ev(
+            "content_block_delta",
+            index=index,
+            delta=SimpleNamespace(type="signature_delta", signature=signature),
+        ),
+        _ev("content_block_stop", index=index),
+    ]
+
+
+def _redacted_block(index: int, data: str) -> list[SimpleNamespace]:
+    """Events for one streamed redacted_thinking block."""
+    block = SimpleNamespace(type="redacted_thinking", data=data)
+    return [
+        _ev("content_block_start", index=index, content_block=block),
+        _ev("content_block_stop", index=index),
+    ]
+
+
+def _text_block(index: int, text: str) -> list[SimpleNamespace]:
+    """Events for one streamed text block."""
+    return [
+        _ev("content_block_start", index=index, content_block=SimpleNamespace(type="text")),
+        _ev(
+            "content_block_delta",
+            index=index,
+            delta=SimpleNamespace(type="text_delta", text=text),
+        ),
+        _ev("content_block_stop", index=index),
+    ]
+
+
+def _tool_block(index: int, tool_id: str, name: str, args_json: str) -> list[SimpleNamespace]:
+    """Events for one streamed tool_use block."""
+    block = SimpleNamespace(type="tool_use", id=tool_id, name=name)
+    return [
+        _ev("content_block_start", index=index, content_block=block),
+        _ev(
+            "content_block_delta",
+            index=index,
+            delta=SimpleNamespace(type="input_json_delta", partial_json=args_json),
+        ),
+        _ev("content_block_stop", index=index),
+    ]
+
+
+def _message_end(stop_reason: str) -> list[SimpleNamespace]:
+    return [
+        _ev(
+            "message_delta",
+            delta=SimpleNamespace(stop_reason=stop_reason),
+            usage=SimpleNamespace(output_tokens=7),
+        ),
+        _ev("message_stop"),
+    ]
+
+
+def _stream_events(blocks: list[list[SimpleNamespace]], stop_reason: str = "tool_use") -> list:
+    """Run the streaming adapter over fake block events and return every yielded event."""
+    from dobby.providers.anthropic.adapter import AnthropicProvider
+
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    provider.base_url = None
+    provider.max_retries = 0
+    provider._client = MagicMock()
+
+    raw = [_message_start(), *(e for block in blocks for e in block), *_message_end(stop_reason)]
+
+    async def native_stream():
+        for event in raw:
+            yield event
+
+    provider._client.messages.create = AsyncMock(return_value=native_stream())
+
+    async def run() -> list:
+        return [e async for e in provider._stream_chat_completion([], "claude")]
+
+    return asyncio.run(run())
+
+
+def _stream_parts(blocks: list[list[SimpleNamespace]], stop_reason: str = "tool_use") -> list:
+    """Return the StreamEndEvent parts for the given fake block events."""
+    from dobby.types import StreamEndEvent
+
+    end = _stream_events(blocks, stop_reason)[-1]
+    assert isinstance(end, StreamEndEvent)
+    return end.parts
+
+
+class TestStreamingPartAssembly:
+    """StreamEndEvent.parts from the streaming path map block to part one-to-one."""
+
+    def test_single_thinking_block_then_tool_call(self) -> None:
+        """Characterization: one thinking block and one tool call (unchanged behaviour)."""
+        from dobby.types import (
+            ReasoningDeltaEvent,
+            ReasoningEndEvent,
+            ReasoningPart,
+            ReasoningStartEvent,
+            StreamStartEvent,
+            ToolUseEvent,
+            ToolUsePart,
+        )
+
+        events = _stream_events(
+            [
+                _thinking_block(0, "let me think", "s1"),
+                _tool_block(1, "tu_1", "search", '{"q": "x"}'),
+            ]
+        )
+
+        assert [type(e) for e in events[:-1]] == [
+            StreamStartEvent,
+            ReasoningStartEvent,
+            ReasoningDeltaEvent,
+            ReasoningDeltaEvent,
+            ReasoningEndEvent,
+            ToolUseEvent,
+        ]
+        deltas = "".join(e.delta for e in events if isinstance(e, ReasoningDeltaEvent))
+        assert deltas == "let me think"
+        end = events[-1]
+        assert end.stop_reason == "tool_use"
+        assert end.parts == [
+            ReasoningPart(text="let me think", signature="s1"),
+            ToolUsePart(id="tu_1", name="search", inputs={"q": "x"}),
+        ]
+
+    def test_single_thinking_block_then_text(self) -> None:
+        """Characterization: one thinking block followed by a text answer."""
+        from dobby.types import ReasoningPart, TextPart
+
+        parts = _stream_parts(
+            [_thinking_block(0, "hmm", "s1"), _text_block(1, "answer")], stop_reason="end_turn"
+        )
+
+        assert parts == [ReasoningPart(text="hmm", signature="s1"), TextPart(text="answer")]
+
+    def test_two_thinking_blocks_keep_their_own_signatures(self) -> None:
+        from dobby.types import ReasoningPart, ToolUsePart
+
+        parts = _stream_parts(
+            [
+                _thinking_block(0, "first thought", "s1"),
+                _thinking_block(1, "second thought", "s2"),
+                _tool_block(2, "tu_1", "search", "{}"),
+            ]
+        )
+
+        assert parts == [
+            ReasoningPart(text="first thought", signature="s1"),
+            ReasoningPart(text="second thought", signature="s2"),
+            ToolUsePart(id="tu_1", name="search", inputs={}),
+        ]
+
+    def test_redacted_block_between_thinking_blocks_keeps_order(self) -> None:
+        from dobby.types import ReasoningPart, TextPart
+
+        parts = _stream_parts(
+            [
+                _thinking_block(0, "alpha", "s1"),
+                _redacted_block(1, "ENC"),
+                _thinking_block(2, "beta", "s2"),
+                _text_block(3, "done"),
+            ],
+            stop_reason="end_turn",
+        )
+
+        assert parts == [
+            ReasoningPart(text="alpha", signature="s1"),
+            ReasoningPart(text="ENC", redacted=True),
+            ReasoningPart(text="beta", signature="s2"),
+            TextPart(text="done"),
+        ]
+
+    def test_interleaved_blocks_keep_provider_order(self) -> None:
+        """Interleaved thinking: each block becomes one part, in the order streamed."""
+        from dobby.types import ReasoningPart, TextPart, ToolUsePart
+
+        parts = _stream_parts(
+            [
+                _thinking_block(0, "plan", "s1"),
+                _text_block(1, "Looking it up."),
+                _tool_block(2, "tu_1", "search", '{"q": "a"}'),
+                _thinking_block(3, "next", "s2"),
+                _tool_block(4, "tu_2", "fetch", '{"u": "b"}'),
+            ]
+        )
+
+        assert parts == [
+            ReasoningPart(text="plan", signature="s1"),
+            TextPart(text="Looking it up."),
+            ToolUsePart(id="tu_1", name="search", inputs={"q": "a"}),
+            ReasoningPart(text="next", signature="s2"),
+            ToolUsePart(id="tu_2", name="fetch", inputs={"u": "b"}),
+        ]
+
+    def test_streaming_matches_non_streaming_parts(self) -> None:
+        """The same message yields the same part list on both paths."""
+        from dobby.providers.anthropic.adapter import AnthropicProvider
+
+        streamed = _stream_parts(
+            [
+                _thinking_block(0, "plan", "s1"),
+                _redacted_block(1, "ENC"),
+                _text_block(2, "Looking it up."),
+                _tool_block(3, "tu_1", "search", '{"q": "a"}'),
+                _thinking_block(4, "next", "s2"),
+            ]
+        )
+
+        response = SimpleNamespace(
+            content=[
+                SimpleNamespace(type="thinking", thinking="plan", signature="s1"),
+                SimpleNamespace(type="redacted_thinking", data="ENC"),
+                SimpleNamespace(type="text", text="Looking it up."),
+                SimpleNamespace(type="tool_use", id="tu_1", name="search", input={"q": "a"}),
+                SimpleNamespace(type="thinking", thinking="next", signature="s2"),
+            ],
+            stop_reason="tool_use",
+            model="claude",
+            usage=None,
+        )
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider.base_url = None
+        provider.max_retries = 0
+        provider._client = MagicMock()
+        provider._client.messages.create = AsyncMock(return_value=response)
+        non_streamed = asyncio.run(provider._non_stream_chat_completion([], "claude")).parts
+
+        assert streamed == non_streamed
+
+    def test_streamed_parts_round_trip_through_to_anthropic_messages(self) -> None:
+        """Replaying streamed parts yields thinking blocks with matching text/signature pairs."""
+        from dobby.providers.anthropic.adapter import to_anthropic_messages
+        from dobby.types import AssistantMessagePart
+
+        parts = _stream_parts(
+            [
+                _thinking_block(0, "first thought", "s1"),
+                _redacted_block(1, "ENC"),
+                _thinking_block(2, "second thought", "s2"),
+                _tool_block(3, "tu_1", "search", '{"q": "x"}'),
+            ]
+        )
+
+        result = to_anthropic_messages([AssistantMessagePart(parts=parts)])
+
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "first thought", "signature": "s1"},
+                    {"type": "redacted_thinking", "data": "ENC"},
+                    {"type": "thinking", "thinking": "second thought", "signature": "s2"},
+                    {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "x"}},
+                ],
+            }
+        ]

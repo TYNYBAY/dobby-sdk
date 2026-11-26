@@ -1,15 +1,16 @@
 """Anthropic Claude provider for Dobby SDK.
 
 Implements the Provider interface for Anthropic's Messages API,
-supporting the direct Anthropic API and Azure-hosted Claude.
+supporting the direct Anthropic API, Azure-hosted Claude and (through
+`VertexAIProvider`) Claude on Vertex AI.
 """
 
 from collections.abc import AsyncIterator, Iterable
 import json
-from typing import Any, Literal, NoReturn, cast, overload
+from typing import Any, Literal, NoReturn, Self, cast, overload
 
 import anthropic
-from anthropic import AsyncAnthropic, AsyncAnthropicFoundry
+from anthropic import AsyncAnthropic, AsyncAnthropicFoundry, AsyncAnthropicVertex
 from anthropic.lib.foundry import AsyncAzureADTokenProvider
 
 from ..._logging import logger
@@ -67,7 +68,10 @@ def _map_stop_reason(reason: str | None) -> StopReason:
     return "end_turn"
 
 
-class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
+type AnthropicClient = AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex
+
+
+class AnthropicProvider(Provider[AnthropicClient]):
     """Provider for Anthropic Claude and Azure-hosted Claude.
 
     Supports the direct Anthropic API and Azure AI Foundry deployments. For
@@ -83,8 +87,9 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
     api_key: str | None
     base_url: str | None
     _model: str
-    _client: AsyncAnthropic | AsyncAnthropicFoundry
+    _client: AnthropicClient
     _is_azure: bool
+    _provider_name: str
     max_retries: int
 
     def __init__(
@@ -150,9 +155,47 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
                 base_url=base_url,
             )
 
+    @classmethod
+    def _from_client(
+        cls,
+        client: AnthropicClient,
+        model: str,
+        *,
+        max_retries: int = 3,
+        provider_name: str = "anthropic",
+    ) -> Self:
+        """Build a provider around a pre-built client, skipping `__init__`.
+
+        Internal construction path for `VertexAIProvider`, which hands in an
+        `AsyncAnthropicVertex` (built with `max_retries=0`) and reuses this
+        adapter's converters, streaming, retries and error translation as they
+        are.
+
+        Args:
+            client: An already-configured Anthropic SDK client.
+            model: Model name sent on each request.
+            max_retries: Maximum retry attempts for transient errors.
+            provider_name: Value of `name`, reported in errors and retry logs.
+
+        Returns:
+            A provider that sends every request through `client`.
+        """
+        provider = cls.__new__(cls)
+        provider.api_key = None
+        provider.base_url = None
+        provider._model = model
+        provider.max_retries = max_retries
+        provider._client = client
+        provider._is_azure = False
+        provider._provider_name = provider_name
+        return provider
+
     @property
     def name(self) -> str:
-        """Provider name."""
+        """Provider name (`"anthropic"`, `"azure-anthropic"`, or the injected name)."""
+        injected = getattr(self, "_provider_name", None)
+        if injected is not None:
+            return injected
         # getattr fallback keeps this robust when the instance is built via
         # __new__ (e.g. in tests) without running __init__.
         is_azure = getattr(self, "_is_azure", bool(self.base_url and "azure" in self.base_url))
@@ -164,7 +207,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         return self._model
 
     @property
-    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry:
+    def client(self) -> AnthropicClient:
         """Authenticated client instance."""
         return self._client
 
@@ -494,13 +537,16 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         # Accumulation state
         response_id: str | None = None
         model_name: str = model
-        accumulated_text: str = ""
-        accumulated_reasoning: str = ""
-        reasoning_signature: str | None = None
-        function_calls: list[ToolUseEvent] = []
+        # One part per content block, in provider order, like _parse_response.
+        # Each thinking block keeps its own signature: merging blocks breaks
+        # signature verification when the reasoning is replayed.
+        response_parts: list[ResponsePart] = []
 
         # Current content block tracking
         current_block_type: str | None = None
+        current_block_text: str = ""
+        current_block_signature: str | None = None
+        current_redacted_data: str | None = None
         current_tool_id: str | None = None
         current_tool_name: str | None = None
         current_tool_input_json: str = ""
@@ -511,9 +557,6 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         cache_creation_input_tokens: int | None = None
         cache_read_input_tokens: int | None = None
         stop_reason: StopReason = "end_turn"
-
-        # Opaque encrypted reasoning blocks, preserved verbatim for round-trip.
-        redacted_thinking_data: list[str] = []
 
         async for event in _iter_translated(stream, self._translate_error):
             match event.type:
@@ -535,12 +578,13 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
 
                 case "content_block_start":
                     current_block_type = event.content_block.type
+                    current_block_text = ""
+                    current_block_signature = None
+                    current_redacted_data = None
                     if current_block_type == "thinking":
                         yield ReasoningStartEvent(type="reasoning_start")
                     elif current_block_type == "redacted_thinking":
-                        data = getattr(event.content_block, "data", None)
-                        if data:
-                            redacted_thinking_data.append(data)
+                        current_redacted_data = getattr(event.content_block, "data", None)
                     elif current_block_type == "tool_use":
                         current_tool_id = event.content_block.id
                         current_tool_name = event.content_block.name
@@ -549,30 +593,49 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
                 case "content_block_delta":
                     match event.delta.type:
                         case "thinking_delta":
-                            accumulated_reasoning += event.delta.thinking
+                            current_block_text += event.delta.thinking
                             yield ReasoningDeltaEvent(delta=event.delta.thinking)
                         case "text_delta":
-                            accumulated_text += event.delta.text
+                            current_block_text += event.delta.text
                             yield TextDeltaEvent(delta=event.delta.text)
                         case "input_json_delta":
                             current_tool_input_json += event.delta.partial_json
                         case "signature_delta":
-                            reasoning_signature = getattr(event.delta, "signature", None)
+                            current_block_signature = getattr(event.delta, "signature", None)
 
                 case "content_block_stop":
-                    if current_block_type == "thinking":
-                        yield ReasoningEndEvent(type="reasoning_end")
-                    elif current_block_type == "tool_use":
-                        tool_inputs = (
-                            json.loads(current_tool_input_json) if current_tool_input_json else {}
-                        )
-                        tool_event = ToolUseEvent(
-                            id=current_tool_id or "",
-                            name=current_tool_name or "",
-                            inputs=tool_inputs,
-                        )
-                        function_calls.append(tool_event)
-                        yield tool_event
+                    match current_block_type:
+                        case "thinking":
+                            if current_block_text or current_block_signature:
+                                response_parts.append(
+                                    ReasoningPart(
+                                        text=current_block_text,
+                                        signature=current_block_signature,
+                                    )
+                                )
+                            yield ReasoningEndEvent(type="reasoning_end")
+                        case "redacted_thinking":
+                            # Opaque encrypted reasoning; preserve verbatim so
+                            # multi-turn thinking continuity survives the round-trip.
+                            if current_redacted_data:
+                                response_parts.append(
+                                    ReasoningPart(text=current_redacted_data, redacted=True)
+                                )
+                        case "text":
+                            if current_block_text:
+                                response_parts.append(TextPart(text=current_block_text))
+                        case "tool_use":
+                            tool_inputs = (
+                                json.loads(current_tool_input_json)
+                                if current_tool_input_json
+                                else {}
+                            )
+                            tool_id = current_tool_id or ""
+                            tool_name = current_tool_name or ""
+                            response_parts.append(
+                                ToolUsePart(id=tool_id, name=tool_name, inputs=tool_inputs)
+                            )
+                            yield ToolUseEvent(id=tool_id, name=tool_name, inputs=tool_inputs)
                     current_block_type = None
 
                 case "message_delta":
@@ -582,27 +645,6 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
                         output_tokens = event.usage.output_tokens
 
                 case "message_stop":
-                    parts: list[ResponsePart] = []
-                    if accumulated_reasoning:
-                        parts.append(
-                            ReasoningPart(
-                                text=accumulated_reasoning,
-                                signature=reasoning_signature,
-                            )
-                        )
-                    for data in redacted_thinking_data:
-                        parts.append(ReasoningPart(text=data, redacted=True))
-                    if accumulated_text:
-                        parts.append(TextPart(text=accumulated_text))
-                    for tool_event in function_calls:
-                        parts.append(
-                            ToolUsePart(
-                                id=tool_event.id,
-                                name=tool_event.name,
-                                inputs=tool_event.inputs,
-                            )
-                        )
-
                     usage_data = Usage(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
@@ -613,7 +655,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
 
                     yield StreamEndEvent(
                         model=model_name,
-                        parts=parts,
+                        parts=response_parts,
                         stop_reason=stop_reason,
                         usage=usage_data,
                     )

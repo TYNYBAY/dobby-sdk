@@ -10,19 +10,21 @@ These tests lock in that every previously-rejected construct is now accepted and
 serializes to the wire as ``parametersJsonSchema`` (never ``parameters``).
 """
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 import os
 from typing import Any, ClassVar, Literal
-from unittest.mock import AsyncMock
 
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 import pytest
 
 from dobby.executor import AgentExecutor
+from dobby.providers.base import Provider
 from dobby.providers.vertexai.converters import to_vertexai_tool
 from dobby.tools import Tool
-from dobby.types import ToolUsePart
+from dobby.types import StreamEndEvent, ToolUsePart, Usage
 
 
 def _serialize(tool: genai_types.Tool) -> dict[str, Any]:
@@ -273,11 +275,57 @@ def test_old_parameters_path_would_have_failed() -> None:
 # existing case is unaffected by that addition.
 
 
+class _FakeProvider(Provider[None]):
+    """Minimal provider that records each chat call's tools.
+
+    Leaves the tool format to the executor's `provider` literal unless given a
+    `formatted` list, which it returns from `format_tools()`.
+    """
+
+    def __init__(self, formatted: list[Any] | None = None) -> None:
+        self._formatted = formatted
+        self.format_tools_calls = 0
+        self.chat_tools: list[list[Any] | None] = []
+
+    @property
+    def name(self) -> str:
+        return "fake"
+
+    @property
+    def model(self) -> str:
+        return "fake-model"
+
+    @property
+    def client(self) -> None:
+        return None
+
+    def format_tools(self, tools: list[Tool]) -> list[Any] | None:
+        if self._formatted is None:
+            return super().format_tools(tools)
+        self.format_tools_calls += 1
+        return self._formatted
+
+    async def chat(self, messages, *, stream=False, tools=None, **kwargs):  # type: ignore[override]
+        del messages, stream, kwargs
+        self.chat_tools.append(tools)
+
+        async def events() -> AsyncIterator[StreamEndEvent]:
+            yield StreamEndEvent(
+                type="stream_end",
+                model="fake-model",
+                parts=[],
+                stop_reason="end_turn",
+                usage=Usage(input_tokens=0, output_tokens=0, total_tokens=0),
+            )
+
+        return events()
+
+
 class TestGetToolsSchemaProviderDispatch:
     """Locks in each provider case of AgentExecutor.get_tools_schema()'s dispatch."""
 
     def _make_executor(self, provider: str, tool: Tool) -> AgentExecutor:
-        return AgentExecutor(provider=provider, llm=AsyncMock(), tools=[tool])  # type: ignore[arg-type]
+        return AgentExecutor(provider=provider, llm=_FakeProvider(), tools=[tool])  # type: ignore[arg-type]
 
     def test_vertexai_dispatch_uses_nested_chat_completions_shape(self) -> None:
         """The vertexai case produces to_vertexai_tool()'s nested {"type", "function": {...}} shape."""
@@ -338,6 +386,79 @@ class TestGetToolsSchemaProviderDispatch:
         schema = self._make_executor("anthropic", tool).get_tools_schema()
 
         assert schema == [tool.to_anthropic_format()]
+
+
+# --- Provider.format_tools() override ------------------------------------------
+
+
+class TestProviderFormatToolsOverride:
+    """A provider's format_tools() answer wins over the executor's literal."""
+
+    def test_default_hook_returns_none(self) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+
+        assert _FakeProvider().format_tools([tool]) is None
+
+    @pytest.mark.parametrize("literal", ["openai", "gemini", "anthropic", "vertexai"])
+    def test_custom_format_overrides_literal_and_is_cached(self, literal: str) -> None:
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        custom = [{"custom": "shape"}]
+        llm = _FakeProvider(formatted=custom)
+        executor = AgentExecutor(provider=literal, llm=llm, tools=[tool])  # type: ignore[arg-type]
+
+        first = executor.get_tools_schema()
+        second = executor.get_tools_schema()
+
+        assert first == custom
+        assert second is first
+        assert llm.format_tools_calls == 1
+
+    @pytest.mark.parametrize(
+        ("literal", "expected"),
+        [
+            ("openai", lambda tool: tool.to_openai_format()),
+            ("anthropic", lambda tool: tool.to_anthropic_format()),
+            ("vertexai", to_vertexai_tool),
+        ],
+    )
+    def test_duck_typed_provider_without_hook_uses_literal(
+        self, literal: str, expected: Callable[[Tool], Any]
+    ) -> None:
+        """A host provider that does not subclass Provider keeps working."""
+
+        class DuckTypedProvider:
+            name = "duck"
+
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        executor = AgentExecutor(
+            provider=literal,  # type: ignore[arg-type]
+            llm=DuckTypedProvider(),  # type: ignore[arg-type]
+            tools=[tool],
+        )
+
+        assert executor.get_tools_schema() == [expected(tool)]
+
+    def test_non_list_hook_result_falls_back_to_literal(self) -> None:
+        """A hook answer that is not a list (e.g. a Mock attribute) is ignored."""
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        llm = _FakeProvider()
+        llm.format_tools = lambda tools: "not-a-list"  # type: ignore[method-assign]
+        executor = AgentExecutor(provider="openai", llm=llm, tools=[tool])
+
+        assert executor.get_tools_schema() == [tool.to_openai_format()]
+
+    def test_no_tools_skips_hook_and_sends_none(self) -> None:
+        llm = _FakeProvider(formatted=[{"custom": "shape"}])
+        executor = AgentExecutor(provider="openai", llm=llm)
+
+        async def run() -> None:
+            async for _ in executor.run_stream(messages=[]):
+                pass
+
+        asyncio.run(run())
+
+        assert llm.format_tools_calls == 0
+        assert llm.chat_tools == [None]
 
 
 # --- Optional credential-gated live smoke test ---------------------------------

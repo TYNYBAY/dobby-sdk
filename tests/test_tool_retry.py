@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -55,6 +55,7 @@ def _make_mock_provider(tool_calls: list[ToolUsePart]) -> AsyncMock:
 
     provider = AsyncMock()
     provider.chat = mock_chat
+    provider.format_tools = Mock(return_value=None)
     provider.chat_calls = lambda: call_count
     return provider
 

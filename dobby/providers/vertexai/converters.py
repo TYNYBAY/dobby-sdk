@@ -31,6 +31,12 @@ from ...types import (
 
 VertexAIContentPart = dict[str, Any]
 
+# ToolUsePart.metadata key holding a tool call's Chat Completions
+# `extra_content` (Gemini thought signatures arrive as
+# `{"google": {"thought_signature": ...}}`). Kept apart from the Gemini
+# adapter's "signature" key because the shape differs.
+EXTRA_CONTENT_KEY = "extra_content"
+
 
 def _text_to_vertexai(part: TextPart) -> VertexAIContentPart:
     """Convert TextPart to Chat Completions text content part."""
@@ -116,7 +122,9 @@ def to_vertexai_messages(messages: Iterable[MessagePart]) -> list[dict[str, Any]
     Handles conversion of different message types and content blocks:
     - User messages -> `{"role": "user", "content": ...}`
     - Assistant text -> `{"role": "assistant", "content": "..."}`
-    - Assistant tool calls -> `{"role": "assistant", "tool_calls": [...]}`
+    - Assistant tool calls -> `{"role": "assistant", "tool_calls": [...]}`;
+      a ToolUsePart's `metadata["extra_content"]` (Gemini thought signatures)
+      is written back unchanged on its `tool_calls` entry.
     - Tool results -> `{"role": "tool", "tool_call_id": ..., "content": ...}`
     - ReasoningPart is dropped (Llama/Model Garden MaaS models have no
       reasoning/thinking channel), mirroring `to_openai_messages`.
@@ -146,17 +154,21 @@ def to_vertexai_messages(messages: Iterable[MessagePart]) -> list[dict[str, Any]
                     match part:
                         case TextPart(text=text):
                             text_segments.append(text)
-                        case ToolUsePart(id=tool_id, name=name, inputs=inputs):
-                            tool_calls.append(
-                                {
-                                    "id": tool_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": json.dumps(inputs),
-                                    },
-                                }
-                            )
+                        case ToolUsePart(id=tool_id, name=name, inputs=inputs, metadata=metadata):
+                            tool_call: dict[str, Any] = {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(inputs),
+                                },
+                            }
+                            # Replay Gemini thought signatures unchanged; Gemini 3+
+                            # rejects a signed function call sent back without one.
+                            extra_content = (metadata or {}).get(EXTRA_CONTENT_KEY)
+                            if isinstance(extra_content, dict) and extra_content:
+                                tool_call["extra_content"] = extra_content
+                            tool_calls.append(tool_call)
                         case ReasoningPart():
                             # Reasoning parts are not sent to Vertex's MaaS models.
                             pass

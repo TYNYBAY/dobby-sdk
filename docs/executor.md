@@ -27,7 +27,7 @@ async for event in executor.run_stream(messages, system_prompt="You are helpful.
 
 ```python
 executor = AgentExecutor(
-    provider="openai",           # "openai" | "azure-openai" | "anthropic"
+    provider="openai",           # "openai" | "azure-openai" | "anthropic" | "gemini" | "vertexai"
     llm=provider,                # Provider instance
     tools=[Tool1(), Tool2()],    # Optional tools
     output_type=MyOutputModel,   # Optional structured output
@@ -37,11 +37,13 @@ executor = AgentExecutor(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `provider` | `str` | Provider name for schema formatting |
+| `provider` | `str` | Fallback tool-schema format. Used only when `llm.format_tools()` returns `None` |
 | `llm` | `OpenAIProvider` | LLM provider instance |
 | `tools` | `list[Tool]` | Available tools |
 | `output_type` | `type[BaseModel]` | Pydantic model for structured output |
 | `output_mode` | `str` | How to get structured output |
+
+The `provider` literal picks a tool-schema shape, not a provider identity. A provider can decide the shape itself through `format_tools(tools)`: when it returns a list, the executor sends that list instead. `VertexAIProvider` does this, so `AgentExecutor("vertexai", provider)` sends Gemini, Anthropic or Chat Completions tools depending on the instance's route. Providers that return `None`, and duck-typed providers that lack the method, keep the literal's format.
 
 ### Accessing Registered Tools
 
@@ -82,6 +84,17 @@ Approval is host control flow, not a classified model error. The executor still 
 Host cancellation re-raises `asyncio.CancelledError` and does not yield `{"cancelled": True}` placeholders. A single in-flight call, a streaming or terminal call, and a parallel `asyncio.gather` batch surface that error from the in-flight read: parallel cancellation escapes `gather` before any per-call placeholders are assembled. In a sequential multi-tool batch, earlier successful events may already have been yielded before a later call is cancelled, so stopping consumption after one of those earlier events can prevent the later cancellation from being observed.
 
 `dobby.exceptions` also exports the classification helpers the executor uses: `classify_tool_error`, `format_model_error`, and `ErrorDecision`. `classify_tool_error(exception)` returns an `ErrorDecision` (`code`, `model_message`, `retry_model`) or `None` for approval, cancellation, and other non-error control flow. `format_model_error(decision)` produces the `[error_code] message` string sent to the model.
+
+### History shape
+
+Each tool turn enters the executor's working history as two messages:
+
+1. One `AssistantMessagePart` holding every part of the turn's `StreamEndEvent`, unchanged: reasoning, text and all tool calls.
+2. One `UserMessagePart` holding every `ToolResultPart`, in the order the model made the calls.
+
+Events and their order are unchanged. The executor used to split a turn into one assistant/user pair per call and drop the turn's reasoning and text. That shape showed the model one call per turn, which teaches it to stop calling tools in parallel, and it dropped reasoning that some providers require to be replayed.
+
+Hosts that persist history between runs should store it the same way: `StreamEndEvent.parts` as one assistant message and all of the turn's results as one user message. Store each result as `ToolResultPart(tool_use_id=event.tool_use_id, name=event.name, parts=[TextPart(text=str(event.result))], is_error=event.is_error)` from its `ToolResultEvent`, which is the form the executor writes. The Gemini approval-ID rule also recognises an approval or cancellation placeholder stored with `json.dumps` (`{"approval_required": true}`); other spellings count as ordinary results. Split-shape histories from older hosts are still accepted. One exception: Claude with thinking enabled must see the previous turn's thinking blocks, so a stored history without `ReasoningPart`s can return a 400 on a native Claude route.
 
 ---
 
@@ -215,5 +228,7 @@ async for event in executor.run_stream(
 ```
 
 If the tool is not in `approved_tool_calls`, the executor yields a `ToolResultEvent` with `is_error=True` and `result={"approval_required": True}` for that call, then raises `ApprovalRequired`. Remaining unexecuted calls get the same `{"approval_required": True}` placeholder (`is_error=True`). Already-running parallel calls may still complete successfully.
+
+**Gemini tool-call IDs and approval.** Gemini often returns calls without IDs, so Gemini providers (`GeminiProvider` and `VertexAIProvider`'s Gemini route) mint `call_{name}`, then `call_{name}_2`, `call_{name}_3`, … when the ID is taken. An ID is taken when it is used earlier in the same response, or in the history by a call that has a real result. A call answered only by an `approval_required` or `cancelled` placeholder does not take its ID. So when you resume after approval, the regenerated call gets the same ID and matches `approved_tool_calls`, while a later, separate call to the same tool gets a new ID and cannot reuse the earlier approval.
 
 Host cancellation re-raises `asyncio.CancelledError` and does not yield `{"cancelled": True}` placeholder events. A cancelled parallel batch in particular emits no per-call placeholders.

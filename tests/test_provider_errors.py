@@ -5,6 +5,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from google.genai import errors as gemini_errors
+import httpx
 import pytest
 from tenacity import retry_if_exception_type, stop_after_attempt, wait_none
 
@@ -18,6 +20,7 @@ from dobby.providers.base import (
     ProviderError,
     RateLimitError,
 )
+from dobby.types import TextPart, UserMessagePart
 
 
 def _zero_delay_retry_config(**kwargs):
@@ -288,25 +291,23 @@ class TestGeminiErrorTranslation:
         provider._client = MagicMock()
         return provider
 
-    def _make_gemini_client_error(self, status: int):
-        from google.genai import errors as gemini_errors
+    def _make_gemini_client_error(self, code: int, status: str = "INVALID_ARGUMENT"):
+        """Build a real SDK `ClientError`: int HTTP code in `code`, gRPC string in `status`."""
+        body = {"error": {"code": code, "message": f"Client error {code}", "status": status}}
+        return gemini_errors.ClientError(code, body)
 
-        err = gemini_errors.ClientError.__new__(gemini_errors.ClientError)
-        err.status = status
-        err.message = f"Client error {status}"
-        return err
-
-    def _make_gemini_server_error(self, status: int = 500):
-        from google.genai import errors as gemini_errors
-
-        err = gemini_errors.ServerError.__new__(gemini_errors.ServerError)
-        err.status = status
-        err.message = f"Server error {status}"
-        return err
+    def _make_gemini_server_error(self, code: int = 500):
+        """Build a real SDK `ServerError`."""
+        body = {
+            "error": {"code": code, "message": f"Server error {code}", "status": "UNAVAILABLE"}
+        }
+        return gemini_errors.ServerError(code, body)
 
     def test_rate_limit_error(self) -> None:
         provider = self._make_provider()
-        native_err = self._make_gemini_client_error(429)
+        native_err = self._make_gemini_client_error(429, "RESOURCE_EXHAUSTED")
+        # The real SDK shape: `status` is a string, so only `code` identifies a 429.
+        assert native_err.status == "RESOURCE_EXHAUSTED"
 
         with pytest.raises(RateLimitError) as exc_info:
             provider._translate_error(native_err)
@@ -317,7 +318,7 @@ class TestGeminiErrorTranslation:
 
     def test_timeout_error(self) -> None:
         provider = self._make_provider()
-        native_err = self._make_gemini_client_error(408)
+        native_err = self._make_gemini_client_error(408, "DEADLINE_EXCEEDED")
 
         with pytest.raises(APITimeoutError) as exc_info:
             provider._translate_error(native_err)
@@ -338,7 +339,7 @@ class TestGeminiErrorTranslation:
 
     def test_other_client_error(self) -> None:
         provider = self._make_provider()
-        native_err = self._make_gemini_client_error(403)
+        native_err = self._make_gemini_client_error(403, "PERMISSION_DENIED")
 
         with pytest.raises(ProviderError) as exc_info:
             provider._translate_error(native_err)
@@ -356,6 +357,106 @@ class TestGeminiErrorTranslation:
 
         assert exc_info.value.provider == "gemini"
         assert exc_info.value.__cause__ is native_err
+
+    def test_httpx_connect_error(self) -> None:
+        provider = self._make_provider()
+        native_err = httpx.ConnectError("connection refused")
+
+        with pytest.raises(APIConnectionError) as exc_info:
+            provider._translate_error(native_err)
+
+        assert not isinstance(exc_info.value, APITimeoutError)
+        assert exc_info.value.provider == "gemini"
+        assert exc_info.value.__cause__ is native_err
+
+    def test_httpx_read_timeout(self) -> None:
+        provider = self._make_provider()
+        native_err = httpx.ReadTimeout("read timed out")
+
+        with pytest.raises(APITimeoutError) as exc_info:
+            provider._translate_error(native_err)
+
+        assert exc_info.value.provider == "gemini"
+        assert exc_info.value.__cause__ is native_err
+
+    def test_injected_name_is_reported(self) -> None:
+        """A Vertex-backed instance reports `vertexai` in translated errors."""
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        provider = GeminiProvider._from_client(
+            MagicMock(), "gemini-2.5-flash", provider_name="vertexai"
+        )
+
+        with pytest.raises(RateLimitError) as exc_info:
+            provider._translate_error(self._make_gemini_client_error(429, "RESOURCE_EXHAUSTED"))
+
+        assert exc_info.value.provider == "vertexai"
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            lambda: gemini_errors.ClientError(
+                429, {"error": {"code": 429, "message": "slow", "status": "RESOURCE_EXHAUSTED"}}
+            ),
+            lambda: gemini_errors.ServerError(
+                503, {"error": {"code": 503, "message": "down", "status": "UNAVAILABLE"}}
+            ),
+            lambda: httpx.ConnectError("refused"),
+            lambda: httpx.ReadTimeout("timed out"),
+        ],
+        ids=["429", "503", "connect", "read-timeout"],
+    )
+    def test_transient_sdk_errors_are_retried(self, make_error) -> None:
+        """Each transient SDK error is translated and retried by `with_retries`."""
+        from google.genai import types as genai_types
+
+        provider = self._make_provider()
+        calls = 0
+        ok = genai_types.GenerateContentResponse(
+            candidates=[
+                genai_types.Candidate(
+                    content=genai_types.Content(role="model", parts=[genai_types.Part(text="ok")]),
+                    finish_reason=genai_types.FinishReason.STOP,
+                )
+            ]
+        )
+
+        async def generate_content(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise make_error()
+            return ok
+
+        provider._client.aio.models.generate_content = generate_content
+
+        async def run() -> None:
+            with patch("dobby.providers._retry.create_retry_config", _zero_delay_retry_config):
+                result = await provider.chat([UserMessagePart(parts=[TextPart(text="hi")])])
+            assert calls == 3
+            assert result.parts[0].text == "ok"
+
+        asyncio.run(run())
+
+    def test_non_retryable_client_error_is_not_retried(self) -> None:
+        provider = self._make_provider()
+        calls = 0
+
+        async def generate_content(**kwargs):
+            nonlocal calls
+            calls += 1
+            raise self._make_gemini_client_error(403, "PERMISSION_DENIED")
+
+        provider._client.aio.models.generate_content = generate_content
+
+        async def run() -> None:
+            with patch("dobby.providers._retry.create_retry_config", _zero_delay_retry_config):
+                with pytest.raises(ProviderError) as exc_info:
+                    await provider.chat([UserMessagePart(parts=[TextPart(text="hi")])])
+            assert exc_info.value.status_code == 403
+            assert calls == 1
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------

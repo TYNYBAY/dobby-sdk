@@ -2,7 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -10,6 +10,7 @@ from dobby import AgentExecutor
 from dobby.exceptions import ApprovalRequired, ModelRetryExhaustedError, ToolFailure
 from dobby.tools import Tool
 from dobby.types import (
+    AssistantMessagePart,
     StreamEndEvent,
     ToolResultEvent,
     ToolResultPart,
@@ -41,7 +42,25 @@ def _make_mock_provider(tool_calls: list[ToolUsePart]) -> AsyncMock:
 
     provider = AsyncMock()
     provider.chat = mock_chat
+    provider.format_tools = Mock(return_value=None)
     return provider
+
+
+def _assert_batched_turns(messages, turn_count: int) -> None:
+    """Require each tool turn to be one assistant message and one result message.
+
+    The results must answer the turn's calls one to one, in call order.
+    """
+    assistant_messages = [m for m in messages if isinstance(m, AssistantMessagePart)]
+    assert len(assistant_messages) == turn_count
+    for index, message in enumerate(messages):
+        if isinstance(message, AssistantMessagePart):
+            call_ids = [part.id for part in message.parts if isinstance(part, ToolUsePart)]
+            reply = messages[index + 1]
+            assert isinstance(reply, UserMessagePart)
+            assert [
+                part.tool_use_id for part in reply.parts if isinstance(part, ToolResultPart)
+            ] == call_ids
 
 
 async def _collect_events(tools: list[Tool], tool_calls: list[ToolUsePart], **kwargs):
@@ -61,16 +80,15 @@ async def _collect_until_exception(tools, tool_calls, exception_type, **kwargs):
     )
     events = []
     caught = None
-    with patch.object(
-        executor, "_emit_tool_result", wraps=executor._emit_tool_result
-    ) as emit_result:
+    with patch.object(executor, "_flush_turn", wraps=executor._flush_turn) as flush_turn:
         try:
             async for event in executor.run_stream(messages=[], **kwargs):
                 events.append(event)
         except exception_type as exception:
             caught = exception
     assert caught is not None
-    messages = emit_result.call_args.args[3] if emit_result.call_args else []
+    messages = flush_turn.call_args.args[0] if flush_turn.call_args else []
+    _assert_batched_turns(messages, flush_turn.call_count)
     return events, messages, caught
 
 

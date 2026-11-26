@@ -1,4 +1,12 @@
-"""Example: Vertex AI provider (Model Garden) - streaming with a tool call.
+"""Example: Vertex AI provider - streaming with a tool call.
+
+`VertexAIProvider` routes by publisher. With the default `routing="native"`,
+`google/gemini*` models use Gemini's native API and `anthropic/*` models use the
+Anthropic Messages API on Vertex; every other publisher (e.g. `meta/...`) and
+every self-deployed endpoint uses the OpenAI-compatible Chat Completions
+endpoint. Pass `routing="openai"` to keep every model on Chat Completions, as
+in 0.2.x. `AgentExecutor` asks the provider for the active route's tool format,
+so the code below is the same on every route.
 
 Also documents every way to supply GCP credentials and OAuth scopes to
 `VertexAIProvider`. See `build_provider()` below for runnable variants of each.
@@ -9,10 +17,11 @@ Auth resolution order, first match wins:
     2. `GOOGLE_APPLICATION_CREDENTIALS_JSON`   service-account key as env var
     3. `google.auth.default()`                 Application Default Credentials
 
-Token refresh is automatic on all three. The bearer token is never held as a
-string: the provider hands the OpenAI SDK a callable `api_key` that is re-invoked
-before every request, so a long-lived provider keeps working past the ~1 hour
-token lifetime with no manual refresh.
+Token refresh is automatic on all three, on every route. On Chat Completions
+the bearer token is never held as a string: the provider hands the OpenAI SDK a
+callable `api_key` that is re-invoked before every request. The native SDK
+clients refresh the same credentials object themselves. Either way a long-lived
+provider keeps working past the ~1 hour token lifetime with no manual refresh.
 
 Run with ADC:
 
@@ -39,8 +48,10 @@ from dobby.types import (
     UserMessagePart,
 )
 
-# Model Garden id, forwarded verbatim to the OpenAI-compatible endpoint.
-MODEL = "meta/llama-3.1-405b-instruct-maas"
+# The publisher picks the route: this one goes to Gemini's native API.
+# Try "anthropic/claude-sonnet-4-5" (native Claude) or
+# "meta/llama-3.1-405b-instruct-maas" (Chat Completions, Model Garden).
+MODEL = "google/gemini-2.5-flash"
 
 # Narrow this where your credential source supports it. Left as None, google-auth
 # resolves its own default, which for most ADC sources is the broad
@@ -63,6 +74,12 @@ def build_provider() -> VertexAIProvider:
     # login`; on GCP it picks up the attached service account. `project` is
     # derived from ADC when ADC knows it.
     return VertexAIProvider(model=MODEL, location="us-central1")
+
+    # --- Option 1c: keep the 0.2.x Chat Completions route ----------------------
+    # Every model goes through the OpenAI-compatible endpoint, Gemini and Claude
+    # included.
+    #
+    # return VertexAIProvider(model=MODEL, location="us-central1", routing="openai")
 
     # --- Option 1b: ADC, project passed explicitly -----------------------------
     # Needed when ADC carries no project — typically user ADC where

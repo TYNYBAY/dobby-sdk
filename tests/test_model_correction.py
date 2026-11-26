@@ -13,6 +13,7 @@ from dobby.exceptions import ApprovalRequired, ModelRetry, ModelRetryExhaustedEr
 from dobby.executor import _control_flow_result, _resolve_max_model_corrections
 from dobby.tools import Tool
 from dobby.types import (
+    AssistantMessagePart,
     StreamEndEvent,
     ToolResultEvent,
     ToolResultPart,
@@ -28,6 +29,10 @@ class ScriptedProvider:
     def __init__(self, turns: list[list[ToolUsePart]]) -> None:
         self.turns = turns
         self.calls: list[list] = []
+
+    def format_tools(self, tools):
+        del tools
+        return None
 
     async def chat(self, messages, **kwargs):
         """Record history and stream the next scripted response."""
@@ -59,6 +64,23 @@ class TypedTool(Tool):
         return count
 
 
+def _assert_batched_turns(messages, turn_count: int) -> None:
+    """Require each tool turn to be one assistant message and one result message.
+
+    The results must answer the turn's calls one to one, in call order.
+    """
+    assistant_messages = [m for m in messages if isinstance(m, AssistantMessagePart)]
+    assert len(assistant_messages) == turn_count
+    for index, message in enumerate(messages):
+        if isinstance(message, AssistantMessagePart):
+            call_ids = [part.id for part in message.parts if isinstance(part, ToolUsePart)]
+            reply = messages[index + 1]
+            assert isinstance(reply, UserMessagePart)
+            assert [
+                part.tool_use_id for part in reply.parts if isinstance(part, ToolResultPart)
+            ] == call_ids
+
+
 def _tool_results(messages) -> list[ToolResultPart]:
     """Return tool-result history parts in order."""
     return [
@@ -79,9 +101,7 @@ async def _collect_until_exception(executor, exception_type, **kwargs):
     """Collect events and assembled history until a host exception is raised."""
     events = []
     caught = None
-    with patch.object(
-        executor, "_emit_tool_result", wraps=executor._emit_tool_result
-    ) as emit_result:
+    with patch.object(executor, "_flush_turn", wraps=executor._flush_turn) as flush_turn:
         try:
             async for event in executor.run_stream(messages=[], **kwargs):
                 events.append(event)
@@ -89,7 +109,8 @@ async def _collect_until_exception(executor, exception_type, **kwargs):
             caught = exception
 
     assert caught is not None
-    messages = emit_result.call_args.args[3] if emit_result.call_args else []
+    messages = flush_turn.call_args.args[0] if flush_turn.call_args else []
+    _assert_batched_turns(messages, flush_turn.call_count)
     return events, messages, caught
 
 
@@ -766,11 +787,10 @@ def test_multiple_terminals_are_all_represented_after_first_completes() -> None:
 
     events = []
     messages = []
-    with patch.object(
-        executor, "_emit_tool_result", wraps=executor._emit_tool_result
-    ) as emit_result:
+    with patch.object(executor, "_flush_turn", wraps=executor._flush_turn) as flush_turn:
         events = asyncio.run(_collect_events(executor))
-        messages = emit_result.call_args.args[3] if emit_result.call_args else []
+        messages = flush_turn.call_args.args[0] if flush_turn.call_args else []
+        _assert_batched_turns(messages, flush_turn.call_count)
 
     results = [event for event in events if isinstance(event, ToolResultEvent)]
     assert second_calls == 0

@@ -59,7 +59,7 @@ async for event in executor.run_stream(messages):
 
    async def main():
        provider = VertexAIProvider(
-           model="meta/llama-3.1-405b-instruct-maas",
+           model="google/gemini-2.5-flash",  # native Gemini route
            project="your-project-id",
            location="us-central1",
            scopes=["https://www.googleapis.com/auth/cloud-platform"],
@@ -78,11 +78,13 @@ async for event in executor.run_stream(messages):
 
 **On GCP itself** (Cloud Run, GKE, Compute Engine): skip all of the above — attach a service account to the runtime and let ADC resolve it automatically via the metadata server. No key material to manage at all. The env-var approach above is only needed off-GCP (other clouds, local dev without `gcloud auth application-default login`).
 
+**Routing.** `VertexAIProvider` sends `google/gemini*` models to Gemini's native API and `anthropic/*` models to the Anthropic Messages API on Vertex. Every other publisher (Llama, gpt-oss, Gemma, …) and every self-deployed endpoint uses Vertex's OpenAI-compatible Chat Completions endpoint. Pass `routing="openai"` to keep every model on Chat Completions, as in 0.2.x. See [docs/providers/vertexai.md](./docs/providers/vertexai.md#routing).
+
 **Other auth styles** — a service-account key file, service-account impersonation, or plain ADC — are shown as runnable variants in `build_provider()` in [examples/vertexai_example.py](./examples/vertexai_example.py), with the full reference in [docs/providers/vertexai.md](./docs/providers/vertexai.md#authentication).
 
 ## Features
 
-- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry), Gemini (Developer API), Vertex AI Model Garden
+- **Multi-provider**: OpenAI, Azure OpenAI, Anthropic (direct, Azure AI Foundry), Gemini (Developer API), Vertex AI (native Gemini and Claude, Model Garden, self-deployed endpoints)
 - **Streaming**: Real-time token streaming with typed events
 - **Tools**: Dataclass-based tools with auto-generated schemas
 - **Context injection**: Pass runtime context to tools via `Injected[T]`
