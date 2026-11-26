@@ -1713,3 +1713,198 @@ class TestStreamChatCompletion:
         assert "extra_headers" not in kwargs
         assert "api_key" not in kwargs
         assert "headers" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# Gemini thought signatures (`tool_calls[].extra_content`) round trip
+# ---------------------------------------------------------------------------
+
+_SIGNED = {"google": {"thought_signature": "c2lnLTE="}}
+
+
+def _signed_tool_call(
+    call_id: str, name: str, arguments: str, extra_content: Any
+) -> SimpleNamespace:
+    tool_call = _make_tool_call(call_id, name, arguments)
+    tool_call.extra_content = extra_content
+    return tool_call
+
+
+def _replay_request(provider: VertexAIProvider, first_turn: list[Any]) -> list[dict[str, Any]]:
+    """Send `first_turn` back as assistant history and return the sent tool_calls."""
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_make_response(content="done")
+    )
+    asyncio.run(
+        provider.chat(
+            messages=[
+                UserMessagePart(parts=[TextPart(text="hi")]),
+                AssistantMessagePart(parts=first_turn),
+            ],
+            stream=False,
+        )
+    )
+    _, kwargs = provider._client.chat.completions.create.call_args
+    return kwargs["messages"][-1]["tool_calls"]
+
+
+class TestExtraContentRoundTrip:
+    """R11: Gemini thought signatures in `extra_content` survive across turns."""
+
+    def test_non_stream_signature_round_trips(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(
+            tool_calls=[_signed_tool_call("call_1", "get_weather", '{"city": "SF"}', _SIGNED)],
+            finish_reason="tool_calls",
+        )
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.parts == [
+            ToolUsePart(
+                id="call_1",
+                name="get_weather",
+                inputs={"city": "SF"},
+                metadata={"extra_content": _SIGNED},
+            )
+        ]
+        assert _replay_request(provider, result.parts) == [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "SF"}'},
+                "extra_content": _SIGNED,
+            }
+        ]
+
+    def test_openai_sdk_model_exposes_extra_content(self) -> None:
+        """The real openai pydantic models keep `extra_content` as an extra field."""
+        response = openai.types.chat.ChatCompletion.model_validate(
+            {
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "google/gemini-3-pro",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get_weather", "arguments": "{}"},
+                                    "extra_content": _SIGNED,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+        provider = _make_chat_provider()
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.parts[0].metadata == {"extra_content": _SIGNED}
+
+    def test_stream_captures_extra_content_from_deltas(self) -> None:
+        provider = _make_chat_provider()
+        first = _make_tool_call_delta(0, call_id="call_1", name="get_weather", arguments='{"ci')
+        second = _make_tool_call_delta(0, arguments='ty": "SF"}')
+        second.extra_content = _SIGNED
+        chunks = [
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(tool_calls=[first]))]),
+            _make_stream_chunk(choices=[_make_stream_choice(_make_delta(tool_calls=[second]))]),
+            _make_stream_chunk(
+                choices=[_make_stream_choice(_make_delta(), finish_reason="tool_calls")]
+            ),
+        ]
+        provider._client.chat.completions.create = AsyncMock(return_value=_chunk_stream(chunks))
+
+        events = asyncio.run(_collect_stream_events(provider))
+
+        expected = ToolUsePart(
+            id="call_1",
+            name="get_weather",
+            inputs={"city": "SF"},
+            metadata={"extra_content": _SIGNED},
+        )
+        assert events[-1].parts == [expected]
+        tool_events = [e for e in events if isinstance(e, ToolUseEvent)]
+        assert tool_events[0].metadata == {"extra_content": _SIGNED}
+        assert _replay_request(provider, events[-1].parts)[0]["extra_content"] == _SIGNED
+
+    def test_parallel_calls_only_signed_call_replays_extra_content(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(
+            tool_calls=[
+                _signed_tool_call("call_1", "get_weather", '{"city": "SF"}', _SIGNED),
+                _make_tool_call("call_2", "get_time", '{"tz": "UTC"}'),
+            ],
+            finish_reason="tool_calls",
+        )
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+        sent = _replay_request(provider, result.parts)
+
+        assert sent[0]["extra_content"] == _SIGNED
+        assert "extra_content" not in sent[1]
+
+    def test_absent_extra_content_leaves_request_unchanged(self) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(
+            tool_calls=[_make_tool_call("call_1", "get_weather", '{"city": "SF"}')],
+            finish_reason="tool_calls",
+        )
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.parts[0].metadata is None
+        assert _replay_request(provider, result.parts) == [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "SF"}'},
+            }
+        ]
+
+    @pytest.mark.parametrize("bad_value", [None, "", {}, "c2lnLTE=", ["x"]])
+    def test_empty_or_non_dict_extra_content_is_dropped(self, bad_value: Any) -> None:
+        provider = _make_chat_provider()
+        response = _make_response(
+            tool_calls=[_signed_tool_call("call_1", "get_weather", "{}", bad_value)],
+            finish_reason="tool_calls",
+        )
+        provider._client.chat.completions.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            provider.chat(messages=[UserMessagePart(parts=[TextPart(text="hi")])], stream=False)
+        )
+
+        assert result.parts[0].metadata is None
+        assert "extra_content" not in _replay_request(provider, result.parts)[0]
+
+    @pytest.mark.parametrize("bad_value", [None, ""])
+    def test_converter_skips_empty_extra_content_in_metadata(self, bad_value: Any) -> None:
+        """History built elsewhere with an empty value is not replayed either."""
+        part = ToolUsePart(id="call_1", name="f", inputs={}, metadata={"extra_content": bad_value})
+
+        result = to_vertexai_messages([AssistantMessagePart(parts=[part])])
+
+        assert "extra_content" not in result[0]["tool_calls"][0]
