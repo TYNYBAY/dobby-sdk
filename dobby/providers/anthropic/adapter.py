@@ -1,15 +1,16 @@
 """Anthropic Claude provider for Dobby SDK.
 
 Implements the Provider interface for Anthropic's Messages API,
-supporting the direct Anthropic API and Azure-hosted Claude.
+supporting the direct Anthropic API, Azure-hosted Claude and (through
+`VertexAIProvider`) Claude on Vertex AI.
 """
 
 from collections.abc import AsyncIterator, Iterable
 import json
-from typing import Any, Literal, NoReturn, cast, overload
+from typing import Any, Literal, NoReturn, Self, cast, overload
 
 import anthropic
-from anthropic import AsyncAnthropic, AsyncAnthropicFoundry
+from anthropic import AsyncAnthropic, AsyncAnthropicFoundry, AsyncAnthropicVertex
 from anthropic.lib.foundry import AsyncAzureADTokenProvider
 
 from ..._logging import logger
@@ -67,7 +68,10 @@ def _map_stop_reason(reason: str | None) -> StopReason:
     return "end_turn"
 
 
-class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
+type AnthropicClient = AsyncAnthropic | AsyncAnthropicFoundry | AsyncAnthropicVertex
+
+
+class AnthropicProvider(Provider[AnthropicClient]):
     """Provider for Anthropic Claude and Azure-hosted Claude.
 
     Supports the direct Anthropic API and Azure AI Foundry deployments. For
@@ -83,8 +87,9 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
     api_key: str | None
     base_url: str | None
     _model: str
-    _client: AsyncAnthropic | AsyncAnthropicFoundry
+    _client: AnthropicClient
     _is_azure: bool
+    _provider_name: str
     max_retries: int
 
     def __init__(
@@ -150,9 +155,47 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
                 base_url=base_url,
             )
 
+    @classmethod
+    def _from_client(
+        cls,
+        client: AnthropicClient,
+        model: str,
+        *,
+        max_retries: int = 3,
+        provider_name: str = "anthropic",
+    ) -> Self:
+        """Build a provider around a pre-built client, skipping `__init__`.
+
+        Internal construction path for `VertexAIProvider`, which hands in an
+        `AsyncAnthropicVertex` (built with `max_retries=0`) and reuses this
+        adapter's converters, streaming, retries and error translation as they
+        are.
+
+        Args:
+            client: An already-configured Anthropic SDK client.
+            model: Model name sent on each request.
+            max_retries: Maximum retry attempts for transient errors.
+            provider_name: Value of `name`, reported in errors and retry logs.
+
+        Returns:
+            A provider that sends every request through `client`.
+        """
+        provider = cls.__new__(cls)
+        provider.api_key = None
+        provider.base_url = None
+        provider._model = model
+        provider.max_retries = max_retries
+        provider._client = client
+        provider._is_azure = False
+        provider._provider_name = provider_name
+        return provider
+
     @property
     def name(self) -> str:
-        """Provider name."""
+        """Provider name (`"anthropic"`, `"azure-anthropic"`, or the injected name)."""
+        injected = getattr(self, "_provider_name", None)
+        if injected is not None:
+            return injected
         # getattr fallback keeps this robust when the instance is built via
         # __new__ (e.g. in tests) without running __init__.
         is_azure = getattr(self, "_is_azure", bool(self.base_url and "azure" in self.base_url))
@@ -164,7 +207,7 @@ class AnthropicProvider(Provider[AsyncAnthropic | AsyncAnthropicFoundry]):
         return self._model
 
     @property
-    def client(self) -> AsyncAnthropic | AsyncAnthropicFoundry:
+    def client(self) -> AnthropicClient:
         """Authenticated client instance."""
         return self._client
 

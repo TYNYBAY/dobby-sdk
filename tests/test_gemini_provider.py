@@ -9,7 +9,7 @@ import base64
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from google.genai import types as genai_types
 import pytest
@@ -130,6 +130,43 @@ class TestGeminiChatModelOverride:
         provider = _make_provider()
         captured = self._run_chat(provider, top_p=0.4)
         assert captured["config"].top_p == 0.4
+
+
+class TestInjectedClient:
+    """The internal `_from_client` path runs the adapter on a pre-built client."""
+
+    def test_calls_generate_content_with_model_and_converted_contents(self) -> None:
+        from google import genai
+
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        client = MagicMock(spec=genai.Client)
+        client.aio.models.generate_content = AsyncMock(
+            return_value=_response([genai_types.Part(text="hello")])
+        )
+        provider = GeminiProvider._from_client(
+            client, "gemini-2.5-pro", max_retries=0, provider_name="vertexai"
+        )
+
+        result = asyncio.run(provider.chat(HI))
+
+        client.aio.models.generate_content.assert_awaited_once()
+        call = client.aio.models.generate_content.await_args.kwargs
+        assert call["model"] == "gemini-2.5-pro"
+        assert [c.role for c in call["contents"]] == ["user"]
+        assert call["contents"][0].parts[0].text == "hi"
+        assert result.parts == [TextPart(text="hello")]
+        assert provider.client is client
+        assert provider.model == "gemini-2.5-pro"
+        assert provider.max_retries == 0
+        assert provider.name == "vertexai"
+
+    def test_name_defaults_to_gemini(self) -> None:
+        from dobby.providers.gemini.adapter import GeminiProvider
+
+        provider = GeminiProvider._from_client(MagicMock(), "gemini-2.5-flash")
+        assert provider.name == "gemini"
+        assert provider.max_retries == 3
 
 
 class TestRequestBuilding:
