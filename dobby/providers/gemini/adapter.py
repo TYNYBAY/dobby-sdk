@@ -79,7 +79,7 @@ def _parse_placeholder_text(text: str) -> object:
         pass
     try:
         return ast.literal_eval(text)
-    except (ValueError, SyntaxError, MemoryError, RecursionError):
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
         return None
 
 

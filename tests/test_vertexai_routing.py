@@ -225,6 +225,23 @@ class TestNativeClientConstruction:
             mock_openai_cls.assert_called_once()
             assert mock_openai_cls.call_args.kwargs["api_key"] == provider._bearer_token
 
+    def test_native_chat_never_builds_openai_client(self) -> None:
+        """chat() on a native route uses only its own SDK client."""
+        with _patched_sdks() as sdks, patch(f"{ADAPTER}.AsyncOpenAI") as mock_openai_cls:
+            provider = VertexAIProvider(
+                model=GEMINI, project="my-project", credentials=_mock_credentials()
+            )
+            client = sdks.genai.Client.return_value
+            client.aio.models.generate_content = AsyncMock(
+                return_value=_gemini_response([genai_types.Part(text="hello")])
+            )
+
+            asyncio.run(provider.chat(HI))
+
+            client.aio.models.generate_content.assert_awaited_once()
+            mock_openai_cls.assert_not_called()
+            assert provider._client is None
+
     def test_openai_client_built_eagerly_on_openai_route(self) -> None:
         with _patched_sdks(), patch(f"{ADAPTER}.AsyncOpenAI") as mock_openai_cls:
             VertexAIProvider(

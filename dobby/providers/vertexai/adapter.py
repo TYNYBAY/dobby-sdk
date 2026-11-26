@@ -583,9 +583,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         # The Chat Completions client is built now only for the OpenAI-compatible
         # route; on a native route it is built on first access to `client`.
         self._route = _resolve_route(resolved_model, routing=routing, endpoint_id=endpoint_id)
-        self._client: AsyncOpenAI | None = (
-            self._build_openai_client() if self._route == "openai" else None
-        )
+        self._client = self._build_openai_client() if self._route == "openai" else None
         self._native = self._build_native_provider()
 
     @property

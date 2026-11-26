@@ -208,6 +208,9 @@ is load-bearing.
 
 `routing="openai"` keeps every model on Chat Completions. Its identity is now **an auth
 strategy plus a router over three protocols**, not one Chat Completions client.
+`provider.client` is still that Chat Completions `AsyncOpenAI` client on every route, with
+the same bearer-token callable from test 2; on a native route it is built only when
+`provider.client` is first read, since `chat()` never uses it there.
 
 Why it changed:
 
