@@ -180,7 +180,22 @@ _NATIVE_ROUTES: dict[_Route, tuple[str, str]] = {
 # passes them through. `logprobs` stays rejected there: Gemini's field is a
 # top-N count, not Chat Completions' on/off flag.
 _SHARED_CHAT_COMPLETIONS_ONLY_KWARGS = frozenset(
-    {"extra_body", "stop", "n", "logprobs", "top_logprobs", "response_format"}
+    {
+        "extra_body",
+        "stop",
+        "n",
+        "logprobs",
+        "top_logprobs",
+        "response_format",
+        # Gemini has no field of these names and Claude's `tool_choice` takes a
+        # different shape, so they would fail with a raw SDK error or, for a
+        # `tool_choice` dict, be misread.
+        "max_completion_tokens",
+        "tool_choice",
+        "parallel_tool_calls",
+        "user",
+        "stream_options",
+    }
 )
 _CHAT_COMPLETIONS_ONLY_KWARGS: dict[_Route, frozenset[str]] = {
     "gemini": _SHARED_CHAT_COMPLETIONS_ONLY_KWARGS,

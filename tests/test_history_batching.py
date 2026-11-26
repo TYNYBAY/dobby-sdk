@@ -353,6 +353,41 @@ def test_approval_required_flushes_once_before_raising() -> None:
     ]
 
 
+class CancelTool(Tool):
+    """Cancel the task running the tool, as host cancellation would."""
+
+    name = "cancel_me"
+    description = "Gets cancelled mid-call."
+
+    async def __call__(self) -> str:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)
+        return "unreachable"
+
+
+def test_cancellation_flushes_once_before_raising() -> None:
+    """A cancelled parallel batch still writes one whole turn, then re-raises."""
+    turn = [_call("a", "cancel_me"), _call("b", value="B")]
+    provider = ScriptedProvider([turn])
+    executor = AgentExecutor(provider="openai", llm=provider, tools=[CancelTool(), EchoTool()])
+
+    events, flush, caught = asyncio.run(_collect_with_flushes(executor, asyncio.CancelledError))
+
+    assert isinstance(caught, asyncio.CancelledError)
+    assert flush.call_count == 1
+    history = flush.call_args.args[0]
+    assert len(history) == 3
+    assert history[1] == AssistantMessagePart(parts=turn)
+    assert _result_texts(history[2]) == [
+        ("a", str({"cancelled": True}), True),
+        ("b", "B", False),
+    ]
+    # Host cancellation yields no placeholder event for the cancelled call.
+    assert ("result", "a", {"cancelled": True}, True) not in _event_shape(events)
+
+
 @pytest.mark.parametrize("call_id", ["same", ""])
 def test_calls_sharing_an_id_each_keep_their_result(call_id: str) -> None:
     turn = [_call(call_id, value="first"), _call(call_id, value="second")]

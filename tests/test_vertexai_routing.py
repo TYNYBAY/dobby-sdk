@@ -285,7 +285,20 @@ class TestGeminiRouteChat:
         assert sent[0].function_declarations[0].name == "echo"
 
     @pytest.mark.parametrize(
-        "kwarg", ["stop", "n", "logprobs", "top_logprobs", "response_format", "extra_body"]
+        "kwarg",
+        [
+            "stop",
+            "n",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "extra_body",
+            "max_completion_tokens",
+            "tool_choice",
+            "parallel_tool_calls",
+            "user",
+            "stream_options",
+        ],
     )
     def test_chat_completions_kwargs_rejected_before_network(self, kwarg: str) -> None:
         provider, client = _gemini_provider()
@@ -348,6 +361,9 @@ class TestAnthropicRouteChat:
         ("kwarg", "value"),
         [
             ("extra_body", {"x": 1}),
+            ("tool_choice", {"type": "function", "function": {"name": "echo"}}),
+            ("max_completion_tokens", 64),
+            ("parallel_tool_calls", False),
             ("seed", 7),
             ("frequency_penalty", 0.5),
             ("presence_penalty", 0.5),
