@@ -506,10 +506,12 @@ class TestToolCallIds:
             '{"error": "boom"}',
             "[tool_execution_error] The tool failed unexpectedly.",
             "{'approval_required': True, 'detail': '" + "x" * 80 + "'}",
-            # Literals ast.literal_eval rejects with TypeError (unhashable keys)
-            # must not crash ID minting for the rest of the history.
+            # Odd literal-looking texts are ordinary results and never crash ID
+            # minting for the rest of the history.
             "{{}}",
             '{["a"]: 1}',
+            # Only the exact stored forms count; other JSON spacing does not.
+            '{"approval_required":true}',
         ],
     )
     def test_other_error_results_take_the_id(self, text: str) -> None:
