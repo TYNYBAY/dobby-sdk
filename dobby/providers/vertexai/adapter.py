@@ -172,22 +172,21 @@ _NATIVE_ROUTES: dict[_Route, tuple[str, str]] = {
     "anthropic": ("anthropic", ""),
 }
 
-# Chat Completions parameters with no native-route meaning. Gemini would raise
-# a raw Pydantic error for them, and on Claude `extra_body` is a real SDK option
-# that silently rewrites the request body, so they are rejected up front.
-_CHAT_COMPLETIONS_ONLY_KWARGS = frozenset(
-    {
-        "extra_body",
-        "stop",
-        "n",
-        "logprobs",
-        "top_logprobs",
-        "response_format",
-        "seed",
-        "frequency_penalty",
-        "presence_penalty",
-    }
+# Chat Completions parameters with no meaning on a native route, per route.
+# Gemini would raise a raw Pydantic error for them, and on Claude `extra_body`
+# is a real SDK option that silently rewrites the request body, so they are
+# rejected up front. `seed` and the two penalties are native
+# `GenerateContentConfig` fields with the same meaning, so the Gemini route
+# passes them through. `logprobs` stays rejected there: Gemini's field is a
+# top-N count, not Chat Completions' on/off flag.
+_SHARED_CHAT_COMPLETIONS_ONLY_KWARGS = frozenset(
+    {"extra_body", "stop", "n", "logprobs", "top_logprobs", "response_format"}
 )
+_CHAT_COMPLETIONS_ONLY_KWARGS: dict[_Route, frozenset[str]] = {
+    "gemini": _SHARED_CHAT_COMPLETIONS_ONLY_KWARGS,
+    "anthropic": _SHARED_CHAT_COMPLETIONS_ONLY_KWARGS
+    | {"seed", "frequency_penalty", "presence_penalty"},
+}
 
 
 def _resolve_route(
@@ -696,8 +695,9 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
                 `reasoning_effort` was given on the Anthropic route (which takes
                 an `int` thinking budget).
         """
+        rejected = _CHAT_COMPLETIONS_ONLY_KWARGS.get(self._route, frozenset())
         for key in kwargs:
-            if key in _CHAT_COMPLETIONS_ONLY_KWARGS:
+            if key in rejected:
                 raise TypeError(
                     f"{key!r} is a Chat Completions parameter and is not supported on "
                     f"VertexAIProvider's native {self._route} route. Construct the "

@@ -284,7 +284,9 @@ class TestGeminiRouteChat:
         assert all(isinstance(tool, genai_types.Tool) for tool in sent)
         assert sent[0].function_declarations[0].name == "echo"
 
-    @pytest.mark.parametrize("kwarg", ["stop", "n", "seed", "response_format", "extra_body"])
+    @pytest.mark.parametrize(
+        "kwarg", ["stop", "n", "logprobs", "top_logprobs", "response_format", "extra_body"]
+    )
     def test_chat_completions_kwargs_rejected_before_network(self, kwarg: str) -> None:
         provider, client = _gemini_provider()
 
@@ -296,6 +298,17 @@ class TestGeminiRouteChat:
         assert "gemini" in message
         assert 'routing="openai"' in message
         client.aio.models.generate_content.assert_not_called()
+
+    def test_native_gemini_fields_with_shared_names_pass_through(self) -> None:
+        """`seed` and the penalties mean the same on Gemini, so they are not rejected."""
+        provider, client = _gemini_provider()
+
+        asyncio.run(provider.chat(HI, seed=7, frequency_penalty=0.5, presence_penalty=0.25))
+
+        config = client.aio.models.generate_content.await_args.kwargs["config"]
+        assert config.seed == 7
+        assert config.frequency_penalty == 0.5
+        assert config.presence_penalty == 0.25
 
 
 class TestAnthropicRouteChat:
@@ -331,14 +344,26 @@ class TestAnthropicRouteChat:
         assert "anthropic" in str(exc_info.value)
         client.messages.create.assert_not_called()
 
-    def test_extra_body_rejected_before_network(self) -> None:
+    @pytest.mark.parametrize(
+        ("kwarg", "value"),
+        [
+            ("extra_body", {"x": 1}),
+            ("seed", 7),
+            ("frequency_penalty", 0.5),
+            ("presence_penalty", 0.5),
+        ],
+    )
+    def test_chat_completions_kwargs_rejected_before_network(
+        self, kwarg: str, value: object
+    ) -> None:
+        """Claude has no seed or penalty fields, so these stay rejected here."""
         provider, client = _claude_provider()
 
         with pytest.raises(TypeError) as exc_info:
-            asyncio.run(provider.chat(HI, extra_body={"x": 1}))
+            asyncio.run(provider.chat(HI, **{kwarg: value}))
 
         message = str(exc_info.value)
-        assert "'extra_body'" in message
+        assert repr(kwarg) in message
         assert "anthropic" in message
         assert 'routing="openai"' in message
         client.messages.create.assert_not_called()

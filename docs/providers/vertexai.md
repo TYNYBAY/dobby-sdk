@@ -281,7 +281,7 @@ result = await provider.chat(messages, tools=tools)
 | `max_tokens` | Sent as `max_output_tokens` | Sent as `max_tokens`; defaults to `8192` when omitted | Forwarded as is |
 | Other kwargs | Forwarded to `GenerateContentConfig` (e.g. `top_p`, `top_k`, `stop_sequences`) | Forwarded to `messages.create()` (e.g. `top_p`, `top_k`, `stop_sequences`, `metadata`) | Forwarded to `chat.completions.create()` |
 
-On a native route these Chat Completions kwargs raise `TypeError` before any network call, naming `routing="openai"`: `extra_body`, `stop`, `n`, `logprobs`, `top_logprobs`, `response_format`, `seed`, `frequency_penalty`, `presence_penalty`. Gemini would otherwise fail with a raw Pydantic error, and on Claude `extra_body` is a real SDK option that silently rewrites the request body. The check is by name, so it applies even where `GenerateContentConfig` has a field of the same name (`seed`, `frequency_penalty`, `presence_penalty`, `logprobs`). See [the kwarg mapping](#kwarg-mapping) for the native fields.
+On a native route these Chat Completions kwargs raise `TypeError` before any network call, naming `routing="openai"`: `extra_body`, `stop`, `n`, `logprobs`, `top_logprobs` and `response_format` on both native routes, plus `seed`, `frequency_penalty` and `presence_penalty` on the Claude route. Gemini would otherwise fail with a raw Pydantic error, and on Claude `extra_body` is a real SDK option that silently rewrites the request body. On the Gemini route `seed`, `frequency_penalty` and `presence_penalty` are native `GenerateContentConfig` fields with the same meaning, so they pass through. `logprobs` stays rejected there because Gemini's field of that name is a top-N count, not an on/off flag. See [the kwarg mapping](#kwarg-mapping) for the native fields.
 
 ---
 
@@ -395,9 +395,9 @@ The Chat-Completions-only kwargs raise `TypeError` on native routes. Use the nat
 | `logprobs` | `response_logprobs` | none |
 | `top_logprobs` | none: Gemini's own field is also called `logprobs`, and that name is rejected | none |
 | `response_format` | `response_mime_type` with `response_schema` or `response_json_schema` | none: use a tool, or `AgentExecutor`'s `output_type` |
-| `seed` | none: the name is rejected | none |
-| `frequency_penalty` | none: the name is rejected | none |
-| `presence_penalty` | none: the name is rejected | none |
+| `seed` | `seed` (passed through unchanged) | none: rejected |
+| `frequency_penalty` | `frequency_penalty` (passed through unchanged) | none: rejected |
+| `presence_penalty` | `presence_penalty` (passed through unchanged) | none: rejected |
 | `extra_body` | pass `GenerateContentConfig` fields as kwargs | none: pass `messages.create` fields as kwargs |
 | `reasoning_effort` (`str`) | `str` → `thinking_level`; `int` → `thinking_budget` | `int` only → `thinking.budget_tokens`; a `str` raises `TypeError` |
 
