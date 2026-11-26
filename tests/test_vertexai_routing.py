@@ -210,12 +210,29 @@ class TestNativeClientConstruction:
             provider = _provider(GEMINI, max_retries=2)
         assert provider._native.max_retries == 2
 
-    def test_openai_client_still_built_on_native_routes(self) -> None:
+    def test_openai_client_built_lazily_on_native_routes(self) -> None:
+        """A native route builds no Chat Completions client until `client` is read."""
         with _patched_sdks(), patch(f"{ADAPTER}.AsyncOpenAI") as mock_openai_cls:
             provider = VertexAIProvider(
                 model=GEMINI, project="my-project", credentials=_mock_credentials()
             )
-        assert provider.client is mock_openai_cls.return_value
+            mock_openai_cls.assert_not_called()
+
+            client = provider.client
+
+            assert client is mock_openai_cls.return_value
+            assert provider.client is client
+            mock_openai_cls.assert_called_once()
+            assert mock_openai_cls.call_args.kwargs["api_key"] == provider._bearer_token
+
+    def test_openai_client_built_eagerly_on_openai_route(self) -> None:
+        with _patched_sdks(), patch(f"{ADAPTER}.AsyncOpenAI") as mock_openai_cls:
+            VertexAIProvider(
+                model="meta/llama-3.3-70b-instruct-maas",
+                project="my-project",
+                credentials=_mock_credentials(),
+            )
+            mock_openai_cls.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

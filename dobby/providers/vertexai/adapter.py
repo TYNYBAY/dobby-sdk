@@ -397,7 +397,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
     _target: _EndpointTarget
     _model: str
     _credentials: google.auth.credentials.Credentials
-    _client: AsyncOpenAI
+    _client: AsyncOpenAI | None
     _route: _Route
     _native: GeminiProvider | AnthropicProvider | None
     max_retries: int
@@ -574,17 +574,18 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         self._refresh_lock = asyncio.Lock()
 
         host = _resolve_host(location, endpoint_host)
-        self._client = AsyncOpenAI(
-            base_url=(
-                f"https://{host}/{api_version}/projects/{self.project}"
-                f"/locations/{location}/endpoints/{self._target.path_segment}"
-            ),
-            api_key=self._bearer_token,
+        self._openai_base_url = (
+            f"https://{host}/{api_version}/projects/{self.project}"
+            f"/locations/{location}/endpoints/{self._target.path_segment}"
         )
 
-        # Native routes run on their own SDK clients around the same credentials;
-        # the AsyncOpenAI client above stays so `client` keeps its meaning.
+        # Native routes run on their own SDK clients around the same credentials.
+        # The Chat Completions client is built now only for the OpenAI-compatible
+        # route; on a native route it is built on first access to `client`.
         self._route = _resolve_route(resolved_model, routing=routing, endpoint_id=endpoint_id)
+        self._client: AsyncOpenAI | None = (
+            self._build_openai_client() if self._route == "openai" else None
+        )
         self._native = self._build_native_provider()
 
     @property
@@ -604,8 +605,18 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         Fully self-sufficient: the callable `api_key` is invoked by the SDK's own
         request-preparation hook on every request, so direct use of
         `provider.client.chat.completions.create(...)` also gets a fresh token.
+
+        This is always the OpenAI-compatible Chat Completions client, whatever the
+        route; native routes send `chat()` through their own SDK clients. On a
+        native route it is built on first access.
         """
+        if self._client is None:
+            self._client = self._build_openai_client()
         return self._client
+
+    def _build_openai_client(self) -> AsyncOpenAI:
+        """Build the Chat Completions client on the shared bearer-token auth."""
+        return AsyncOpenAI(base_url=self._openai_base_url, api_key=self._bearer_token)
 
     async def _bearer_token(self) -> str:
         """Return a valid bearer token, refreshing it first if necessary.
@@ -980,7 +991,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         )
 
         try:
-            response = await self._client.chat.completions.create(**create_kwargs)
+            response = await self.client.chat.completions.create(**create_kwargs)
         except Exception as e:
             self._translate_error(e)
 
@@ -1058,7 +1069,7 @@ class VertexAIProvider(Provider[AsyncOpenAI]):
         create_kwargs["stream_options"] = {"include_usage": True}
 
         try:
-            stream = await self._client.chat.completions.create(**create_kwargs)
+            stream = await self.client.chat.completions.create(**create_kwargs)
         except Exception as e:
             self._translate_error(e)
 

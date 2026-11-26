@@ -4,6 +4,7 @@ This module provides the GeminiProvider class for interacting with
 Google's Gemini API via the google-genai SDK.
 """
 
+import ast
 import base64
 from collections.abc import AsyncIterator, Iterable
 import json
@@ -50,23 +51,46 @@ from .converters import to_gemini_messages
 
 __all__ = ["GeminiProvider"]
 
-# Text of the executor's control-flow placeholder results, which reach the
-# history as `TextPart(text=str(result))`. A call answered only by one of these
-# was paused, not completed, so its ID stays free for the resumed call. The
-# payloads come from the same constants the executor writes.
-_PLACEHOLDER_RESULT_TEXTS = frozenset(
-    str(result) for result in (_APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT)
-)
+# Payloads of the executor's control-flow placeholder results. A call answered
+# only by one of these was paused, not completed, so its ID stays free for the
+# resumed call. They come from the same constants the executor writes.
+_PLACEHOLDER_RESULTS = (_APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT)
+
+# Placeholder text is short; longer results are real tool output and are never
+# parsed, so arbitrary output cannot cost a parse.
+_MAX_PLACEHOLDER_TEXT_LENGTH = 64
+
+
+def _parse_placeholder_text(text: str) -> object:
+    """Parse a stored result text as the executor's repr or a host's JSON.
+
+    The executor writes `str(result)` (Python repr); hosts that persist history
+    themselves may store the same payload as JSON. Both forms are recognised.
+
+    Args:
+        text: The tool result's text.
+
+    Returns:
+        The parsed value, or None when the text is neither form.
+    """
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return None
 
 
 def _is_placeholder_result(part: ToolResultPart) -> bool:
     """Return whether a tool result is an approval or cancellation placeholder."""
-    return (
-        part.is_error
-        and len(part.parts) == 1
-        and isinstance(part.parts[0], TextPart)
-        and part.parts[0].text in _PLACEHOLDER_RESULT_TEXTS
-    )
+    if not (part.is_error and len(part.parts) == 1 and isinstance(part.parts[0], TextPart)):
+        return False
+    text = part.parts[0].text.strip()
+    if len(text) > _MAX_PLACEHOLDER_TEXT_LENGTH:
+        return False
+    return _parse_placeholder_text(text) in _PLACEHOLDER_RESULTS
 
 
 def _taken_tool_call_ids(messages: list[MessagePart]) -> frozenset[str]:

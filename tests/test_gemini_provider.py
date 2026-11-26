@@ -490,6 +490,29 @@ class TestToolCallIds:
         history = _history_with_search(placeholder, is_error=True)
         assert self._ids([_call("search")], history, stream=stream) == ["call_search"]
 
+    @pytest.mark.parametrize(
+        "placeholder",
+        ['{"approval_required": true}', '{"cancelled": true}', ' {"cancelled": true}\n'],
+    )
+    def test_json_stored_placeholder_keeps_id(self, placeholder: str) -> None:
+        """Hosts that persist the placeholder payload as JSON still resume cleanly."""
+        history = _history_with_search(placeholder, is_error=True)
+        assert self._ids([_call("search")], history) == ["call_search"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"approval_required": false}',
+            '{"error": "boom"}',
+            "[tool_execution_error] The tool failed unexpectedly.",
+            "{'approval_required': True, 'detail': '" + "x" * 80 + "'}",
+        ],
+    )
+    def test_other_error_results_take_the_id(self, text: str) -> None:
+        """Real errors, other payloads and over-long text are never placeholders."""
+        history = _history_with_search(text, is_error=True)
+        assert self._ids([_call("search")], history) == ["call_search_2"]
+
     def test_placeholder_text_without_error_flag_is_real(self) -> None:
         history = _history_with_search(APPROVAL_PLACEHOLDER, is_error=False)
         assert self._ids([_call("search")], history) == ["call_search_2"]

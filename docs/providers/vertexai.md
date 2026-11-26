@@ -45,7 +45,7 @@ pinned = VertexAIProvider(
 - `routing` is keyword-only and takes `"native"` (default) or `"openai"`. Anything else raises `ValueError`. It is ignored with `endpoint_id`, which always uses Chat Completions.
 - On a native route the publisher prefix is removed before the SDK sees the id (`google/gemini-2.5-flash` → `gemini-2.5-flash`). `provider.model` still returns the id you passed.
 - `provider.name` is `"vertexai"` on every route, and so is `ProviderError.provider`.
-- `provider.client` is always the `AsyncOpenAI` client for the Chat Completions route. The native routes run on their own SDK clients, built from the same credentials, project and location.
+- `provider.client` is always the `AsyncOpenAI` client for the Chat Completions route. The native routes run on their own SDK clients, built from the same credentials, project and location; on a native route the `AsyncOpenAI` client is only built the first time `provider.client` is read.
 - The native SDK clients are built with their own retries off, so `max_retries` (Dobby's `with_retries`) is the only retry layer on every route.
 
 **A per-call `model=` is sent over the instance's route.** A native route removes only its own publisher prefix; the Chat Completions route forwards the id verbatim. An override within the same route works. An override for another route is not re-routed: it reaches the instance's backend and fails with that backend's own error. Build a second provider to talk to another publisher.
