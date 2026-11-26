@@ -10,7 +10,7 @@ Providers are the interface between Dobby and LLM APIs. Each provider handles me
 | Azure OpenAI | ✅ Stable | Responses API |
 | Anthropic | ✅ Stable | Messages API (direct and Azure AI Foundry) |
 | Gemini | ✅ Stable | `google-genai` (Developer API) |
-| [Vertex AI](./vertexai.md) | ✅ Stable | Chat Completions API (OpenAI-compatible; Model Garden) |
+| [Vertex AI](./vertexai.md) | ✅ Stable | Routes by publisher: native Gemini (`google/gemini*`), Anthropic Messages (`anthropic/*`), OpenAI-compatible Chat Completions for everything else and self-deployed endpoints |
 
 ## Common Interface
 
@@ -27,6 +27,8 @@ async def chat(
     reasoning_effort: str | None = None,
 ) -> StreamEndEvent | AsyncIterator[StreamEvent]
 ```
+
+`tools` must already be in the provider's wire format. `provider.format_tools(tools)` returns that format for providers that decide it themselves, such as `VertexAIProvider`, and `None` for the rest, whose format follows the `provider` literal given to `AgentExecutor`. `AgentExecutor` calls it for you.
 
 ## Usage
 
@@ -55,7 +57,8 @@ OpenAI and Gemini wrap stream iteration with the same error translation used at 
 The mapped types differ by provider:
 
 - **OpenAI:** rate limits, timeouts, connection failures, and 5xx become `RateLimitError`, `APITimeoutError`, `APIConnectionError`, or `InternalServerError`. Every other case is `ProviderError`.
-- **Gemini:** HTTP 429 becomes `RateLimitError`, HTTP 408 becomes `APITimeoutError`, and `ServerError` becomes `InternalServerError`. Other cases, including connection failures, are `ProviderError`. Gemini has no dedicated `APIConnectionError` mapping.
+- **Gemini:** HTTP 429 becomes `RateLimitError`; HTTP 408 and `httpx` timeouts become `APITimeoutError`; other `httpx` transport failures become `APIConnectionError`; `ServerError` (5xx) becomes `InternalServerError`. Every other case is `ProviderError`. The match reads the int `code` on `google-genai` errors, not the `status` string.
+- **Vertex AI:** each route uses its own SDK's mapping (OpenAI's on Chat Completions, Gemini's and Anthropic's on the native routes), always reported as `vertexai`.
 
 (`ProviderError` is aliased as `DobbyProviderError` in the adapters.)
 
@@ -64,4 +67,5 @@ These failures do not consume Dobby tool-retry or model-correction budgets. Prov
 ## Next
 
 - [OpenAI Provider](./openai.md) - Detailed OpenAI/Azure configuration
-- [Vertex AI Provider](./vertexai.md) - Detailed Vertex AI Model Garden configuration
+- [Vertex AI Provider](./vertexai.md) - Vertex AI routing, Model Garden and self-deployed endpoints
+- [Vertex routing](../vertex-routing-options.md) - Diagrams of the Vertex routes, history batching and Gemini tool-call IDs
