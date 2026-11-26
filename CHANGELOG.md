@@ -1,11 +1,15 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.18] - 2026-11-26
+
+Vertex AI now sends Gemini and Claude through their native APIs by default, and the agent loop keeps each tool turn whole so models keep making parallel tool calls. This release includes breaking changes for `VertexAIProvider` callers; `routing="openai"` restores the previous route.
 
 ### Added
 - **`max_model_corrections` on `AgentExecutor.run_stream()`.** One run-wide model-correction budget, default `3`, shared by tool-call correction and final-result correction. Exhausting it raises `ModelRetryExhaustedError`.
