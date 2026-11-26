@@ -28,6 +28,10 @@ class ScriptedProvider:
         self.turns = turns
         self.calls: list[list] = []
 
+    def format_tools(self, tools):
+        del tools
+        return None
+
     async def chat(self, messages, **kwargs):
         """Record history and stream the next scripted response."""
         del kwargs

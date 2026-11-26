@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, Literal, NoReturn, overload
 
+from ..tools.tool import Tool
 from ..types import MessagePart, StreamEndEvent, StreamEvent
 
 
@@ -242,6 +243,25 @@ class Provider[ClientT](ABC):
             InternalServerError: When provider returns 5xx (retryable)
         """
         raise NotImplementedError()
+
+    def format_tools(self, tools: list[Tool]) -> list[Any] | None:
+        """Format tools for this provider's wire protocol, if it decides the format.
+
+        Most providers return ``None`` and leave the format to the ``provider``
+        literal given to ``AgentExecutor``. A provider that needs another format,
+        such as one that routes between protocols, returns the formatted list,
+        and the executor uses it in place of the literal. Direct ``chat()``
+        callers can use it to format tools for this provider.
+
+        Args:
+            tools: Tools to format.
+
+        Returns:
+            Tool definitions ready for ``chat(tools=...)``, or ``None`` when the
+            provider leaves the format to the executor's ``provider`` literal.
+        """
+        del tools
+        return None
 
     def __repr__(self) -> str:
         """Return string representation of the provider."""

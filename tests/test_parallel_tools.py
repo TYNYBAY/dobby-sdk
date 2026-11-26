@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import logging
 import time
 from typing import Annotated
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -56,6 +56,7 @@ def _make_mock_provider(tool_calls: list[ToolUsePart]):
 
     provider = AsyncMock()
     provider.chat = mock_chat
+    provider.format_tools = Mock(return_value=None)
     return provider
 
 
