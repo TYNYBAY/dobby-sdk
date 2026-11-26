@@ -11,7 +11,7 @@ serializes to the wire as ``parametersJsonSchema`` (never ``parameters``).
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 import os
 from typing import Any, ClassVar, Literal
@@ -412,6 +412,40 @@ class TestProviderFormatToolsOverride:
         assert first == custom
         assert second is first
         assert llm.format_tools_calls == 1
+
+    @pytest.mark.parametrize(
+        ("literal", "expected"),
+        [
+            ("openai", lambda tool: tool.to_openai_format()),
+            ("anthropic", lambda tool: tool.to_anthropic_format()),
+            ("vertexai", to_vertexai_tool),
+        ],
+    )
+    def test_duck_typed_provider_without_hook_uses_literal(
+        self, literal: str, expected: Callable[[Tool], Any]
+    ) -> None:
+        """A host provider that does not subclass Provider keeps working."""
+
+        class DuckTypedProvider:
+            name = "duck"
+
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        executor = AgentExecutor(
+            provider=literal,  # type: ignore[arg-type]
+            llm=DuckTypedProvider(),  # type: ignore[arg-type]
+            tools=[tool],
+        )
+
+        assert executor.get_tools_schema() == [expected(tool)]
+
+    def test_non_list_hook_result_falls_back_to_literal(self) -> None:
+        """A hook answer that is not a list (e.g. a Mock attribute) is ignored."""
+        tool = Tool.from_model(WithConstraints, name="t", description="d")
+        llm = _FakeProvider()
+        llm.format_tools = lambda tools: "not-a-list"  # type: ignore[method-assign]
+        executor = AgentExecutor(provider="openai", llm=llm, tools=[tool])
+
+        assert executor.get_tools_schema() == [tool.to_openai_format()]
 
     def test_no_tools_skips_hook_and_sends_none(self) -> None:
         llm = _FakeProvider(formatted=[{"custom": "shape"}])

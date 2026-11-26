@@ -339,13 +339,19 @@ class AgentExecutor[ContextT, OutputT: BaseModel]:
 
         The provider's `format_tools()` decides the format when it returns a
         list; otherwise the `provider` literal does. The result is cached.
+        Providers that do not subclass `Provider` (duck-typed hosts) and so
+        lack `format_tools()` keep the literal-based format.
 
         Returns:
             List of tool schemas in provider-specific format
         """
-        if self._formatted_tools is None:
-            if self._tools:
-                self._formatted_tools = self.llm.format_tools(list(self._tools.values()))
+        if self._formatted_tools is None and self._tools:
+            format_tools = getattr(self.llm, "format_tools", None)
+            formatted = (
+                format_tools(list(self._tools.values())) if callable(format_tools) else None
+            )
+            if isinstance(formatted, list):
+                self._formatted_tools = formatted
         if self._formatted_tools is None:
             match self.provider:
                 case "openai" | "azure-openai":
