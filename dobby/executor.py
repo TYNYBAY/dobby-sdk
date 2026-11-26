@@ -60,6 +60,7 @@ from .types import (
     ToolUsePart,
     UserMessagePart,
 )
+from .types.tool_result_part import _APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT
 
 OUTPUT_TOOL_NAME = "final_result"
 _DEFAULT_MAX_MODEL_CORRECTIONS = 3
@@ -209,9 +210,9 @@ def _control_flow_result(
     not routed through error classification.
     """
     if isinstance(exception, ApprovalRequired):
-        result = {"approval_required": True}
+        result = dict(_APPROVAL_REQUIRED_RESULT)
     else:
-        result = {"cancelled": True}
+        result = dict(_CANCELLED_RESULT)
     return ToolCallResult(tool_call.name, tool_call.id, result, True)
 
 

@@ -34,6 +34,7 @@ from ...types import (
     Usage,
     UserMessagePart,
 )
+from ...types.tool_result_part import _APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT
 from .._retry import with_retries
 from ..base import (
     APIConnectionError as DobbyAPIConnectionError,
@@ -49,12 +50,12 @@ from .converters import to_gemini_messages
 
 __all__ = ["GeminiProvider"]
 
-# Text of the executor's control-flow placeholder results (see
-# `dobby.executor._control_flow_result`), which reach the history as
-# `TextPart(text=str(result))`. A call answered only by one of these was paused,
-# not completed, so its ID stays free for the resumed call.
+# Text of the executor's control-flow placeholder results, which reach the
+# history as `TextPart(text=str(result))`. A call answered only by one of these
+# was paused, not completed, so its ID stays free for the resumed call. The
+# payloads come from the same constants the executor writes.
 _PLACEHOLDER_RESULT_TEXTS = frozenset(
-    str(result) for result in ({"approval_required": True}, {"cancelled": True})
+    str(result) for result in (_APPROVAL_REQUIRED_RESULT, _CANCELLED_RESULT)
 )
 
 
