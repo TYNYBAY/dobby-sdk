@@ -16,6 +16,7 @@ from google.genai import (
 )
 
 from ...types import (
+    AssistantMessagePart,
     MessagePart,
     ResponsePart,
     StopReason,
@@ -25,10 +26,12 @@ from ...types import (
     StreamStartEvent,
     TextDeltaEvent,
     TextPart,
+    ToolResultPart,
     ToolUseErrorEvent,
     ToolUseEvent,
     ToolUsePart,
     Usage,
+    UserMessagePart,
 )
 from .._retry import with_retries
 from ..base import (
@@ -43,6 +46,107 @@ from ..base import (
 from .converters import to_gemini_messages
 
 __all__ = ["GeminiProvider"]
+
+# Text of the executor's control-flow placeholder results (see
+# `dobby.executor._control_flow_result`), which reach the history as
+# `TextPart(text=str(result))`. A call answered only by one of these was paused,
+# not completed, so its ID stays free for the resumed call.
+_PLACEHOLDER_RESULT_TEXTS = frozenset(
+    str(result) for result in ({"approval_required": True}, {"cancelled": True})
+)
+
+
+def _is_placeholder_result(part: ToolResultPart) -> bool:
+    """Return whether a tool result is an approval or cancellation placeholder."""
+    return (
+        part.is_error
+        and len(part.parts) == 1
+        and isinstance(part.parts[0], TextPart)
+        and part.parts[0].text in _PLACEHOLDER_RESULT_TEXTS
+    )
+
+
+def _taken_tool_call_ids(messages: list[MessagePart]) -> frozenset[str]:
+    """Collect history tool-call IDs that a new Gemini call must not reuse.
+
+    An ID is taken when an assistant `ToolUsePart` used it and a later user
+    message holds a real (non-placeholder) `ToolResultPart` for it. A call with
+    no result, or only approval/cancellation placeholders, does not take its ID,
+    so a call regenerated after a pause keeps `call_{name}` and still matches
+    the host's `approved_tool_calls`.
+
+    Args:
+        messages: The request's conversation history.
+
+    Returns:
+        IDs already bound to completed tool calls.
+    """
+    used: set[str] = set()
+    taken: set[str] = set()
+    for message in messages:
+        for part in message.parts:
+            if isinstance(message, AssistantMessagePart) and isinstance(part, ToolUsePart):
+                used.add(part.id)
+            elif (
+                isinstance(message, UserMessagePart)
+                and isinstance(part, ToolResultPart)
+                and part.tool_use_id in used
+                and not _is_placeholder_result(part)
+            ):
+                taken.add(part.tool_use_id)
+    return frozenset(taken)
+
+
+def _mint_tool_call_id(function_call: genai_types.FunctionCall, taken: set[str]) -> str:
+    """Return a unique ID for a Gemini function call and mark it as taken.
+
+    A Gemini-provided ID is used as is. A missing ID becomes `call_{name}`, or
+    `call_{name}_2`, `call_{name}_3`, ... when that is already taken.
+
+    Args:
+        function_call: The function call from the Gemini response.
+        taken: IDs unavailable for this response. Updated in place.
+
+    Returns:
+        The tool-call ID to expose.
+    """
+    if function_call.id:
+        taken.add(function_call.id)
+        return function_call.id
+    base = f"call_{function_call.name}"
+    candidate = base
+    suffix = 2
+    while candidate in taken:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    taken.add(candidate)
+    return candidate
+
+
+def _thinking_config(reasoning_effort: str | int | None) -> genai_types.ThinkingConfig | None:
+    """Map dobby's `reasoning_effort` onto a Gemini `ThinkingConfig`.
+
+    Args:
+        reasoning_effort: `None` for no thinking config, an `int` thinking
+            budget in tokens, or a `str` thinking level (e.g. "low", "high").
+
+    Returns:
+        The thinking config, or None when `reasoning_effort` is None.
+
+    Raises:
+        TypeError: If `reasoning_effort` is not None, int or str (bool is
+            rejected even though it subclasses int).
+    """
+    if reasoning_effort is None:
+        return None
+    if isinstance(reasoning_effort, str):
+        return genai_types.ThinkingConfig(thinking_level=reasoning_effort)  # type: ignore[arg-type]
+    if isinstance(reasoning_effort, int) and not isinstance(reasoning_effort, bool):
+        return genai_types.ThinkingConfig(thinking_budget=reasoning_effort)
+    raise TypeError(
+        "Gemini provider requires reasoning_effort as int (thinking_budget), "
+        f"str (thinking_level) or None, got {type(reasoning_effort).__name__}"
+    )
 
 
 class GeminiProvider(Provider[genai.Client]):
@@ -153,6 +257,8 @@ class GeminiProvider(Provider[genai.Client]):
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
         model: str | None = None,
+        reasoning_effort: str | int | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> StreamEndEvent: ...
 
@@ -166,6 +272,8 @@ class GeminiProvider(Provider[genai.Client]):
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
         model: str | None = None,
+        reasoning_effort: str | int | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]: ...
 
@@ -178,6 +286,8 @@ class GeminiProvider(Provider[genai.Client]):
         temperature: float = 0.0,
         tools: list[genai_types.Tool] | None = None,
         model: str | None = None,
+        reasoning_effort: str | int | None = None,
+        max_tokens: int | None = None,
         **kwargs: Any,
     ) -> StreamEndEvent | AsyncIterator[StreamEvent]:
         """Generate response from messages using Gemini API.
@@ -192,17 +302,36 @@ class GeminiProvider(Provider[genai.Client]):
             temperature: Controls randomness (0.0-2.0, default 0.0)
             tools: List of Gemini Tool objects (pre-converted by executor)
             model: Per-call model override. Falls back to the instance model.
+            reasoning_effort: Thinking control. `None` sets no thinking config, an
+                `int` sets `thinking_budget` (tokens), a `str` sets
+                `thinking_level` (e.g. "low", "high").
+            max_tokens: Maximum output tokens, sent as `max_output_tokens`.
             **kwargs: Additional Gemini-specific parameters forwarded verbatim to
-                GenerateContentConfig (e.g. top_p, stop_sequences).
+                GenerateContentConfig (e.g. top_p, stop_sequences). Passing
+                `thinking_config` here together with a non-None
+                `reasoning_effort` is ambiguous and rejected.
 
         Returns:
             StreamEndEvent for non-streaming, AsyncIterator[StreamEvent] for streaming
+
+        Raises:
+            TypeError: If `reasoning_effort` is not None, int or str.
+            ValueError: If both `reasoning_effort` and `thinking_config` are given.
         """
+        thinking_config = _thinking_config(reasoning_effort)
+        if thinking_config is not None:
+            if "thinking_config" in kwargs:
+                raise ValueError(
+                    "Pass either reasoning_effort or thinking_config to GeminiProvider.chat, "
+                    "not both"
+                )
+            kwargs["thinking_config"] = thinking_config
+
+        messages = list(messages)
+        taken_ids = _taken_tool_call_ids(messages)
         # Convert messages to Gemini format
         gemini_contents = to_gemini_messages(messages)
         target_model = model or self._model
-
-        max_tokens = kwargs.pop("max_tokens", None)
 
         config = genai_types.GenerateContentConfig(
             temperature=temperature,
@@ -222,9 +351,11 @@ class GeminiProvider(Provider[genai.Client]):
             config.max_output_tokens = max_tokens
 
         if stream:
-            return self._stream_chat_completion(gemini_contents, config, target_model)
+            return self._stream_chat_completion(gemini_contents, config, target_model, taken_ids)
 
-        return await self._non_stream_chat_completion(gemini_contents, config, target_model)
+        return await self._non_stream_chat_completion(
+            gemini_contents, config, target_model, taken_ids
+        )
 
     @with_retries
     async def _non_stream_chat_completion(
@@ -232,6 +363,7 @@ class GeminiProvider(Provider[genai.Client]):
         contents: list[genai_types.Content],
         config: genai_types.GenerateContentConfig,
         model: str,
+        taken_ids: frozenset[str] = frozenset(),
     ) -> StreamEndEvent:
         """Non-streaming chat completion with retry support.
 
@@ -239,6 +371,7 @@ class GeminiProvider(Provider[genai.Client]):
             contents: Gemini-formatted content list.
             config: Generation configuration.
             model: Model id to generate with.
+            taken_ids: History tool-call IDs new calls must not reuse.
 
         Returns:
             StreamEndEvent with complete response.
@@ -252,16 +385,20 @@ class GeminiProvider(Provider[genai.Client]):
         except Exception as e:
             self._translate_error(e)
 
-        return self._parse_response(response, model)
+        return self._parse_response(response, model, taken_ids)
 
     def _parse_response(
-        self, response: genai_types.GenerateContentResponse, model: str
+        self,
+        response: genai_types.GenerateContentResponse,
+        model: str,
+        taken_ids: frozenset[str] = frozenset(),
     ) -> StreamEndEvent:
         """Parse a non-streaming Gemini response into StreamEndEvent.
 
         Args:
             response: Gemini GenerateContentResponse object
             model: Model id used for the request
+            taken_ids: History tool-call IDs new calls must not reuse.
 
         Returns:
             StreamEndEvent with parsed parts and usage
@@ -269,6 +406,7 @@ class GeminiProvider(Provider[genai.Client]):
         parts: list[ResponsePart] = []
         stop_reason: StopReason = "end_turn"
         truncated = False
+        taken = set(taken_ids)
 
         # Extract parts from the response
         if response.candidates:
@@ -304,7 +442,7 @@ class GeminiProvider(Provider[genai.Client]):
 
                         parts.append(
                             ToolUsePart(
-                                id=part.function_call.id or f"call_{part.function_call.name}",
+                                id=_mint_tool_call_id(part.function_call, taken),
                                 name=part.function_call.name,  # type: ignore[assignment]
                                 inputs=dict(func_args) if func_args else {},
                                 metadata={"signature": signature},
@@ -348,6 +486,7 @@ class GeminiProvider(Provider[genai.Client]):
         contents: list[genai_types.Content],
         config: genai_types.GenerateContentConfig,
         model: str,
+        taken_ids: frozenset[str] = frozenset(),
     ) -> AsyncIterator[StreamEvent]:
         """Stream chat completion yielding discriminated events.
 
@@ -359,6 +498,7 @@ class GeminiProvider(Provider[genai.Client]):
             contents: Gemini-formatted content list
             config: Generation configuration
             model: Model id to generate with
+            taken_ids: History tool-call IDs new calls must not reuse.
 
         Yields:
             StreamEvent objects: StreamStartEvent, TextDeltaEvent,
@@ -369,6 +509,7 @@ class GeminiProvider(Provider[genai.Client]):
         stream_started = False
         final_usage: Usage | None = None
         stop_reason: StopReason = "end_turn"
+        taken = set(taken_ids)
 
         try:
             stream_response = await self._client.aio.models.generate_content_stream(
@@ -431,8 +572,7 @@ class GeminiProvider(Provider[genai.Client]):
                                 # rather than emitting a tool call on partial input.
                                 if candidate_truncated:
                                     yield ToolUseErrorEvent(
-                                        id=part.function_call.id
-                                        or f"call_{part.function_call.name}",
+                                        id=_mint_tool_call_id(part.function_call, taken),
                                         name=part.function_call.name or "",
                                         raw_arguments=(
                                             json.dumps(dict(func_args)) if func_args else ""
@@ -452,7 +592,7 @@ class GeminiProvider(Provider[genai.Client]):
                                 signature = base64.b64encode(sig_bytes).decode("utf-8")
 
                                 tool_event = ToolUseEvent(
-                                    id=part.function_call.id or f"call_{part.function_call.name}",
+                                    id=_mint_tool_call_id(part.function_call, taken),
                                     name=part.function_call.name,  # type: ignore[assignment]
                                     inputs=dict(func_args) if func_args else {},
                                     metadata={"signature": signature},
